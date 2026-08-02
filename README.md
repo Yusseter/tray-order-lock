@@ -29,6 +29,11 @@ experiments/
 └── nvidia-stable-tray-id-test.wh.cpp
 ```
 
+## Research notes
+
+See [`docs/research.md`](docs/research.md) for the tested identity and
+`UIOrderList` findings.
+
 ## Status
 
 Experimental research project. A complete general order-lock implementation has
