@@ -6,6 +6,7 @@ desktop.ini
 # IDE, local editor and agent folders
 .vscode/*
 !.vscode/
+!.vscode/c_cpp_properties.json
 !.vscode/extensions.json
 !.vscode/tasks.json
 .claude/
