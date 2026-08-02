@@ -1,0 +1,10 @@
+# Default
+* text=auto
+
+# Text files
+*.cpp text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.ps1 text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf

@@ -1,0 +1,31 @@
+# OS and editor files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE, local editor and agent folders
+.vscode/*
+!.vscode/
+!.vscode/extensions.json
+.claude/
+.agents/
+.codex/
+.idea/
+.vs/
+.history/
+*.code-workspace
+
+# Temporary files
+~$*
+*.tmp
+*.bak
+
+# Local working folders
+.cache/
+tmp/
+temp/
+wip/
+
+# Diagnostic output
+logs/
+*.log
