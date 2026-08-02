@@ -3,24 +3,25 @@
 Research project for preserving Windows 11 notification-area icon identity and
 ordering across application updates.
 
-## Stable Tray Icons
+## Included mods
 
-`stable-tray-icons.wh.cpp` combines the verified app-specific experiments:
+### Stable Tray Icons
 
-- ChatGPT: UID `3`
-- NVIDIA Settings: UID `1051`
+Assigns fixed GUIDs to the verified ChatGPT and NVIDIA Settings tray icons.
 
-Both icons receive fixed GUIDs before their `Shell_NotifyIconW/A` calls reach the
-Windows shell. The standalone test mods remain under `experiments/` for reference.
+### Tray Order Lock Analyzer
 
-This fixes identity changes for those selected applications, but it is not a
-general solution because many tray applications do not provide stable GUIDs or
-stable UIDs.
+Hooks `Shell_NotifyIconW/A` and logs the identity information supplied by tray
+applications, including process path, package family, company, product, window,
+UID, GUID, flags and tooltip.
+
+The analyzer only observes calls and does not change icon data.
 
 ## Repository layout
 
 ```text
 stable-tray-icons.wh.cpp
+tray-order-lock-analyzer.wh.cpp
 experiments/
 ├── chatgpt-stable-tray-id-test.wh.cpp
 └── nvidia-stable-tray-id-test.wh.cpp
@@ -28,7 +29,8 @@ experiments/
 
 ## Status
 
-Experimental research project.
+Experimental research project. A complete general order-lock implementation has
+not been added yet.
 
 ## License
 
