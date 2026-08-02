@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              system-tray-index-analyzer
 // @name            System Tray Index Analyzer
-// @description     Logs SystemTray index updates, delayed snapshots and read-only UIOrderList registry notifications.
-// @version         0.3.0
+// @description     Logs UIOrderList registry writes and correlates them with SystemTray index updates.
+// @version         0.4.0
 // @author          Yusseter
 // @github          https://github.com/Yusseter
 // @homepage        https://github.com/Yusseter/tray-order-lock
@@ -22,55 +22,50 @@ ordering.
 The mod hooks:
 
     winrt::SystemTray::implementation::StackViewModel::UpdateIconIndexes()
+    ntdll!NtSetValueKey
 
-The mod records:
+It records:
 
-- Call number
-- Thread ID
-- StackViewModel address
-- UIOrderList byte length, entry count and 64-bit FNV-1a hash immediately before
-  and after the original function
-- Whether the immediate before and after snapshots differ
-- Read-only delayed snapshots 10, 50, 250, 1000, 1500, 2000, 2500, 3000,
-  5000 and 10000 milliseconds after the immediate after snapshot
-- Requested delay, actual elapsed time and whether each delayed snapshot differs
-  from the immediate after snapshot
+- UpdateIconIndexes call number, thread ID and StackViewModel address
+- Read-only UIOrderList snapshots immediately before and after each
+  UpdateIconIndexes call
 - Read-only last-set notifications for the NotifyIconSettings registry key
-- The UIOrderList snapshot observed after each notification, compared with the
-  previous watcher snapshot
-- The number of UpdateIconIndexes calls observed when the notification is
-  processed
-
-Delayed reads are scheduled on one background worker. Pending delayed reads are
-cancelled when the mod is unloaded, and the worker is stopped before the module
-can be released.
+- NtSetValueKey calls that target the UIOrderList value under
+  NotifyIconSettings
+- The native registry key path, value type, data size and NTSTATUS result
+- UIOrderList snapshots immediately before and after each matching write
+- A captured call stack with module names and relative offsets for each write
+- The number of UpdateIconIndexes calls observed at each registry event
 
 Registry notifications are key-wide and can be caused by values other than
 UIOrderList. Every notification is therefore followed by a read-only
 UIOrderList snapshot and comparison. Notifications can be coalesced by Windows.
 
-The mod only reads:
+The NtSetValueKey hook only observes matching UIOrderList writes. The original
+function is always called with its original arguments and its return value is
+preserved.
 
-    HKCU\\Control Panel\\NotifyIconSettings\\UIOrderList
-
-It does not modify tray icons, tray ordering, registry values, XAML elements,
-function arguments or original return behavior.
+The analyzer itself does not modify tray icons, tray ordering, registry values,
+XAML elements, function arguments or original return behavior.
 */
 // ==/WindhawkModReadme==
 
 #include <windows.h>
+#include <winternl.h>
 #include <windhawk_utils.h>
 
 #include <atomic>
-#include <chrono>
 #include <cstdint>
-#include <queue>
+#include <string>
 #include <vector>
 
 namespace {
 
 constexpr wchar_t kNotifyIconSettingsPath[] =
     L"Control Panel\\NotifyIconSettings";
+
+constexpr wchar_t kNotifyIconSettingsSuffix[] =
+    L"\\Control Panel\\NotifyIconSettings";
 
 constexpr wchar_t kUIOrderListValueName[] =
     L"UIOrderList";
@@ -81,21 +76,21 @@ constexpr std::uint64_t kFnv1aOffsetBasis =
 constexpr std::uint64_t kFnv1aPrime =
     1099511628211ULL;
 
-constexpr DWORD kDelayedSnapshotDelaysMs[] = {
-    10,
-    50,
-    250,
-    1000,
-    1500,
-    2000,
-    2500,
-    3000,
-    5000,
-    10000,
-};
+constexpr ULONG kKeyNameInformationClass = 3;
+constexpr USHORT kMaximumCapturedStackFrames = 32;
+constexpr ULONG kStackFramesToSkip = 1;
 
 std::atomic<bool> g_systemTrayModuleHooked = false;
 std::atomic<unsigned long long> g_updateCallCount = 0;
+std::atomic<unsigned long long> g_registryNotificationCount = 0;
+std::atomic<unsigned long long> g_uiOrderWriteCount = 0;
+
+HANDLE g_registryWatcherStopEvent = nullptr;
+HANDLE g_registryWatcherChangeEvent = nullptr;
+HANDLE g_registryWatcherThread = nullptr;
+HKEY g_registryWatcherKey = nullptr;
+
+thread_local bool g_insideNtSetValueKeyHook = false;
 
 struct UIOrderSnapshot {
     LONG status = ERROR_SUCCESS;
@@ -107,55 +102,41 @@ struct UIOrderSnapshot {
     bool valid = false;
 };
 
-struct DelayedSnapshotJob {
-    std::chrono::steady_clock::time_point dueTime;
-    std::chrono::steady_clock::time_point baseTime;
-    unsigned long long callNumber = 0;
-    DWORD requestedDelayMs = 0;
-    unsigned long long sequence = 0;
-    UIOrderSnapshot immediateAfterSnapshot;
+struct CapturedStack {
+    USHORT frameCount = 0;
+    void* frames[kMaximumCapturedStackFrames]{};
 };
 
-struct DelayedSnapshotJobCompare {
-    bool operator()(
-        const DelayedSnapshotJob& left,
-        const DelayedSnapshotJob& right
-    ) const {
-        if (left.dueTime != right.dueTime) {
-            return left.dueTime > right.dueTime;
-        }
-
-        return left.sequence > right.sequence;
-    }
+struct NativeKeyNameInformation {
+    ULONG nameLength;
+    WCHAR name[1];
 };
-
-using DelayedSnapshotQueue = std::priority_queue<
-    DelayedSnapshotJob,
-    std::vector<DelayedSnapshotJob>,
-    DelayedSnapshotJobCompare
->;
-
-SRWLOCK g_delayedJobsLock = SRWLOCK_INIT;
-DelayedSnapshotQueue g_delayedJobs;
-std::atomic<bool> g_delayedWorkerStopping = false;
-std::atomic<bool> g_acceptDelayedJobs = false;
-std::atomic<unsigned long long> g_delayedJobSequence = 0;
-HANDLE g_delayedWorkerWakeEvent = nullptr;
-HANDLE g_delayedWorkerThread = nullptr;
-
-std::atomic<unsigned long long>
-    g_registryNotificationCount = 0;
-
-HANDLE g_registryWatcherStopEvent = nullptr;
-HANDLE g_registryWatcherChangeEvent = nullptr;
-HANDLE g_registryWatcherThread = nullptr;
-HKEY g_registryWatcherKey = nullptr;
 
 using StackViewModel_UpdateIconIndexes_t =
     void(WINAPI*)(void* pThis);
 
+using NtSetValueKey_t = NTSTATUS(NTAPI*)(
+    HANDLE keyHandle,
+    PUNICODE_STRING valueName,
+    ULONG titleIndex,
+    ULONG type,
+    PVOID data,
+    ULONG dataSize
+);
+
+using NtQueryKey_t = NTSTATUS(NTAPI*)(
+    HANDLE keyHandle,
+    ULONG keyInformationClass,
+    PVOID keyInformation,
+    ULONG length,
+    PULONG resultLength
+);
+
 StackViewModel_UpdateIconIndexes_t
     StackViewModel_UpdateIconIndexes_Original = nullptr;
+
+NtSetValueKey_t NtSetValueKey_Original = nullptr;
+NtQueryKey_t NtQueryKey_Function = nullptr;
 
 std::uint64_t CalculateFnv1aHash(
     const BYTE* data,
@@ -199,7 +180,6 @@ UIOrderSnapshot CaptureUIOrderSnapshot() {
         }
 
         std::vector<BYTE> data(requiredBytes);
-
         DWORD actualBytes = requiredBytes;
 
         status = RegGetValueW(
@@ -247,6 +227,20 @@ UIOrderSnapshot CaptureUIOrderSnapshot() {
     return snapshot;
 }
 
+bool AreSnapshotsEqual(
+    const UIOrderSnapshot& first,
+    const UIOrderSnapshot& second
+) {
+    if (!first.valid || !second.valid) {
+        return false;
+    }
+
+    return
+        first.registryType == second.registryType &&
+        first.byteLength == second.byteLength &&
+        first.hash == second.hash;
+}
+
 void LogUIOrderSnapshot(
     const wchar_t* phase,
     unsigned long long callNumber,
@@ -275,378 +269,453 @@ void LogUIOrderSnapshot(
     );
 }
 
-bool AreSnapshotsEqual(
-    const UIOrderSnapshot& first,
-    const UIOrderSnapshot& second
+bool IsUIOrderListValueName(
+    const UNICODE_STRING* valueName
 ) {
-    if (!first.valid || !second.valid) {
+    if (
+        !valueName ||
+        !valueName->Buffer ||
+        valueName->Length % sizeof(wchar_t) != 0
+    ) {
         return false;
     }
 
-    return
-        first.registryType == second.registryType &&
-        first.byteLength == second.byteLength &&
-        first.hash == second.hash;
+    const int valueNameLength =
+        static_cast<int>(
+            valueName->Length / sizeof(wchar_t)
+        );
+
+    return CompareStringOrdinal(
+        valueName->Buffer,
+        valueNameLength,
+        kUIOrderListValueName,
+        ARRAYSIZE(kUIOrderListValueName) - 1,
+        TRUE
+    ) == CSTR_EQUAL;
 }
 
-void LogDelayedUIOrderSnapshot(
-    const DelayedSnapshotJob& job,
-    unsigned long long actualElapsedMs,
-    const UIOrderSnapshot& delayedSnapshot
+bool EndsWithOrdinalIgnoreCase(
+    const std::wstring& value,
+    const wchar_t* suffix
 ) {
-    int comparable =
-        job.immediateAfterSnapshot.valid &&
-        delayedSnapshot.valid
-            ? 1
-            : 0;
+    const int suffixLength =
+        static_cast<int>(wcslen(suffix));
 
-    int changedFromImmediateAfter =
-        comparable &&
-        !AreSnapshotsEqual(
-            job.immediateAfterSnapshot,
-            delayedSnapshot
-        )
-            ? 1
-            : 0;
-
-    Wh_Log(
-        L"UIORDER_DELAYED "
-        L"call=%llu "
-        L"requestedDelayMs=%lu "
-        L"actualElapsedMs=%llu "
-        L"valid=%d "
-        L"status=%ld "
-        L"type=%lu "
-        L"bytes=%lu "
-        L"entries=%llu "
-        L"aligned=%d "
-        L"hash=0x%016llX "
-        L"comparable=%d "
-        L"changedFromImmediateAfter=%d "
-        L"immediateAfterHash=0x%016llX",
-        job.callNumber,
-        job.requestedDelayMs,
-        actualElapsedMs,
-        delayedSnapshot.valid ? 1 : 0,
-        delayedSnapshot.status,
-        delayedSnapshot.registryType,
-        delayedSnapshot.byteLength,
-        delayedSnapshot.entryCount,
-        delayedSnapshot.lengthAligned ? 1 : 0,
-        static_cast<unsigned long long>(delayedSnapshot.hash),
-        comparable,
-        changedFromImmediateAfter,
-        static_cast<unsigned long long>(
-            job.immediateAfterSnapshot.hash
-        )
-    );
-}
-
-DWORD WINAPI DelayedSnapshotWorkerThreadProc(
-    LPVOID
-) {
-    Wh_Log(
-        L"Delayed snapshot worker started; thread=%lu",
-        GetCurrentThreadId()
-    );
-
-    for (;;) {
-        DelayedSnapshotJob job;
-        bool haveJob = false;
-        DWORD waitMilliseconds = INFINITE;
-
-        bool shouldStop = false;
-
-        AcquireSRWLockExclusive(
-            &g_delayedJobsLock
-        );
-
-        if (
-            g_delayedWorkerStopping.load(
-                std::memory_order_acquire
-            )
-        ) {
-            shouldStop = true;
-        }
-        else if (!g_delayedJobs.empty()) {
-            const auto now =
-                std::chrono::steady_clock::now();
-
-            const DelayedSnapshotJob& nextJob =
-                g_delayedJobs.top();
-
-            if (nextJob.dueTime <= now) {
-                job = nextJob;
-                g_delayedJobs.pop();
-                haveJob = true;
-            }
-            else {
-                const auto remaining =
-                    std::chrono::ceil<
-                        std::chrono::milliseconds
-                    >(
-                        nextJob.dueTime - now
-                    );
-
-                const auto remainingCount =
-                    remaining.count();
-
-                waitMilliseconds =
-                    remainingCount >=
-                            static_cast<long long>(INFINITE)
-                        ? INFINITE - 1
-                        : static_cast<DWORD>(
-                              remainingCount
-                          );
-            }
-        }
-
-        ReleaseSRWLockExclusive(
-            &g_delayedJobsLock
-        );
-
-        if (shouldStop) {
-            break;
-        }
-
-        if (haveJob) {
-            UIOrderSnapshot delayedSnapshot =
-                CaptureUIOrderSnapshot();
-
-            const auto completedAt =
-                std::chrono::steady_clock::now();
-
-            const auto actualElapsed =
-                std::chrono::duration_cast<
-                    std::chrono::milliseconds
-                >(
-                    completedAt - job.baseTime
-                );
-
-            LogDelayedUIOrderSnapshot(
-                job,
-                static_cast<unsigned long long>(
-                    actualElapsed.count()
-                ),
-                delayedSnapshot
-            );
-
-            continue;
-        }
-
-        DWORD waitResult = WaitForSingleObject(
-            g_delayedWorkerWakeEvent,
-            waitMilliseconds
-        );
-
-        if (waitResult == WAIT_FAILED) {
-            DWORD error = GetLastError();
-
-            g_acceptDelayedJobs.store(
-                false,
-                std::memory_order_release
-            );
-
-            Wh_Log(
-                L"Delayed snapshot worker wait failed; error=%lu",
-                error
-            );
-
-            break;
-        }
-    }
-
-    Wh_Log(
-        L"Delayed snapshot worker stopped; thread=%lu",
-        GetCurrentThreadId()
-    );
-
-    return 0;
-}
-
-bool StartDelayedSnapshotWorker() {
-    if (g_delayedWorkerThread) {
-        return true;
-    }
-
-    g_delayedWorkerStopping.store(
-        false,
-        std::memory_order_release
-    );
-
-    g_acceptDelayedJobs.store(
-        false,
-        std::memory_order_release
-    );
-
-    g_delayedWorkerWakeEvent = CreateEventW(
-        nullptr,
-        FALSE,
-        FALSE,
-        nullptr
-    );
-
-    if (!g_delayedWorkerWakeEvent) {
-        Wh_Log(
-            L"Failed to create delayed snapshot wake event; error=%lu",
-            GetLastError()
-        );
-
+    if (
+        suffixLength < 0 ||
+        value.size() < static_cast<std::size_t>(suffixLength)
+    ) {
         return false;
     }
 
-    g_delayedWorkerThread = CreateThread(
+    const wchar_t* valueSuffix =
+        value.data() + value.size() - suffixLength;
+
+    return CompareStringOrdinal(
+        valueSuffix,
+        suffixLength,
+        suffix,
+        suffixLength,
+        TRUE
+    ) == CSTR_EQUAL;
+}
+
+bool QueryNativeRegistryKeyPath(
+    HANDLE keyHandle,
+    std::wstring& keyPath,
+    NTSTATUS& queryStatus
+) {
+    keyPath.clear();
+    queryStatus = static_cast<NTSTATUS>(0xC0000001L);
+
+    if (!NtQueryKey_Function || !keyHandle) {
+        return false;
+    }
+
+    ULONG requiredLength = 0;
+
+    queryStatus = NtQueryKey_Function(
+        keyHandle,
+        kKeyNameInformationClass,
         nullptr,
         0,
-        DelayedSnapshotWorkerThreadProc,
-        nullptr,
-        0,
-        nullptr
+        &requiredLength
     );
 
-    if (!g_delayedWorkerThread) {
-        DWORD error = GetLastError();
-
-        CloseHandle(g_delayedWorkerWakeEvent);
-        g_delayedWorkerWakeEvent = nullptr;
-
-        Wh_Log(
-            L"Failed to create delayed snapshot worker; error=%lu",
-            error
-        );
-
+    if (requiredLength < sizeof(ULONG)) {
         return false;
     }
 
-    g_acceptDelayedJobs.store(
-        true,
-        std::memory_order_release
+    std::vector<BYTE> buffer(
+        static_cast<std::size_t>(requiredLength) +
+        sizeof(wchar_t)
+    );
+
+    queryStatus = NtQueryKey_Function(
+        keyHandle,
+        kKeyNameInformationClass,
+        buffer.data(),
+        requiredLength,
+        &requiredLength
+    );
+
+    if (queryStatus < 0) {
+        return false;
+    }
+
+    const auto* information =
+        reinterpret_cast<const NativeKeyNameInformation*>(
+            buffer.data()
+        );
+
+    if (
+        information->nameLength % sizeof(wchar_t) != 0 ||
+        information->nameLength >
+            requiredLength - sizeof(ULONG)
+    ) {
+        return false;
+    }
+
+    keyPath.assign(
+        information->name,
+        information->nameLength / sizeof(wchar_t)
     );
 
     return true;
 }
 
-void QueueDelayedSnapshots(
-    unsigned long long callNumber,
-    const UIOrderSnapshot& immediateAfterSnapshot,
-    std::chrono::steady_clock::time_point baseTime
-) {
-    if (
-        !g_acceptDelayedJobs.load(
-            std::memory_order_acquire
-        )
-    ) {
-        return;
-    }
+CapturedStack CaptureCurrentCallStack() {
+    CapturedStack stack;
 
-    AcquireSRWLockExclusive(
-        &g_delayedJobsLock
+    stack.frameCount = CaptureStackBackTrace(
+        kStackFramesToSkip,
+        kMaximumCapturedStackFrames,
+        stack.frames,
+        nullptr
     );
 
-    if (
-        !g_acceptDelayedJobs.load(
-            std::memory_order_acquire
-        )
-    ) {
-        ReleaseSRWLockExclusive(
-            &g_delayedJobsLock
-        );
-
-        return;
-    }
-
-    for (DWORD delayMilliseconds :
-         kDelayedSnapshotDelaysMs) {
-        DelayedSnapshotJob job;
-
-        job.dueTime =
-            baseTime +
-            std::chrono::milliseconds(
-                delayMilliseconds
-            );
-
-        job.baseTime = baseTime;
-        job.callNumber = callNumber;
-        job.requestedDelayMs = delayMilliseconds;
-        job.sequence =
-            g_delayedJobSequence.fetch_add(
-                1,
-                std::memory_order_relaxed
-            );
-
-        job.immediateAfterSnapshot =
-            immediateAfterSnapshot;
-
-        g_delayedJobs.push(job);
-    }
-
-    SetEvent(g_delayedWorkerWakeEvent);
-
-    ReleaseSRWLockExclusive(
-        &g_delayedJobsLock
-    );
+    return stack;
 }
 
-void StopDelayedSnapshotWorker() {
-    g_acceptDelayedJobs.store(
-        false,
-        std::memory_order_release
+void LogCapturedStack(
+    unsigned long long writeNumber,
+    const CapturedStack& stack
+) {
+    Wh_Log(
+        L"UIORDER_WRITE_STACK_BEGIN "
+        L"write=%llu frames=%hu",
+        writeNumber,
+        stack.frameCount
     );
 
-    std::size_t cancelledJobs = 0;
+    for (USHORT index = 0; index < stack.frameCount; index++) {
+        void* frameAddress = stack.frames[index];
+        HMODULE module = nullptr;
 
-    AcquireSRWLockExclusive(
-        &g_delayedJobsLock
-    );
-
-    g_delayedWorkerStopping.store(
-        true,
-        std::memory_order_release
-    );
-
-    cancelledJobs = g_delayedJobs.size();
-
-    while (!g_delayedJobs.empty()) {
-        g_delayedJobs.pop();
-    }
-
-    ReleaseSRWLockExclusive(
-        &g_delayedJobsLock
-    );
-
-    if (g_delayedWorkerWakeEvent) {
-        SetEvent(g_delayedWorkerWakeEvent);
-    }
-
-    if (g_delayedWorkerThread) {
-        DWORD waitResult = WaitForSingleObject(
-            g_delayedWorkerThread,
-            INFINITE
+        BOOL moduleResolved = GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(frameAddress),
+            &module
         );
 
-        if (waitResult != WAIT_OBJECT_0) {
-            Wh_Log(
-                L"Waiting for delayed snapshot worker failed; result=%lu error=%lu",
-                waitResult,
-                GetLastError()
+        wchar_t modulePath[1024]{};
+        DWORD modulePathLength = 0;
+
+        if (moduleResolved && module) {
+            modulePathLength = GetModuleFileNameW(
+                module,
+                modulePath,
+                ARRAYSIZE(modulePath)
             );
         }
 
-        CloseHandle(g_delayedWorkerThread);
-        g_delayedWorkerThread = nullptr;
-    }
+        const unsigned long long moduleOffset =
+            module
+                ? static_cast<unsigned long long>(
+                      reinterpret_cast<std::uintptr_t>(frameAddress) -
+                      reinterpret_cast<std::uintptr_t>(module)
+                  )
+                : 0;
 
-    if (g_delayedWorkerWakeEvent) {
-        CloseHandle(g_delayedWorkerWakeEvent);
-        g_delayedWorkerWakeEvent = nullptr;
+        if (
+            moduleResolved &&
+            module &&
+            modulePathLength > 0 &&
+            modulePathLength < ARRAYSIZE(modulePath)
+        ) {
+            Wh_Log(
+                L"UIORDER_WRITE_STACK "
+                L"write=%llu "
+                L"frame=%hu "
+                L"address=%p "
+                L"moduleBase=%p "
+                L"offset=0x%llX "
+                L"module=\"%s\"",
+                writeNumber,
+                index,
+                frameAddress,
+                module,
+                moduleOffset,
+                modulePath
+            );
+        }
+        else {
+            Wh_Log(
+                L"UIORDER_WRITE_STACK "
+                L"write=%llu "
+                L"frame=%hu "
+                L"address=%p "
+                L"moduleBase=%p "
+                L"offset=0x%llX "
+                L"module=\"<unresolved>\"",
+                writeNumber,
+                index,
+                frameAddress,
+                module,
+                moduleOffset
+            );
+        }
     }
 
     Wh_Log(
-        L"Delayed snapshot worker cleanup complete; cancelledJobs=%llu",
-        static_cast<unsigned long long>(cancelledJobs)
+        L"UIORDER_WRITE_STACK_END write=%llu",
+        writeNumber
     );
 }
 
+NTSTATUS NTAPI NtSetValueKey_Hook(
+    HANDLE keyHandle,
+    PUNICODE_STRING valueName,
+    ULONG titleIndex,
+    ULONG type,
+    PVOID data,
+    ULONG dataSize
+) {
+    if (
+        g_insideNtSetValueKeyHook ||
+        !IsUIOrderListValueName(valueName)
+    ) {
+        return NtSetValueKey_Original(
+            keyHandle,
+            valueName,
+            titleIndex,
+            type,
+            data,
+            dataSize
+        );
+    }
+
+    g_insideNtSetValueKeyHook = true;
+
+    std::wstring keyPath;
+    NTSTATUS keyQueryStatus = 0;
+
+    const bool keyPathResolved =
+        QueryNativeRegistryKeyPath(
+            keyHandle,
+            keyPath,
+            keyQueryStatus
+        );
+
+    if (
+        keyPathResolved &&
+        !EndsWithOrdinalIgnoreCase(
+            keyPath,
+            kNotifyIconSettingsSuffix
+        )
+    ) {
+        g_insideNtSetValueKeyHook = false;
+
+        return NtSetValueKey_Original(
+            keyHandle,
+            valueName,
+            titleIndex,
+            type,
+            data,
+            dataSize
+        );
+    }
+
+    const unsigned long long writeNumber =
+        g_uiOrderWriteCount.fetch_add(
+            1,
+            std::memory_order_relaxed
+        ) + 1;
+
+    const DWORD threadId = GetCurrentThreadId();
+    const unsigned long long updateCallsBefore =
+        g_updateCallCount.load(
+            std::memory_order_acquire
+        );
+
+    const UIOrderSnapshot beforeSnapshot =
+        CaptureUIOrderSnapshot();
+
+    const CapturedStack stack =
+        CaptureCurrentCallStack();
+
+    Wh_Log(
+        L"UIORDER_WRITE_BEGIN "
+        L"write=%llu "
+        L"thread=%lu "
+        L"keyResolved=%d "
+        L"keyQueryStatus=0x%08lX "
+        L"key=\"%s\" "
+        L"value=\"UIOrderList\" "
+        L"type=%lu "
+        L"bytes=%lu "
+        L"updateCallsObserved=%llu "
+        L"beforeValid=%d "
+        L"beforeBytes=%lu "
+        L"beforeHash=0x%016llX",
+        writeNumber,
+        threadId,
+        keyPathResolved ? 1 : 0,
+        static_cast<ULONG>(keyQueryStatus),
+        keyPathResolved
+            ? keyPath.c_str()
+            : L"<unresolved>",
+        type,
+        dataSize,
+        updateCallsBefore,
+        beforeSnapshot.valid ? 1 : 0,
+        beforeSnapshot.byteLength,
+        static_cast<unsigned long long>(
+            beforeSnapshot.hash
+        )
+    );
+
+    const NTSTATUS status = NtSetValueKey_Original(
+        keyHandle,
+        valueName,
+        titleIndex,
+        type,
+        data,
+        dataSize
+    );
+
+    const UIOrderSnapshot afterSnapshot =
+        CaptureUIOrderSnapshot();
+
+    const int comparable =
+        beforeSnapshot.valid &&
+        afterSnapshot.valid
+            ? 1
+            : 0;
+
+    const int changed =
+        comparable &&
+        !AreSnapshotsEqual(
+            beforeSnapshot,
+            afterSnapshot
+        )
+            ? 1
+            : 0;
+
+    const unsigned long long updateCallsAfter =
+        g_updateCallCount.load(
+            std::memory_order_acquire
+        );
+
+    Wh_Log(
+        L"UIORDER_WRITE_END "
+        L"write=%llu "
+        L"thread=%lu "
+        L"ntstatus=0x%08lX "
+        L"comparable=%d "
+        L"changed=%d "
+        L"afterValid=%d "
+        L"afterBytes=%lu "
+        L"afterHash=0x%016llX "
+        L"updateCallsBefore=%llu "
+        L"updateCallsAfter=%llu",
+        writeNumber,
+        threadId,
+        static_cast<ULONG>(status),
+        comparable,
+        changed,
+        afterSnapshot.valid ? 1 : 0,
+        afterSnapshot.byteLength,
+        static_cast<unsigned long long>(
+            afterSnapshot.hash
+        ),
+        updateCallsBefore,
+        updateCallsAfter
+    );
+
+    LogCapturedStack(
+        writeNumber,
+        stack
+    );
+
+    g_insideNtSetValueKeyHook = false;
+    return status;
+}
+
+bool HookNativeRegistryWrites() {
+    HMODULE ntdll = GetModuleHandleW(
+        L"ntdll.dll"
+    );
+
+    if (!ntdll) {
+        Wh_Log(
+            L"ntdll.dll is unavailable"
+        );
+
+        return false;
+    }
+
+    auto ntSetValueKey =
+        reinterpret_cast<NtSetValueKey_t>(
+            GetProcAddress(
+                ntdll,
+                "NtSetValueKey"
+            )
+        );
+
+    NtQueryKey_Function =
+        reinterpret_cast<NtQueryKey_t>(
+            GetProcAddress(
+                ntdll,
+                "NtQueryKey"
+            )
+        );
+
+    if (!ntSetValueKey) {
+        Wh_Log(
+            L"NtSetValueKey is unavailable"
+        );
+
+        return false;
+    }
+
+    if (!NtQueryKey_Function) {
+        Wh_Log(
+            L"NtQueryKey is unavailable"
+        );
+
+        return false;
+    }
+
+    if (!WindhawkUtils::Wh_SetFunctionHookT(
+            ntSetValueKey,
+            NtSetValueKey_Hook,
+            &NtSetValueKey_Original
+        )) {
+        Wh_Log(
+            L"Failed to hook NtSetValueKey"
+        );
+
+        return false;
+    }
+
+    Wh_Log(
+        L"NtSetValueKey hook installed"
+    );
+
+    return true;
+}
 
 void LogUIOrderRegistryWatcherSnapshot(
     const wchar_t* phase,
@@ -654,14 +723,14 @@ void LogUIOrderRegistryWatcherSnapshot(
     const UIOrderSnapshot* previousSnapshot,
     const UIOrderSnapshot& currentSnapshot
 ) {
-    int comparable =
+    const int comparable =
         previousSnapshot &&
         previousSnapshot->valid &&
         currentSnapshot.valid
             ? 1
             : 0;
 
-    int changedFromPrevious =
+    const int changedFromPrevious =
         comparable &&
         !AreSnapshotsEqual(
             *previousSnapshot,
@@ -670,7 +739,7 @@ void LogUIOrderRegistryWatcherSnapshot(
             ? 1
             : 0;
 
-    unsigned long long previousHash =
+    const unsigned long long previousHash =
         previousSnapshot
             ? static_cast<unsigned long long>(
                   previousSnapshot->hash
@@ -682,6 +751,7 @@ void LogUIOrderRegistryWatcherSnapshot(
         L"phase=%s "
         L"notification=%llu "
         L"updateCallsObserved=%llu "
+        L"writesObserved=%llu "
         L"valid=%d "
         L"status=%ld "
         L"type=%lu "
@@ -695,6 +765,9 @@ void LogUIOrderRegistryWatcherSnapshot(
         phase,
         notificationNumber,
         g_updateCallCount.load(
+            std::memory_order_acquire
+        ),
+        g_uiOrderWriteCount.load(
             std::memory_order_acquire
         ),
         currentSnapshot.valid ? 1 : 0,
@@ -773,9 +846,8 @@ DWORD WINAPI UIOrderRegistryWatcherThreadProc(
 
         if (waitResult == WAIT_OBJECT_0 + 1) {
             /*
-            RegNotifyChangeKeyValue is one-shot. Re-arm it before
-            reading UIOrderList so a change that occurs during the
-            registry read can still signal the event.
+            RegNotifyChangeKeyValue is one-shot. Re-arm it before reading
+            UIOrderList so a change during the read can still signal the event.
             */
             notifyStatus =
                 ArmUIOrderRegistryNotification();
@@ -794,7 +866,7 @@ DWORD WINAPI UIOrderRegistryWatcherThreadProc(
             UIOrderSnapshot currentSnapshot =
                 CaptureUIOrderSnapshot();
 
-            unsigned long long notificationNumber =
+            const unsigned long long notificationNumber =
                 g_registryNotificationCount.fetch_add(
                     1,
                     std::memory_order_relaxed
@@ -877,7 +949,7 @@ bool StartUIOrderRegistryWatcher() {
     );
 
     if (!g_registryWatcherStopEvent) {
-        DWORD error = GetLastError();
+        const DWORD error = GetLastError();
 
         RegCloseKey(g_registryWatcherKey);
         g_registryWatcherKey = nullptr;
@@ -899,7 +971,7 @@ bool StartUIOrderRegistryWatcher() {
     );
 
     if (!g_registryWatcherChangeEvent) {
-        DWORD error = GetLastError();
+        const DWORD error = GetLastError();
 
         CloseHandle(g_registryWatcherStopEvent);
         g_registryWatcherStopEvent = nullptr;
@@ -926,7 +998,7 @@ bool StartUIOrderRegistryWatcher() {
     );
 
     if (!g_registryWatcherThread) {
-        DWORD error = GetLastError();
+        const DWORD error = GetLastError();
 
         CloseHandle(g_registryWatcherChangeEvent);
         g_registryWatcherChangeEvent = nullptr;
@@ -955,7 +1027,7 @@ void StopUIOrderRegistryWatcher() {
     }
 
     if (g_registryWatcherThread) {
-        DWORD waitResult = WaitForSingleObject(
+        const DWORD waitResult = WaitForSingleObject(
             g_registryWatcherThread,
             INFINITE
         );
@@ -997,7 +1069,7 @@ void StopUIOrderRegistryWatcher() {
 void LogModuleInformation(HMODULE module) {
     wchar_t modulePath[MAX_PATH]{};
 
-    DWORD length = GetModuleFileNameW(
+    const DWORD length = GetModuleFileNameW(
         module,
         modulePath,
         ARRAYSIZE(modulePath)
@@ -1022,25 +1094,29 @@ void LogModuleInformation(HMODULE module) {
 void WINAPI StackViewModel_UpdateIconIndexes_Hook(
     void* pThis
 ) {
-    unsigned long long callNumber =
+    const unsigned long long callNumber =
         g_updateCallCount.fetch_add(
             1,
             std::memory_order_relaxed
         ) + 1;
 
-    DWORD threadId = GetCurrentThreadId();
+    const DWORD threadId = GetCurrentThreadId();
 
     Wh_Log(
         L"INDEX_UPDATE_BEGIN "
         L"call=%llu "
         L"thread=%lu "
-        L"this=%p",
+        L"this=%p "
+        L"writesObserved=%llu",
         callNumber,
         threadId,
-        pThis
+        pThis,
+        g_uiOrderWriteCount.load(
+            std::memory_order_acquire
+        )
     );
 
-    UIOrderSnapshot beforeSnapshot =
+    const UIOrderSnapshot beforeSnapshot =
         CaptureUIOrderSnapshot();
 
     LogUIOrderSnapshot(
@@ -1053,11 +1129,8 @@ void WINAPI StackViewModel_UpdateIconIndexes_Hook(
         pThis
     );
 
-    UIOrderSnapshot afterSnapshot =
+    const UIOrderSnapshot afterSnapshot =
         CaptureUIOrderSnapshot();
-
-    const auto afterSnapshotTime =
-        std::chrono::steady_clock::now();
 
     LogUIOrderSnapshot(
         L"after",
@@ -1065,13 +1138,13 @@ void WINAPI StackViewModel_UpdateIconIndexes_Hook(
         afterSnapshot
     );
 
-    int comparable =
+    const int comparable =
         beforeSnapshot.valid &&
         afterSnapshot.valid
             ? 1
             : 0;
 
-    int changed =
+    const int changed =
         comparable &&
         !AreSnapshotsEqual(
             beforeSnapshot,
@@ -1102,20 +1175,18 @@ void WINAPI StackViewModel_UpdateIconIndexes_Hook(
         )
     );
 
-    QueueDelayedSnapshots(
-        callNumber,
-        afterSnapshot,
-        afterSnapshotTime
-    );
-
     Wh_Log(
         L"INDEX_UPDATE_END "
         L"call=%llu "
         L"thread=%lu "
-        L"this=%p",
+        L"this=%p "
+        L"writesObserved=%llu",
         callNumber,
         threadId,
-        pThis
+        pThis,
+        g_uiOrderWriteCount.load(
+            std::memory_order_acquire
+        )
     );
 }
 
@@ -1154,10 +1225,9 @@ bool HookSystemTraySymbols(HMODULE module) {
 }
 
 HMODULE GetSystemTrayModuleHandle() {
-    HMODULE module =
-        GetModuleHandleW(
-            L"SystemTray.dll"
-        );
+    HMODULE module = GetModuleHandleW(
+        L"SystemTray.dll"
+    );
 
     if (module) {
         return module;
@@ -1235,12 +1305,11 @@ HMODULE WINAPI LoadLibraryExW_Hook(
     HANDLE file,
     DWORD flags
 ) {
-    HMODULE module =
-        LoadLibraryExW_Original(
-            libraryPath,
-            file,
-            flags
-        );
+    HMODULE module = LoadLibraryExW_Original(
+        libraryPath,
+        file,
+        flags
+    );
 
     if (module) {
         HandleLoadedModule(
@@ -1253,10 +1322,9 @@ HMODULE WINAPI LoadLibraryExW_Hook(
 }
 
 bool HookModuleLoader() {
-    HMODULE kernelBase =
-        GetModuleHandleW(
-            L"kernelbase.dll"
-        );
+    HMODULE kernelBase = GetModuleHandleW(
+        L"kernelbase.dll"
+    );
 
     if (!kernelBase) {
         Wh_Log(
@@ -1267,9 +1335,7 @@ bool HookModuleLoader() {
     }
 
     auto loadLibraryExW =
-        reinterpret_cast<
-            decltype(&LoadLibraryExW)
-        >(
+        reinterpret_cast<decltype(&LoadLibraryExW)>(
             GetProcAddress(
                 kernelBase,
                 "LoadLibraryExW"
@@ -1295,21 +1361,19 @@ bool HookModuleLoader() {
 
 BOOL Wh_ModInit() {
     Wh_Log(
-        L"System Tray Index Analyzer 0.3.0 "
+        L"System Tray Index Analyzer 0.4.0 "
         L"initializing"
     );
 
-    if (!StartDelayedSnapshotWorker()) {
+    if (!HookNativeRegistryWrites()) {
         return FALSE;
     }
 
     if (!StartUIOrderRegistryWatcher()) {
-        StopDelayedSnapshotWorker();
         return FALSE;
     }
 
-    HMODULE module =
-        GetSystemTrayModuleHandle();
+    HMODULE module = GetSystemTrayModuleHandle();
 
     if (module) {
         g_systemTrayModuleHooked.store(
@@ -1324,7 +1388,6 @@ BOOL Wh_ModInit() {
             );
 
             StopUIOrderRegistryWatcher();
-            StopDelayedSnapshotWorker();
             return FALSE;
         }
 
@@ -1338,7 +1401,6 @@ BOOL Wh_ModInit() {
 
     if (!HookModuleLoader()) {
         StopUIOrderRegistryWatcher();
-        StopDelayedSnapshotWorker();
         return FALSE;
     }
 
@@ -1354,8 +1416,7 @@ void Wh_ModAfterInit() {
         return;
     }
 
-    HMODULE module =
-        GetSystemTrayModuleHandle();
+    HMODULE module = GetSystemTrayModuleHandle();
 
     if (!module) {
         return;
@@ -1391,17 +1452,20 @@ void Wh_ModAfterInit() {
 }
 
 void Wh_ModUninit() {
-    StopDelayedSnapshotWorker();
     StopUIOrderRegistryWatcher();
 
     Wh_Log(
         L"System Tray Index Analyzer stopped; "
         L"capturedCalls=%llu "
-        L"registryNotifications=%llu",
+        L"registryNotifications=%llu "
+        L"uiOrderWrites=%llu",
         g_updateCallCount.load(
             std::memory_order_relaxed
         ),
         g_registryNotificationCount.load(
+            std::memory_order_relaxed
+        ),
+        g_uiOrderWriteCount.load(
             std::memory_order_relaxed
         )
     );
