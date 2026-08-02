@@ -15,7 +15,9 @@ Hooks `Shell_NotifyIconW/A` and logs the identity information supplied by tray
 applications, including process path, package family, company, product, window,
 UID, GUID, flags and tooltip.
 
-The analyzer only observes calls and does not change icon data.
+The analyzer only observes calls and does not change icon data. Version 0.2.0
+keeps the live Windhawk output and also writes UTF-16 process logs under
+`%LOCALAPPDATA%\TrayOrderLockAnalyzer`.
 
 ## Repository layout
 

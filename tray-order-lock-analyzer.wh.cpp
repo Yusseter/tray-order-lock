@@ -2,7 +2,7 @@
 // @id              tray-order-lock-analyzer
 // @name            Tray Order Lock Analyzer
 // @description     Logs notification icon registrations to research stable cross-update tray identities.
-// @version         0.1.0
+// @version         0.2.0
 // @author          Yusseter
 // @github          https://github.com/Yusseter
 // @homepage        https://github.com/Yusseter/windhawk-tray-order-lock
@@ -25,8 +25,8 @@
 Logs `Shell_NotifyIconW` and `Shell_NotifyIconA` calls with process, package,
 version-resource, window, UID, GUID, flags and tooltip information.
 
-Version 0.1.0 writes only to Windhawk's live log output and does not modify any
-notification icon data.
+Version 0.2.0 writes to Windhawk's live log and to UTF-16 process logs under
+`%LOCALAPPDATA%\TrayOrderLockAnalyzer`. It does not modify notification icons.
 */
 // ==/WindhawkModReadme==
 
@@ -329,6 +329,106 @@ std::wstring BuildEventLine(
     return line;
 }
 
+std::mutex g_logMutex;
+HANDLE g_logFile = INVALID_HANDLE_VALUE;
+std::once_flag g_logInitOnce;
+
+void InitializePersistentLog() {
+    wchar_t localAppData[32768]{};
+    DWORD length = GetEnvironmentVariableW(
+        L"LOCALAPPDATA",
+        localAppData,
+        ARRAYSIZE(localAppData)
+    );
+
+    if (!length || length >= ARRAYSIZE(localAppData)) {
+        return;
+    }
+
+    std::wstring directory = localAppData;
+    directory += L"\\TrayOrderLockAnalyzer";
+    CreateDirectoryW(directory.c_str(), nullptr);
+
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+
+    std::wstring processName = GetBaseName(GetProcessPath());
+    for (wchar_t& ch : processName) {
+        if (ch == L'\\' || ch == L'/' || ch == L':' || ch == L'*' ||
+            ch == L'?' || ch == L'\"' || ch == L'<' || ch == L'>' ||
+            ch == L'|') {
+            ch = L'_';
+        }
+    }
+
+    wchar_t fileName[512]{};
+    _snwprintf_s(
+        fileName,
+        ARRAYSIZE(fileName),
+        _TRUNCATE,
+        L"\\events-%04u%02u%02u-%02u%02u%02u-%lu-%s.log",
+        now.wYear,
+        now.wMonth,
+        now.wDay,
+        now.wHour,
+        now.wMinute,
+        now.wSecond,
+        GetCurrentProcessId(),
+        processName.c_str()
+    );
+
+    std::wstring path = directory + fileName;
+    g_logFile = CreateFileW(
+        path.c_str(),
+        FILE_APPEND_DATA,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr
+    );
+
+    if (g_logFile == INVALID_HANDLE_VALUE) {
+        return;
+    }
+
+    LARGE_INTEGER size{};
+    if (GetFileSizeEx(g_logFile, &size) && size.QuadPart == 0) {
+        const wchar_t bom = 0xFEFF;
+        DWORD written = 0;
+        WriteFile(g_logFile, &bom, sizeof(bom), &written, nullptr);
+    }
+
+    Wh_Log(L"Persistent log: %s", path.c_str());
+}
+
+void AppendPersistentLine(const std::wstring& line) {
+    std::call_once(g_logInitOnce, InitializePersistentLog);
+    if (g_logFile == INVALID_HANDLE_VALUE) {
+        return;
+    }
+
+    std::wstring output = line + L"\r\n";
+    std::lock_guard<std::mutex> lock(g_logMutex);
+
+    DWORD written = 0;
+    WriteFile(
+        g_logFile,
+        output.data(),
+        static_cast<DWORD>(output.size() * sizeof(wchar_t)),
+        &written,
+        nullptr
+    );
+}
+
+void ClosePersistentLog() {
+    std::lock_guard<std::mutex> lock(g_logMutex);
+    if (g_logFile != INVALID_HANDLE_VALUE) {
+        CloseHandle(g_logFile);
+        g_logFile = INVALID_HANDLE_VALUE;
+    }
+}
+
 void RecordEvent(
     const wchar_t* api,
     DWORD message,
@@ -355,6 +455,7 @@ void RecordEvent(
     );
 
     Wh_Log(L"%s", line.c_str());
+    AppendPersistentLine(line);
 }
 
 BOOL WINAPI Shell_NotifyIconW_Hook(
@@ -456,5 +557,6 @@ BOOL Wh_ModInit() {
 }
 
 void Wh_ModUninit() {
+    ClosePersistentLog();
     Wh_Log(L"Tray Order Lock Analyzer stopped");
 }
