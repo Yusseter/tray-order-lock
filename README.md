@@ -42,8 +42,11 @@ editing, Git and review, then copy a `.wh.cpp` file into Windhawk for compilatio
 and runtime testing.
 
 The included VS Code task **Copy active Windhawk mod to clipboard** runs the
-PowerShell helper in `scripts/`. Windhawk remains responsible for `Compile Mod`,
-mod enablement and live log output.
+PowerShell helper in `scripts/`. Press `Ctrl+Shift+B` while the desired Windhawk
+source file is active to copy its complete contents to the clipboard.
+
+Windhawk remains responsible for `Compile Mod`, mod enablement and live log
+output.
 
 ## Research notes
 
