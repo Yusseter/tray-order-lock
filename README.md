@@ -19,11 +19,17 @@ The analyzer only observes calls and does not change icon data. Version 0.2.0
 keeps the live Windhawk output and also writes UTF-16 process logs under
 `%LOCALAPPDATA%\TrayOrderLockAnalyzer`.
 
+### System Tray Index Analyzer
+
+Hooks `StackViewModel::UpdateIconIndexes()` in `SystemTray.dll` (with a
+`Taskbar.View.dll` fallback) and logs each call without changing tray state.
+
 ## Repository layout
 
 ```text
 stable-tray-icons.wh.cpp
 tray-order-lock-analyzer.wh.cpp
+system-tray-index-analyzer.wh.cpp
 experiments/
 ├── chatgpt-stable-tray-id-test.wh.cpp
 └── nvidia-stable-tray-id-test.wh.cpp
