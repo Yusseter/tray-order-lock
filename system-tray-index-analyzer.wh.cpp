@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              system-tray-index-analyzer
 // @name            System Tray Index Analyzer
-// @description     Logs SystemTray index updates and read-only UIOrderList snapshots.
-// @version         0.2.0
+// @description     Logs immediate and delayed read-only UIOrderList snapshots around SystemTray index updates.
+// @version         0.2.1
 // @author          Yusseter
 // @github          https://github.com/Yusseter
 // @homepage        https://github.com/Yusseter/tray-order-lock
@@ -28,14 +28,21 @@ For every call, it records:
 - Call number
 - Thread ID
 - StackViewModel address
-- UIOrderList byte length before and after the original function
-- UIOrderList entry count before and after the original function
-- A 64-bit FNV-1a hash of UIOrderList before and after the original function
-- Whether the two snapshots differ
+- UIOrderList byte length, entry count and 64-bit FNV-1a hash immediately before
+  and after the original function
+- Whether the immediate before and after snapshots differ
+- Read-only delayed snapshots 10, 50, 250 and 1000 milliseconds after the
+  immediate after snapshot
+- Requested delay, actual elapsed time and whether each delayed snapshot differs
+  from the immediate after snapshot
+
+Delayed reads are scheduled on one background worker. Pending delayed reads are
+cancelled when the mod is unloaded, and the worker is stopped before the module
+can be released.
 
 The mod only reads:
 
-    HKCU\Control Panel\NotifyIconSettings\UIOrderList
+    HKCU\\Control Panel\\NotifyIconSettings\\UIOrderList
 
 It does not modify tray icons, tray ordering, registry values, XAML elements,
 function arguments or original return behavior.
@@ -46,7 +53,9 @@ function arguments or original return behavior.
 #include <windhawk_utils.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <queue>
 #include <vector>
 
 namespace {
@@ -63,6 +72,13 @@ constexpr std::uint64_t kFnv1aOffsetBasis =
 constexpr std::uint64_t kFnv1aPrime =
     1099511628211ULL;
 
+constexpr DWORD kDelayedSnapshotDelaysMs[] = {
+    10,
+    50,
+    250,
+    1000,
+};
+
 std::atomic<bool> g_systemTrayModuleHooked = false;
 std::atomic<unsigned long long> g_updateCallCount = 0;
 
@@ -75,6 +91,42 @@ struct UIOrderSnapshot {
     std::uint64_t hash = 0;
     bool valid = false;
 };
+
+struct DelayedSnapshotJob {
+    std::chrono::steady_clock::time_point dueTime;
+    std::chrono::steady_clock::time_point baseTime;
+    unsigned long long callNumber = 0;
+    DWORD requestedDelayMs = 0;
+    unsigned long long sequence = 0;
+    UIOrderSnapshot immediateAfterSnapshot;
+};
+
+struct DelayedSnapshotJobCompare {
+    bool operator()(
+        const DelayedSnapshotJob& left,
+        const DelayedSnapshotJob& right
+    ) const {
+        if (left.dueTime != right.dueTime) {
+            return left.dueTime > right.dueTime;
+        }
+
+        return left.sequence > right.sequence;
+    }
+};
+
+using DelayedSnapshotQueue = std::priority_queue<
+    DelayedSnapshotJob,
+    std::vector<DelayedSnapshotJob>,
+    DelayedSnapshotJobCompare
+>;
+
+SRWLOCK g_delayedJobsLock = SRWLOCK_INIT;
+DelayedSnapshotQueue g_delayedJobs;
+std::atomic<bool> g_delayedWorkerStopping = false;
+std::atomic<bool> g_acceptDelayedJobs = false;
+std::atomic<unsigned long long> g_delayedJobSequence = 0;
+HANDLE g_delayedWorkerWakeEvent = nullptr;
+HANDLE g_delayedWorkerThread = nullptr;
 
 using StackViewModel_UpdateIconIndexes_t =
     void(WINAPI*)(void* pThis);
@@ -214,6 +266,364 @@ bool AreSnapshotsEqual(
         first.hash == second.hash;
 }
 
+void LogDelayedUIOrderSnapshot(
+    const DelayedSnapshotJob& job,
+    unsigned long long actualElapsedMs,
+    const UIOrderSnapshot& delayedSnapshot
+) {
+    int comparable =
+        job.immediateAfterSnapshot.valid &&
+        delayedSnapshot.valid
+            ? 1
+            : 0;
+
+    int changedFromImmediateAfter =
+        comparable &&
+        !AreSnapshotsEqual(
+            job.immediateAfterSnapshot,
+            delayedSnapshot
+        )
+            ? 1
+            : 0;
+
+    Wh_Log(
+        L"UIORDER_DELAYED "
+        L"call=%llu "
+        L"requestedDelayMs=%lu "
+        L"actualElapsedMs=%llu "
+        L"valid=%d "
+        L"status=%ld "
+        L"type=%lu "
+        L"bytes=%lu "
+        L"entries=%llu "
+        L"aligned=%d "
+        L"hash=0x%016llX "
+        L"comparable=%d "
+        L"changedFromImmediateAfter=%d "
+        L"immediateAfterHash=0x%016llX",
+        job.callNumber,
+        job.requestedDelayMs,
+        actualElapsedMs,
+        delayedSnapshot.valid ? 1 : 0,
+        delayedSnapshot.status,
+        delayedSnapshot.registryType,
+        delayedSnapshot.byteLength,
+        delayedSnapshot.entryCount,
+        delayedSnapshot.lengthAligned ? 1 : 0,
+        static_cast<unsigned long long>(delayedSnapshot.hash),
+        comparable,
+        changedFromImmediateAfter,
+        static_cast<unsigned long long>(
+            job.immediateAfterSnapshot.hash
+        )
+    );
+}
+
+DWORD WINAPI DelayedSnapshotWorkerThreadProc(
+    LPVOID
+) {
+    Wh_Log(
+        L"Delayed snapshot worker started; thread=%lu",
+        GetCurrentThreadId()
+    );
+
+    for (;;) {
+        DelayedSnapshotJob job;
+        bool haveJob = false;
+        DWORD waitMilliseconds = INFINITE;
+
+        bool shouldStop = false;
+
+        AcquireSRWLockExclusive(
+            &g_delayedJobsLock
+        );
+
+        if (
+            g_delayedWorkerStopping.load(
+                std::memory_order_acquire
+            )
+        ) {
+            shouldStop = true;
+        }
+        else if (!g_delayedJobs.empty()) {
+            const auto now =
+                std::chrono::steady_clock::now();
+
+            const DelayedSnapshotJob& nextJob =
+                g_delayedJobs.top();
+
+            if (nextJob.dueTime <= now) {
+                job = nextJob;
+                g_delayedJobs.pop();
+                haveJob = true;
+            }
+            else {
+                const auto remaining =
+                    std::chrono::ceil<
+                        std::chrono::milliseconds
+                    >(
+                        nextJob.dueTime - now
+                    );
+
+                const auto remainingCount =
+                    remaining.count();
+
+                waitMilliseconds =
+                    remainingCount >=
+                            static_cast<long long>(INFINITE)
+                        ? INFINITE - 1
+                        : static_cast<DWORD>(
+                              remainingCount
+                          );
+            }
+        }
+
+        ReleaseSRWLockExclusive(
+            &g_delayedJobsLock
+        );
+
+        if (shouldStop) {
+            break;
+        }
+
+        if (haveJob) {
+            UIOrderSnapshot delayedSnapshot =
+                CaptureUIOrderSnapshot();
+
+            const auto completedAt =
+                std::chrono::steady_clock::now();
+
+            const auto actualElapsed =
+                std::chrono::duration_cast<
+                    std::chrono::milliseconds
+                >(
+                    completedAt - job.baseTime
+                );
+
+            LogDelayedUIOrderSnapshot(
+                job,
+                static_cast<unsigned long long>(
+                    actualElapsed.count()
+                ),
+                delayedSnapshot
+            );
+
+            continue;
+        }
+
+        DWORD waitResult = WaitForSingleObject(
+            g_delayedWorkerWakeEvent,
+            waitMilliseconds
+        );
+
+        if (waitResult == WAIT_FAILED) {
+            DWORD error = GetLastError();
+
+            g_acceptDelayedJobs.store(
+                false,
+                std::memory_order_release
+            );
+
+            Wh_Log(
+                L"Delayed snapshot worker wait failed; error=%lu",
+                error
+            );
+
+            break;
+        }
+    }
+
+    Wh_Log(
+        L"Delayed snapshot worker stopped; thread=%lu",
+        GetCurrentThreadId()
+    );
+
+    return 0;
+}
+
+bool StartDelayedSnapshotWorker() {
+    if (g_delayedWorkerThread) {
+        return true;
+    }
+
+    g_delayedWorkerStopping.store(
+        false,
+        std::memory_order_release
+    );
+
+    g_acceptDelayedJobs.store(
+        false,
+        std::memory_order_release
+    );
+
+    g_delayedWorkerWakeEvent = CreateEventW(
+        nullptr,
+        FALSE,
+        FALSE,
+        nullptr
+    );
+
+    if (!g_delayedWorkerWakeEvent) {
+        Wh_Log(
+            L"Failed to create delayed snapshot wake event; error=%lu",
+            GetLastError()
+        );
+
+        return false;
+    }
+
+    g_delayedWorkerThread = CreateThread(
+        nullptr,
+        0,
+        DelayedSnapshotWorkerThreadProc,
+        nullptr,
+        0,
+        nullptr
+    );
+
+    if (!g_delayedWorkerThread) {
+        DWORD error = GetLastError();
+
+        CloseHandle(g_delayedWorkerWakeEvent);
+        g_delayedWorkerWakeEvent = nullptr;
+
+        Wh_Log(
+            L"Failed to create delayed snapshot worker; error=%lu",
+            error
+        );
+
+        return false;
+    }
+
+    g_acceptDelayedJobs.store(
+        true,
+        std::memory_order_release
+    );
+
+    return true;
+}
+
+void QueueDelayedSnapshots(
+    unsigned long long callNumber,
+    const UIOrderSnapshot& immediateAfterSnapshot,
+    std::chrono::steady_clock::time_point baseTime
+) {
+    if (
+        !g_acceptDelayedJobs.load(
+            std::memory_order_acquire
+        )
+    ) {
+        return;
+    }
+
+    AcquireSRWLockExclusive(
+        &g_delayedJobsLock
+    );
+
+    if (
+        !g_acceptDelayedJobs.load(
+            std::memory_order_acquire
+        )
+    ) {
+        ReleaseSRWLockExclusive(
+            &g_delayedJobsLock
+        );
+
+        return;
+    }
+
+    for (DWORD delayMilliseconds :
+         kDelayedSnapshotDelaysMs) {
+        DelayedSnapshotJob job;
+
+        job.dueTime =
+            baseTime +
+            std::chrono::milliseconds(
+                delayMilliseconds
+            );
+
+        job.baseTime = baseTime;
+        job.callNumber = callNumber;
+        job.requestedDelayMs = delayMilliseconds;
+        job.sequence =
+            g_delayedJobSequence.fetch_add(
+                1,
+                std::memory_order_relaxed
+            );
+
+        job.immediateAfterSnapshot =
+            immediateAfterSnapshot;
+
+        g_delayedJobs.push(job);
+    }
+
+    SetEvent(g_delayedWorkerWakeEvent);
+
+    ReleaseSRWLockExclusive(
+        &g_delayedJobsLock
+    );
+}
+
+void StopDelayedSnapshotWorker() {
+    g_acceptDelayedJobs.store(
+        false,
+        std::memory_order_release
+    );
+
+    std::size_t cancelledJobs = 0;
+
+    AcquireSRWLockExclusive(
+        &g_delayedJobsLock
+    );
+
+    g_delayedWorkerStopping.store(
+        true,
+        std::memory_order_release
+    );
+
+    cancelledJobs = g_delayedJobs.size();
+
+    while (!g_delayedJobs.empty()) {
+        g_delayedJobs.pop();
+    }
+
+    ReleaseSRWLockExclusive(
+        &g_delayedJobsLock
+    );
+
+    if (g_delayedWorkerWakeEvent) {
+        SetEvent(g_delayedWorkerWakeEvent);
+    }
+
+    if (g_delayedWorkerThread) {
+        DWORD waitResult = WaitForSingleObject(
+            g_delayedWorkerThread,
+            INFINITE
+        );
+
+        if (waitResult != WAIT_OBJECT_0) {
+            Wh_Log(
+                L"Waiting for delayed snapshot worker failed; result=%lu error=%lu",
+                waitResult,
+                GetLastError()
+            );
+        }
+
+        CloseHandle(g_delayedWorkerThread);
+        g_delayedWorkerThread = nullptr;
+    }
+
+    if (g_delayedWorkerWakeEvent) {
+        CloseHandle(g_delayedWorkerWakeEvent);
+        g_delayedWorkerWakeEvent = nullptr;
+    }
+
+    Wh_Log(
+        L"Delayed snapshot worker cleanup complete; cancelledJobs=%llu",
+        static_cast<unsigned long long>(cancelledJobs)
+    );
+}
+
 void LogModuleInformation(HMODULE module) {
     wchar_t modulePath[MAX_PATH]{};
 
@@ -276,6 +686,9 @@ void WINAPI StackViewModel_UpdateIconIndexes_Hook(
     UIOrderSnapshot afterSnapshot =
         CaptureUIOrderSnapshot();
 
+    const auto afterSnapshotTime =
+        std::chrono::steady_clock::now();
+
     LogUIOrderSnapshot(
         L"after",
         callNumber,
@@ -317,6 +730,12 @@ void WINAPI StackViewModel_UpdateIconIndexes_Hook(
         static_cast<unsigned long long>(
             afterSnapshot.hash
         )
+    );
+
+    QueueDelayedSnapshots(
+        callNumber,
+        afterSnapshot,
+        afterSnapshotTime
     );
 
     Wh_Log(
@@ -506,9 +925,13 @@ bool HookModuleLoader() {
 
 BOOL Wh_ModInit() {
     Wh_Log(
-        L"System Tray Index Analyzer 0.2.0 "
+        L"System Tray Index Analyzer 0.2.1 "
         L"initializing"
     );
+
+    if (!StartDelayedSnapshotWorker()) {
+        return FALSE;
+    }
 
     HMODULE module =
         GetSystemTrayModuleHandle();
@@ -525,6 +948,7 @@ BOOL Wh_ModInit() {
                 std::memory_order_release
             );
 
+            StopDelayedSnapshotWorker();
             return FALSE;
         }
 
@@ -536,7 +960,12 @@ BOOL Wh_ModInit() {
         L"waiting for module load"
     );
 
-    return HookModuleLoader();
+    if (!HookModuleLoader()) {
+        StopDelayedSnapshotWorker();
+        return FALSE;
+    }
+
+    return TRUE;
 }
 
 void Wh_ModAfterInit() {
@@ -585,6 +1014,8 @@ void Wh_ModAfterInit() {
 }
 
 void Wh_ModUninit() {
+    StopDelayedSnapshotWorker();
+
     Wh_Log(
         L"System Tray Index Analyzer stopped; "
         L"capturedCalls=%llu",
