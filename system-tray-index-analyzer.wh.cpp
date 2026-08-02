@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              system-tray-index-analyzer
 // @name            System Tray Index Analyzer
-// @description     Logs immediate and delayed read-only UIOrderList snapshots around SystemTray index updates.
-// @version         0.2.2
+// @description     Logs SystemTray index updates, delayed snapshots and read-only UIOrderList registry notifications.
+// @version         0.3.0
 // @author          Yusseter
 // @github          https://github.com/Yusseter
 // @homepage        https://github.com/Yusseter/tray-order-lock
@@ -23,7 +23,7 @@ The mod hooks:
 
     winrt::SystemTray::implementation::StackViewModel::UpdateIconIndexes()
 
-For every call, it records:
+The mod records:
 
 - Call number
 - Thread ID
@@ -35,10 +35,19 @@ For every call, it records:
   5000 and 10000 milliseconds after the immediate after snapshot
 - Requested delay, actual elapsed time and whether each delayed snapshot differs
   from the immediate after snapshot
+- Read-only last-set notifications for the NotifyIconSettings registry key
+- The UIOrderList snapshot observed after each notification, compared with the
+  previous watcher snapshot
+- The number of UpdateIconIndexes calls observed when the notification is
+  processed
 
 Delayed reads are scheduled on one background worker. Pending delayed reads are
 cancelled when the mod is unloaded, and the worker is stopped before the module
 can be released.
+
+Registry notifications are key-wide and can be caused by values other than
+UIOrderList. Every notification is therefore followed by a read-only
+UIOrderList snapshot and comparison. Notifications can be coalesced by Windows.
 
 The mod only reads:
 
@@ -133,6 +142,14 @@ std::atomic<bool> g_acceptDelayedJobs = false;
 std::atomic<unsigned long long> g_delayedJobSequence = 0;
 HANDLE g_delayedWorkerWakeEvent = nullptr;
 HANDLE g_delayedWorkerThread = nullptr;
+
+std::atomic<unsigned long long>
+    g_registryNotificationCount = 0;
+
+HANDLE g_registryWatcherStopEvent = nullptr;
+HANDLE g_registryWatcherChangeEvent = nullptr;
+HANDLE g_registryWatcherThread = nullptr;
+HKEY g_registryWatcherKey = nullptr;
 
 using StackViewModel_UpdateIconIndexes_t =
     void(WINAPI*)(void* pThis);
@@ -630,6 +647,353 @@ void StopDelayedSnapshotWorker() {
     );
 }
 
+
+void LogUIOrderRegistryWatcherSnapshot(
+    const wchar_t* phase,
+    unsigned long long notificationNumber,
+    const UIOrderSnapshot* previousSnapshot,
+    const UIOrderSnapshot& currentSnapshot
+) {
+    int comparable =
+        previousSnapshot &&
+        previousSnapshot->valid &&
+        currentSnapshot.valid
+            ? 1
+            : 0;
+
+    int changedFromPrevious =
+        comparable &&
+        !AreSnapshotsEqual(
+            *previousSnapshot,
+            currentSnapshot
+        )
+            ? 1
+            : 0;
+
+    unsigned long long previousHash =
+        previousSnapshot
+            ? static_cast<unsigned long long>(
+                  previousSnapshot->hash
+              )
+            : 0;
+
+    Wh_Log(
+        L"UIORDER_WATCH "
+        L"phase=%s "
+        L"notification=%llu "
+        L"updateCallsObserved=%llu "
+        L"valid=%d "
+        L"status=%ld "
+        L"type=%lu "
+        L"bytes=%lu "
+        L"entries=%llu "
+        L"aligned=%d "
+        L"hash=0x%016llX "
+        L"comparable=%d "
+        L"changedFromPrevious=%d "
+        L"previousHash=0x%016llX",
+        phase,
+        notificationNumber,
+        g_updateCallCount.load(
+            std::memory_order_acquire
+        ),
+        currentSnapshot.valid ? 1 : 0,
+        currentSnapshot.status,
+        currentSnapshot.registryType,
+        currentSnapshot.byteLength,
+        currentSnapshot.entryCount,
+        currentSnapshot.lengthAligned ? 1 : 0,
+        static_cast<unsigned long long>(
+            currentSnapshot.hash
+        ),
+        comparable,
+        changedFromPrevious,
+        previousHash
+    );
+}
+
+LONG ArmUIOrderRegistryNotification() {
+    return RegNotifyChangeKeyValue(
+        g_registryWatcherKey,
+        FALSE,
+        REG_NOTIFY_CHANGE_LAST_SET,
+        g_registryWatcherChangeEvent,
+        TRUE
+    );
+}
+
+DWORD WINAPI UIOrderRegistryWatcherThreadProc(
+    LPVOID
+) {
+    Wh_Log(
+        L"UIOrderList registry watcher started; "
+        L"thread=%lu",
+        GetCurrentThreadId()
+    );
+
+    LONG notifyStatus =
+        ArmUIOrderRegistryNotification();
+
+    if (notifyStatus != ERROR_SUCCESS) {
+        Wh_Log(
+            L"Initial registry notification "
+            L"registration failed; status=%ld",
+            notifyStatus
+        );
+
+        return 0;
+    }
+
+    UIOrderSnapshot previousSnapshot =
+        CaptureUIOrderSnapshot();
+
+    LogUIOrderRegistryWatcherSnapshot(
+        L"baseline",
+        0,
+        nullptr,
+        previousSnapshot
+    );
+
+    HANDLE waitHandles[] = {
+        g_registryWatcherStopEvent,
+        g_registryWatcherChangeEvent,
+    };
+
+    for (;;) {
+        DWORD waitResult = WaitForMultipleObjects(
+            ARRAYSIZE(waitHandles),
+            waitHandles,
+            FALSE,
+            INFINITE
+        );
+
+        if (waitResult == WAIT_OBJECT_0) {
+            break;
+        }
+
+        if (waitResult == WAIT_OBJECT_0 + 1) {
+            /*
+            RegNotifyChangeKeyValue is one-shot. Re-arm it before
+            reading UIOrderList so a change that occurs during the
+            registry read can still signal the event.
+            */
+            notifyStatus =
+                ArmUIOrderRegistryNotification();
+
+            if (notifyStatus != ERROR_SUCCESS) {
+                Wh_Log(
+                    L"Registry notification "
+                    L"re-registration failed; "
+                    L"status=%ld",
+                    notifyStatus
+                );
+
+                break;
+            }
+
+            UIOrderSnapshot currentSnapshot =
+                CaptureUIOrderSnapshot();
+
+            unsigned long long notificationNumber =
+                g_registryNotificationCount.fetch_add(
+                    1,
+                    std::memory_order_relaxed
+                ) + 1;
+
+            LogUIOrderRegistryWatcherSnapshot(
+                L"change",
+                notificationNumber,
+                &previousSnapshot,
+                currentSnapshot
+            );
+
+            previousSnapshot = currentSnapshot;
+            continue;
+        }
+
+        if (waitResult == WAIT_FAILED) {
+            Wh_Log(
+                L"Registry watcher wait failed; "
+                L"error=%lu",
+                GetLastError()
+            );
+        }
+        else {
+            Wh_Log(
+                L"Registry watcher received "
+                L"unexpected wait result=%lu",
+                waitResult
+            );
+        }
+
+        break;
+    }
+
+    Wh_Log(
+        L"UIOrderList registry watcher stopped; "
+        L"thread=%lu notifications=%llu",
+        GetCurrentThreadId(),
+        g_registryNotificationCount.load(
+            std::memory_order_relaxed
+        )
+    );
+
+    return 0;
+}
+
+bool StartUIOrderRegistryWatcher() {
+    if (g_registryWatcherThread) {
+        return true;
+    }
+
+    g_registryNotificationCount.store(
+        0,
+        std::memory_order_release
+    );
+
+    LONG openStatus = RegOpenKeyExW(
+        HKEY_CURRENT_USER,
+        kNotifyIconSettingsPath,
+        0,
+        KEY_NOTIFY,
+        &g_registryWatcherKey
+    );
+
+    if (openStatus != ERROR_SUCCESS) {
+        Wh_Log(
+            L"Failed to open NotifyIconSettings "
+            L"for notifications; status=%ld",
+            openStatus
+        );
+
+        return false;
+    }
+
+    g_registryWatcherStopEvent = CreateEventW(
+        nullptr,
+        TRUE,
+        FALSE,
+        nullptr
+    );
+
+    if (!g_registryWatcherStopEvent) {
+        DWORD error = GetLastError();
+
+        RegCloseKey(g_registryWatcherKey);
+        g_registryWatcherKey = nullptr;
+
+        Wh_Log(
+            L"Failed to create registry watcher "
+            L"stop event; error=%lu",
+            error
+        );
+
+        return false;
+    }
+
+    g_registryWatcherChangeEvent = CreateEventW(
+        nullptr,
+        FALSE,
+        FALSE,
+        nullptr
+    );
+
+    if (!g_registryWatcherChangeEvent) {
+        DWORD error = GetLastError();
+
+        CloseHandle(g_registryWatcherStopEvent);
+        g_registryWatcherStopEvent = nullptr;
+
+        RegCloseKey(g_registryWatcherKey);
+        g_registryWatcherKey = nullptr;
+
+        Wh_Log(
+            L"Failed to create registry watcher "
+            L"change event; error=%lu",
+            error
+        );
+
+        return false;
+    }
+
+    g_registryWatcherThread = CreateThread(
+        nullptr,
+        0,
+        UIOrderRegistryWatcherThreadProc,
+        nullptr,
+        0,
+        nullptr
+    );
+
+    if (!g_registryWatcherThread) {
+        DWORD error = GetLastError();
+
+        CloseHandle(g_registryWatcherChangeEvent);
+        g_registryWatcherChangeEvent = nullptr;
+
+        CloseHandle(g_registryWatcherStopEvent);
+        g_registryWatcherStopEvent = nullptr;
+
+        RegCloseKey(g_registryWatcherKey);
+        g_registryWatcherKey = nullptr;
+
+        Wh_Log(
+            L"Failed to create registry watcher "
+            L"thread; error=%lu",
+            error
+        );
+
+        return false;
+    }
+
+    return true;
+}
+
+void StopUIOrderRegistryWatcher() {
+    if (g_registryWatcherStopEvent) {
+        SetEvent(g_registryWatcherStopEvent);
+    }
+
+    if (g_registryWatcherThread) {
+        DWORD waitResult = WaitForSingleObject(
+            g_registryWatcherThread,
+            INFINITE
+        );
+
+        if (waitResult != WAIT_OBJECT_0) {
+            Wh_Log(
+                L"Waiting for registry watcher "
+                L"failed; result=%lu error=%lu",
+                waitResult,
+                GetLastError()
+            );
+        }
+
+        CloseHandle(g_registryWatcherThread);
+        g_registryWatcherThread = nullptr;
+    }
+
+    if (g_registryWatcherKey) {
+        RegCloseKey(g_registryWatcherKey);
+        g_registryWatcherKey = nullptr;
+    }
+
+    if (g_registryWatcherChangeEvent) {
+        CloseHandle(g_registryWatcherChangeEvent);
+        g_registryWatcherChangeEvent = nullptr;
+    }
+
+    if (g_registryWatcherStopEvent) {
+        CloseHandle(g_registryWatcherStopEvent);
+        g_registryWatcherStopEvent = nullptr;
+    }
+
+    Wh_Log(
+        L"UIOrderList registry watcher "
+        L"cleanup complete"
+    );
+}
+
 void LogModuleInformation(HMODULE module) {
     wchar_t modulePath[MAX_PATH]{};
 
@@ -931,11 +1295,16 @@ bool HookModuleLoader() {
 
 BOOL Wh_ModInit() {
     Wh_Log(
-        L"System Tray Index Analyzer 0.2.2 "
+        L"System Tray Index Analyzer 0.3.0 "
         L"initializing"
     );
 
     if (!StartDelayedSnapshotWorker()) {
+        return FALSE;
+    }
+
+    if (!StartUIOrderRegistryWatcher()) {
+        StopDelayedSnapshotWorker();
         return FALSE;
     }
 
@@ -954,6 +1323,7 @@ BOOL Wh_ModInit() {
                 std::memory_order_release
             );
 
+            StopUIOrderRegistryWatcher();
             StopDelayedSnapshotWorker();
             return FALSE;
         }
@@ -967,6 +1337,7 @@ BOOL Wh_ModInit() {
     );
 
     if (!HookModuleLoader()) {
+        StopUIOrderRegistryWatcher();
         StopDelayedSnapshotWorker();
         return FALSE;
     }
@@ -1021,11 +1392,16 @@ void Wh_ModAfterInit() {
 
 void Wh_ModUninit() {
     StopDelayedSnapshotWorker();
+    StopUIOrderRegistryWatcher();
 
     Wh_Log(
         L"System Tray Index Analyzer stopped; "
-        L"capturedCalls=%llu",
+        L"capturedCalls=%llu "
+        L"registryNotifications=%llu",
         g_updateCallCount.load(
+            std::memory_order_relaxed
+        ),
+        g_registryNotificationCount.load(
             std::memory_order_relaxed
         )
     );
