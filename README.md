@@ -35,6 +35,16 @@ experiments/
 └── nvidia-stable-tray-id-test.wh.cpp
 ```
 
+## VS Code workflow
+
+The files in this repository are the source of truth. Use normal VS Code for
+editing, Git and review, then copy a `.wh.cpp` file into Windhawk for compilation
+and runtime testing.
+
+The included VS Code task **Copy active Windhawk mod to clipboard** runs the
+PowerShell helper in `scripts/`. Windhawk remains responsible for `Compile Mod`,
+mod enablement and live log output.
+
 ## Research notes
 
 See [`docs/research.md`](docs/research.md) for the tested identity and

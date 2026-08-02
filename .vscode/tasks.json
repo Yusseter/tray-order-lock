@@ -1,0 +1,20 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Copy active Windhawk mod to clipboard",
+      "type": "shell",
+      "command": "pwsh",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${workspaceFolder}\\scripts\\copy-mod-to-clipboard.ps1",
+        "-Path",
+        "${file}"
+      ],
+      "problemMatcher": []
+    }
+  ]
+}
