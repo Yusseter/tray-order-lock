@@ -1,22 +1,26 @@
 # Windhawk Tray Order Lock
 
-Research project for keeping Windows 11 notification-area icons associated with
-their intended identities and positions across application updates.
+Research project for preserving Windows 11 notification-area icon identity and
+ordering across application updates.
 
-## Current stage
+## Stable Tray Icons
 
-The repository starts with two focused Windhawk experiments:
+`stable-tray-icons.wh.cpp` combines the verified app-specific experiments:
 
-- `ChatGPT Stable Tray ID Test`
-- `NVIDIA Stable Tray ID Test`
+- ChatGPT: UID `3`
+- NVIDIA Settings: UID `1051`
 
-Each experiment assigns a fixed GUID to one verified tray icon. This tests
-whether a stable icon identity prevents application updates or changing host
-executables from creating a new tray record.
+Both icons receive fixed GUIDs before their `Shell_NotifyIconW/A` calls reach the
+Windows shell. The standalone test mods remain under `experiments/` for reference.
+
+This fixes identity changes for those selected applications, but it is not a
+general solution because many tray applications do not provide stable GUIDs or
+stable UIDs.
 
 ## Repository layout
 
 ```text
+stable-tray-icons.wh.cpp
 experiments/
 ├── chatgpt-stable-tray-id-test.wh.cpp
 └── nvidia-stable-tray-id-test.wh.cpp
@@ -24,7 +28,7 @@ experiments/
 
 ## Status
 
-Experimental. The repository does not yet provide a general tray-order lock.
+Experimental research project.
 
 ## License
 
