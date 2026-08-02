@@ -2,7 +2,7 @@
 // @id              system-tray-index-analyzer
 // @name            System Tray Index Analyzer
 // @description     Logs immediate and delayed read-only UIOrderList snapshots around SystemTray index updates.
-// @version         0.2.1
+// @version         0.2.2
 // @author          Yusseter
 // @github          https://github.com/Yusseter
 // @homepage        https://github.com/Yusseter/tray-order-lock
@@ -31,8 +31,8 @@ For every call, it records:
 - UIOrderList byte length, entry count and 64-bit FNV-1a hash immediately before
   and after the original function
 - Whether the immediate before and after snapshots differ
-- Read-only delayed snapshots 10, 50, 250 and 1000 milliseconds after the
-  immediate after snapshot
+- Read-only delayed snapshots 10, 50, 250, 1000, 1500, 2000, 2500, 3000,
+  5000 and 10000 milliseconds after the immediate after snapshot
 - Requested delay, actual elapsed time and whether each delayed snapshot differs
   from the immediate after snapshot
 
@@ -77,6 +77,12 @@ constexpr DWORD kDelayedSnapshotDelaysMs[] = {
     50,
     250,
     1000,
+    1500,
+    2000,
+    2500,
+    3000,
+    5000,
+    10000,
 };
 
 std::atomic<bool> g_systemTrayModuleHooked = false;
@@ -925,7 +931,7 @@ bool HookModuleLoader() {
 
 BOOL Wh_ModInit() {
     Wh_Log(
-        L"System Tray Index Analyzer 0.2.1 "
+        L"System Tray Index Analyzer 0.2.2 "
         L"initializing"
     );
 
