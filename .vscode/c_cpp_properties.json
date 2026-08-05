@@ -1,0 +1,20 @@
+{
+  "configurations": [
+    {
+      "name": "Windhawk x64",
+      "includePath": [
+        "${workspaceFolder}/**",
+        "${env:ProgramFiles}/Windhawk/Compiler/include/**"
+      ],
+      "defines": [
+        "WH_MOD",
+        "UNICODE",
+        "_UNICODE"
+      ],
+      "cStandard": "c17",
+      "cppStandard": "c++20",
+      "intelliSenseMode": "windows-msvc-x64"
+    }
+  ],
+  "version": 4
+}

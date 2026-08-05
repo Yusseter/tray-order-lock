@@ -10,11 +10,15 @@
         "-ExecutionPolicy",
         "Bypass",
         "-File",
-        "${workspaceFolder}\\scripts\\copy-mod-to-clipboard.ps1",
+        "${workspaceFolder}/scripts/copy-mod-to-clipboard.ps1",
         "-Path",
         "${file}"
       ],
-      "problemMatcher": []
+      "problemMatcher": [],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      }
     }
   ]
 }
