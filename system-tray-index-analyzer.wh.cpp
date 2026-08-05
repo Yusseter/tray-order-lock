@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              system-tray-index-analyzer
 // @name            System Tray Index Analyzer
-// @description     Tests whether suppressing one UIOrderList write also prevents the visible tray reorder.
-// @version         0.5.0
+// @description     Tests whether suppressing one ITaskbarModel5::MoveNotificationAreaIcon request prevents a visible tray reorder.
+// @version         0.6.0
 // @author          Yusseter
 // @github          https://github.com/Yusseter
 // @homepage        https://github.com/Yusseter/tray-order-lock
@@ -19,31 +19,30 @@
 A temporary diagnostic mod for researching Windows 11 notification-area icon
 ordering.
 
-Version 0.5.0 performs a single controlled behavior test:
+Version 0.6.0 performs a single controlled behavior test:
 
-- It watches for NtSetValueKey calls targeting the REG_BINARY UIOrderList value
-  under HKCU\\Control Panel\\NotifyIconSettings.
-- The first exact matching write is suppressed and STATUS_SUCCESS is returned to
-  the caller.
-- Every later matching write is passed to the original NtSetValueKey function.
-- Writes with an unresolved key path, a different key, a different value name or
-  a different registry type are never suppressed.
+- It hooks the ABI-facing `ITaskbarModel5::MoveNotificationAreaIcon` producer in
+  `taskbar.dll` using the exact public symbol recovered from Microsoft symbols.
+- The first move request after the mod is loaded returns `S_OK` without calling
+  the original producer, so the lower `NotificationAreaIconManager2::MoveIcon`
+  function is never entered.
+- Every later move request is passed through unchanged.
+- `NtSetValueKey` is still observed for exact `UIOrderList` writes, but no
+  registry write is suppressed in this version.
 
-The one-shot suppression makes it possible to test whether preventing the
-registry write also prevents the visible tray reorder. A second drag remains
-available for restoring and persisting the original icon position.
+The test determines whether suppressing the move request above `MoveIcon` stops
+both the live collection update and the persistent `UIOrderList` update.
 
 The mod also records:
 
-- Matching UIOrderList write attempts and whether each one was suppressed
-- Read-only UIOrderList snapshots before and after each matching attempt
-- Read-only last-set notifications for the NotifyIconSettings registry key
-- StackViewModel::UpdateIconIndexes calls and read-only before/after snapshots
-- Correlation counters for write attempts, suppressed writes, registry
-  notifications and index updates
+- Move requests, arguments, and whether the request was suppressed
+- Exact `UIOrderList` write attempts and read-only before/after snapshots
+- Read-only last-set notifications for `NotifyIconSettings`
+- `StackViewModel::UpdateIconIndexes` calls and read-only before/after snapshots
+- Correlation counters for moves, writes, notifications, and index updates
 
-This is an experimental diagnostic version. It intentionally changes the first
-exact matching UIOrderList write after the mod is loaded.
+This is an experimental diagnostic version. It intentionally suppresses the
+first `ITaskbarModel5::MoveNotificationAreaIcon` request after the mod is loaded.
 */
 // ==/WindhawkModReadme==
 
@@ -52,6 +51,7 @@ exact matching UIOrderList write after the mod is loaded.
 #include <windhawk_utils.h>
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cwchar>
 #include <string>
@@ -74,40 +74,75 @@ constexpr std::uint64_t kFnv1aOffsetBasis =
 constexpr std::uint64_t kFnv1aPrime =
     1099511628211ULL;
 
-constexpr ULONG kKeyNameInformationClass = 3;
-constexpr NTSTATUS kStatusSuccess =
-    static_cast<NTSTATUS>(0);
+constexpr ULONG kKeyNameInformationClass =
+    3;
 
-std::atomic<bool> g_systemTrayModuleHooked = false;
-std::atomic<bool> g_firstMatchingWriteSuppressed = false;
+std::atomic<bool> g_taskbarModuleHooked =
+    false;
 
-std::atomic<unsigned long long>
-    g_updateCallCount = 0;
+std::atomic<bool> g_systemTrayModuleHooked =
+    false;
 
-std::atomic<unsigned long long>
-    g_registryNotificationCount = 0;
-
-std::atomic<unsigned long long>
-    g_uiOrderWriteAttemptCount = 0;
+std::atomic<bool> g_firstMoveRequestSuppressed =
+    false;
 
 std::atomic<unsigned long long>
-    g_uiOrderSuppressedWriteCount = 0;
+    g_moveRequestCallCount =
+        0;
 
-HANDLE g_registryWatcherStopEvent = nullptr;
-HANDLE g_registryWatcherChangeEvent = nullptr;
-HANDLE g_registryWatcherThread = nullptr;
-HKEY g_registryWatcherKey = nullptr;
+std::atomic<unsigned long long>
+    g_moveRequestSuppressedCount =
+        0;
 
-thread_local bool g_insideNtSetValueKeyHook = false;
+std::atomic<unsigned long long>
+    g_updateCallCount =
+        0;
+
+std::atomic<unsigned long long>
+    g_registryNotificationCount =
+        0;
+
+std::atomic<unsigned long long>
+    g_uiOrderWriteAttemptCount =
+        0;
+
+HANDLE g_registryWatcherStopEvent =
+    nullptr;
+
+HANDLE g_registryWatcherChangeEvent =
+    nullptr;
+
+HANDLE g_registryWatcherThread =
+    nullptr;
+
+HKEY g_registryWatcherKey =
+    nullptr;
+
+thread_local bool
+    g_insideNtSetValueKeyHook =
+        false;
 
 struct UIOrderSnapshot {
-    LONG status = ERROR_SUCCESS;
-    DWORD registryType = REG_NONE;
-    DWORD byteLength = 0;
-    unsigned long long entryCount = 0;
-    bool lengthAligned = false;
-    std::uint64_t hash = 0;
-    bool valid = false;
+    LONG status =
+        ERROR_SUCCESS;
+
+    DWORD registryType =
+        REG_NONE;
+
+    DWORD byteLength =
+        0;
+
+    unsigned long long entryCount =
+        0;
+
+    bool lengthAligned =
+        false;
+
+    std::uint64_t hash =
+        0;
+
+    bool valid =
+        false;
 };
 
 struct NativeKeyNameInformation {
@@ -120,12 +155,16 @@ public:
     explicit NtSetValueKeyHookGuard(
         bool& insideFlag
     )
-        : insideFlag_(insideFlag) {
-        insideFlag_ = true;
+        : insideFlag_(
+              insideFlag
+          ) {
+        insideFlag_ =
+            true;
     }
 
     ~NtSetValueKeyHookGuard() {
-        insideFlag_ = false;
+        insideFlag_ =
+            false;
     }
 
     NtSetValueKeyHookGuard(
@@ -140,35 +179,53 @@ private:
     bool& insideFlag_;
 };
 
+using TaskbarModel_MoveNotificationAreaIcon_t =
+    int(__cdecl*)(
+        void* pThis,
+        void* notificationAreaIconAbi,
+        int location,
+        unsigned int index
+    );
+
 using StackViewModel_UpdateIconIndexes_t =
-    void(WINAPI*)(void* pThis);
+    void(WINAPI*)(
+        void* pThis
+    );
 
-using NtSetValueKey_t = NTSTATUS(NTAPI*)(
-    HANDLE keyHandle,
-    PUNICODE_STRING valueName,
-    ULONG titleIndex,
-    ULONG type,
-    PVOID data,
-    ULONG dataSize
-);
+using NtSetValueKey_t =
+    NTSTATUS(NTAPI*)(
+        HANDLE keyHandle,
+        PUNICODE_STRING valueName,
+        ULONG titleIndex,
+        ULONG type,
+        PVOID data,
+        ULONG dataSize
+    );
 
-using NtQueryKey_t = NTSTATUS(NTAPI*)(
-    HANDLE keyHandle,
-    ULONG keyInformationClass,
-    PVOID keyInformation,
-    ULONG length,
-    PULONG resultLength
-);
+using NtQueryKey_t =
+    NTSTATUS(NTAPI*)(
+        HANDLE keyHandle,
+        ULONG keyInformationClass,
+        PVOID keyInformation,
+        ULONG length,
+        PULONG resultLength
+    );
+
+TaskbarModel_MoveNotificationAreaIcon_t
+    TaskbarModel_MoveNotificationAreaIcon_Original =
+        nullptr;
 
 StackViewModel_UpdateIconIndexes_t
     StackViewModel_UpdateIconIndexes_Original =
         nullptr;
 
-NtSetValueKey_t NtSetValueKey_Original =
-    nullptr;
+NtSetValueKey_t
+    NtSetValueKey_Original =
+        nullptr;
 
-NtQueryKey_t NtQueryKey_Function =
-    nullptr;
+NtQueryKey_t
+    NtQueryKey_Function =
+        nullptr;
 
 std::uint64_t CalculateFnv1aHash(
     const BYTE* data,
@@ -182,8 +239,11 @@ std::uint64_t CalculateFnv1aHash(
         index < length;
         index++
     ) {
-        hash ^= data[index];
-        hash *= kFnv1aPrime;
+        hash ^=
+            data[index];
+
+        hash *=
+            kFnv1aPrime;
     }
 
     return hash;
@@ -275,13 +335,9 @@ UIOrderSnapshot CaptureUIOrderSnapshot() {
             actualBytes;
 
         snapshot.entryCount =
-            static_cast<
-                unsigned long long
-            >(
-                actualBytes /
-                sizeof(
-                    std::uint64_t
-                )
+            actualBytes /
+            sizeof(
+                std::uint64_t
             );
 
         snapshot.lengthAligned =
@@ -315,14 +371,9 @@ bool AreSnapshotsEqual(
     const UIOrderSnapshot& first,
     const UIOrderSnapshot& second
 ) {
-    if (
-        !first.valid ||
-        !second.valid
-    ) {
-        return false;
-    }
-
     return
+        first.valid &&
+        second.valid &&
         first.registryType ==
             second.registryType &&
         first.byteLength ==
@@ -333,12 +384,14 @@ bool AreSnapshotsEqual(
 
 void LogUIOrderSnapshot(
     const wchar_t* phase,
+    const wchar_t* source,
     unsigned long long callNumber,
     const UIOrderSnapshot& snapshot
 ) {
     Wh_Log(
         L"UIORDER_SNAPSHOT "
         L"phase=%s "
+        L"source=%s "
         L"call=%llu "
         L"valid=%d "
         L"status=%ld "
@@ -348,6 +401,7 @@ void LogUIOrderSnapshot(
         L"aligned=%d "
         L"hash=0x%016llX",
         phase,
+        source,
         callNumber,
         snapshot.valid
             ? 1
@@ -502,7 +556,8 @@ bool QueryNativeRegistryKeyPath(
         );
 
     if (
-        queryStatus < 0
+        queryStatus <
+        0
     ) {
         return false;
     }
@@ -565,11 +620,13 @@ NTSTATUS NTAPI NtSetValueKey_Hook(
             );
     }
 
-    NtSetValueKeyHookGuard hookGuard(
-        g_insideNtSetValueKeyHook
-    );
+    NtSetValueKeyHookGuard
+        hookGuard(
+            g_insideNtSetValueKeyHook
+        );
 
     std::wstring keyPath;
+
     NTSTATUS keyQueryStatus =
         0;
 
@@ -629,35 +686,29 @@ NTSTATUS NTAPI NtSetValueKey_Hook(
                 ) +
             1;
 
-    bool expected =
-        false;
-
-    const bool suppressWrite =
-        g_firstMatchingWriteSuppressed
-            .compare_exchange_strong(
-                expected,
-                true,
-                std::memory_order_acq_rel
-            );
-
-    if (
-        suppressWrite
-    ) {
-        g_uiOrderSuppressedWriteCount
-            .fetch_add(
-                1,
-                std::memory_order_relaxed
-            );
-    }
-
     const DWORD threadId =
         GetCurrentThreadId();
 
     const unsigned long long
+        moveRequestsBefore =
+            g_moveRequestCallCount
+                .load(
+                    std::memory_order_acquire
+                );
+
+    const unsigned long long
+        suppressedMoveRequestsBefore =
+            g_moveRequestSuppressedCount
+                .load(
+                    std::memory_order_acquire
+                );
+
+    const unsigned long long
         updateCallsBefore =
-            g_updateCallCount.load(
-                std::memory_order_acquire
-            );
+            g_updateCallCount
+                .load(
+                    std::memory_order_acquire
+                );
 
     const UIOrderSnapshot
         beforeSnapshot =
@@ -671,7 +722,8 @@ NTSTATUS NTAPI NtSetValueKey_Hook(
         L"value=\"UIOrderList\" "
         L"type=%lu "
         L"bytes=%lu "
-        L"suppress=%d "
+        L"moveRequestsObserved=%llu "
+        L"suppressedMoveRequestsObserved=%llu "
         L"updateCallsObserved=%llu "
         L"beforeValid=%d "
         L"beforeBytes=%lu "
@@ -681,9 +733,8 @@ NTSTATUS NTAPI NtSetValueKey_Hook(
         keyPath.c_str(),
         type,
         dataSize,
-        suppressWrite
-            ? 1
-            : 0,
+        moveRequestsBefore,
+        suppressedMoveRequestsBefore,
         updateCallsBefore,
         beforeSnapshot.valid
             ? 1
@@ -696,35 +747,15 @@ NTSTATUS NTAPI NtSetValueKey_Hook(
         )
     );
 
-    NTSTATUS status =
-        kStatusSuccess;
-
-    if (
-        suppressWrite
-    ) {
-        Wh_Log(
-            L"UIORDER_WRITE_SUPPRESSED "
-            L"attempt=%llu "
-            L"thread=%lu "
-            L"returnedStatus=0x%08lX",
-            attemptNumber,
-            threadId,
-            static_cast<ULONG>(
-                kStatusSuccess
-            )
+    const NTSTATUS status =
+        NtSetValueKey_Original(
+            keyHandle,
+            valueName,
+            titleIndex,
+            type,
+            data,
+            dataSize
         );
-    }
-    else {
-        status =
-            NtSetValueKey_Original(
-                keyHandle,
-                valueName,
-                titleIndex,
-                type,
-                data,
-                dataSize
-            );
-    }
 
     const UIOrderSnapshot
         afterSnapshot =
@@ -745,30 +776,24 @@ NTSTATUS NTAPI NtSetValueKey_Hook(
             ? 1
             : 0;
 
-    const unsigned long long
-        updateCallsAfter =
-            g_updateCallCount.load(
-                std::memory_order_acquire
-            );
-
     Wh_Log(
         L"UIORDER_WRITE_END "
         L"attempt=%llu "
         L"thread=%lu "
-        L"suppressed=%d "
         L"ntstatus=0x%08lX "
         L"comparable=%d "
         L"changed=%d "
         L"afterValid=%d "
         L"afterBytes=%lu "
         L"afterHash=0x%016llX "
+        L"moveRequestsBefore=%llu "
+        L"moveRequestsAfter=%llu "
+        L"suppressedMoveRequestsBefore=%llu "
+        L"suppressedMoveRequestsAfter=%llu "
         L"updateCallsBefore=%llu "
         L"updateCallsAfter=%llu",
         attemptNumber,
         threadId,
-        suppressWrite
-            ? 1
-            : 0,
         static_cast<ULONG>(
             status
         ),
@@ -783,8 +808,21 @@ NTSTATUS NTAPI NtSetValueKey_Hook(
         >(
             afterSnapshot.hash
         ),
+        moveRequestsBefore,
+        g_moveRequestCallCount
+            .load(
+                std::memory_order_acquire
+            ),
+        suppressedMoveRequestsBefore,
+        g_moveRequestSuppressedCount
+            .load(
+                std::memory_order_acquire
+            ),
         updateCallsBefore,
-        updateCallsAfter
+        g_updateCallCount
+            .load(
+                std::memory_order_acquire
+            )
     );
 
     return status;
@@ -827,20 +865,12 @@ bool HookNativeRegistryWrites() {
         );
 
     if (
-        !ntSetValueKey
-    ) {
-        Wh_Log(
-            L"NtSetValueKey is unavailable"
-        );
-
-        return false;
-    }
-
-    if (
+        !ntSetValueKey ||
         !NtQueryKey_Function
     ) {
         Wh_Log(
-            L"NtQueryKey is unavailable"
+            L"NtSetValueKey or NtQueryKey "
+            L"is unavailable"
         );
 
         return false;
@@ -863,8 +893,7 @@ bool HookNativeRegistryWrites() {
 
     Wh_Log(
         L"NtSetValueKey hook installed; "
-        L"one-shot UIOrderList "
-        L"suppression armed"
+        L"UIOrderList writes are observation-only"
     );
 
     return true;
@@ -898,8 +927,7 @@ void LogUIOrderRegistryWatcherSnapshot(
                 ? static_cast<
                       unsigned long long
                   >(
-                      previousSnapshot
-                          ->hash
+                      previousSnapshot->hash
                   )
                 : 0;
 
@@ -907,9 +935,10 @@ void LogUIOrderRegistryWatcherSnapshot(
         L"UIORDER_WATCH "
         L"phase=%s "
         L"notification=%llu "
+        L"moveRequestsObserved=%llu "
+        L"suppressedMoveRequestsObserved=%llu "
         L"updateCallsObserved=%llu "
         L"writeAttemptsObserved=%llu "
-        L"suppressedWritesObserved=%llu "
         L"valid=%d "
         L"status=%ld "
         L"type=%lu "
@@ -922,15 +951,22 @@ void LogUIOrderRegistryWatcherSnapshot(
         L"previousHash=0x%016llX",
         phase,
         notificationNumber,
-        g_updateCallCount.load(
-            std::memory_order_acquire
-        ),
-        g_uiOrderWriteAttemptCount.load(
-            std::memory_order_acquire
-        ),
-        g_uiOrderSuppressedWriteCount.load(
-            std::memory_order_acquire
-        ),
+        g_moveRequestCallCount
+            .load(
+                std::memory_order_acquire
+            ),
+        g_moveRequestSuppressedCount
+            .load(
+                std::memory_order_acquire
+            ),
+        g_updateCallCount
+            .load(
+                std::memory_order_acquire
+            ),
+        g_uiOrderWriteAttemptCount
+            .load(
+                std::memory_order_acquire
+            ),
         currentSnapshot.valid
             ? 1
             : 0,
@@ -1005,7 +1041,7 @@ UIOrderRegistryWatcherThreadProc(
     };
 
     for (;;) {
-        DWORD waitResult =
+        const DWORD waitResult =
             WaitForMultipleObjects(
                 ARRAYSIZE(
                     waitHandles
@@ -1074,8 +1110,8 @@ UIOrderRegistryWatcherThreadProc(
             WAIT_FAILED
         ) {
             Wh_Log(
-                L"Registry watcher wait "
-                L"failed; error=%lu",
+                L"Registry watcher wait failed; "
+                L"error=%lu",
                 GetLastError()
             );
         }
@@ -1095,9 +1131,10 @@ UIOrderRegistryWatcherThreadProc(
         L"stopped; thread=%lu "
         L"notifications=%llu",
         GetCurrentThreadId(),
-        g_registryNotificationCount.load(
-            std::memory_order_relaxed
-        )
+        g_registryNotificationCount
+            .load(
+                std::memory_order_relaxed
+            )
     );
 
     return 0;
@@ -1109,11 +1146,6 @@ bool StartUIOrderRegistryWatcher() {
     ) {
         return true;
     }
-
-    g_registryNotificationCount.store(
-        0,
-        std::memory_order_release
-    );
 
     LONG openStatus =
         RegOpenKeyExW(
@@ -1129,9 +1161,8 @@ bool StartUIOrderRegistryWatcher() {
         ERROR_SUCCESS
     ) {
         Wh_Log(
-            L"Failed to open "
-            L"NotifyIconSettings for "
-            L"notifications; status=%ld",
+            L"Failed to open NotifyIconSettings "
+            L"for notifications; status=%ld",
             openStatus
         );
 
@@ -1160,8 +1191,8 @@ bool StartUIOrderRegistryWatcher() {
             nullptr;
 
         Wh_Log(
-            L"Failed to create registry "
-            L"watcher stop event; error=%lu",
+            L"Failed to create registry watcher "
+            L"stop event; error=%lu",
             error
         );
 
@@ -1197,9 +1228,8 @@ bool StartUIOrderRegistryWatcher() {
             nullptr;
 
         Wh_Log(
-            L"Failed to create registry "
-            L"watcher change event; "
-            L"error=%lu",
+            L"Failed to create registry watcher "
+            L"change event; error=%lu",
             error
         );
 
@@ -1244,8 +1274,8 @@ bool StartUIOrderRegistryWatcher() {
             nullptr;
 
         Wh_Log(
-            L"Failed to create registry "
-            L"watcher thread; error=%lu",
+            L"Failed to create registry watcher "
+            L"thread; error=%lu",
             error
         );
 
@@ -1278,9 +1308,8 @@ void StopUIOrderRegistryWatcher() {
             WAIT_OBJECT_0
         ) {
             Wh_Log(
-                L"Waiting for registry "
-                L"watcher failed; result=%lu "
-                L"error=%lu",
+                L"Waiting for registry watcher "
+                L"failed; result=%lu error=%lu",
                 waitResult,
                 GetLastError()
             );
@@ -1334,6 +1363,7 @@ void StopUIOrderRegistryWatcher() {
 }
 
 void LogModuleInformation(
+    const wchar_t* role,
     HMODULE module
 ) {
     wchar_t modulePath[
@@ -1357,8 +1387,8 @@ void LogModuleInformation(
             )
     ) {
         Wh_Log(
-            L"System tray module=%p, "
-            L"path unavailable",
+            L"%s module=%p path unavailable",
+            role,
             module
         );
 
@@ -1366,11 +1396,222 @@ void LogModuleInformation(
     }
 
     Wh_Log(
-        L"System tray module=%p, "
-        L"path=\"%s\"",
+        L"%s module=%p path=\"%s\"",
+        role,
         module,
         modulePath
     );
+}
+
+int __cdecl
+TaskbarModel_MoveNotificationAreaIcon_Hook(
+    void* pThis,
+    void* notificationAreaIconAbi,
+    int location,
+    unsigned int index
+) {
+    const unsigned long long
+        callNumber =
+            g_moveRequestCallCount
+                .fetch_add(
+                    1,
+                    std::memory_order_relaxed
+                ) +
+            1;
+
+    bool expected =
+        false;
+
+    const bool suppressCall =
+        g_firstMoveRequestSuppressed
+            .compare_exchange_strong(
+                expected,
+                true,
+                std::memory_order_acq_rel
+            );
+
+    if (
+        suppressCall
+    ) {
+        g_moveRequestSuppressedCount
+            .fetch_add(
+                1,
+                std::memory_order_relaxed
+            );
+    }
+
+    const DWORD threadId =
+        GetCurrentThreadId();
+
+    const unsigned long long
+        writesBefore =
+            g_uiOrderWriteAttemptCount
+                .load(
+                    std::memory_order_acquire
+                );
+
+    const unsigned long long
+        notificationsBefore =
+            g_registryNotificationCount
+                .load(
+                    std::memory_order_acquire
+                );
+
+    const unsigned long long
+        updatesBefore =
+            g_updateCallCount
+                .load(
+                    std::memory_order_acquire
+                );
+
+    const UIOrderSnapshot
+        beforeSnapshot =
+            CaptureUIOrderSnapshot();
+
+    Wh_Log(
+        L"MOVE_REQUEST_BEGIN "
+        L"call=%llu "
+        L"thread=%lu "
+        L"this=%p "
+        L"iconAbi=%p "
+        L"location=%d "
+        L"index=%u "
+        L"suppress=%d "
+        L"writeAttemptsObserved=%llu "
+        L"registryNotificationsObserved=%llu "
+        L"updateCallsObserved=%llu "
+        L"beforeValid=%d "
+        L"beforeBytes=%lu "
+        L"beforeHash=0x%016llX",
+        callNumber,
+        threadId,
+        pThis,
+        notificationAreaIconAbi,
+        location,
+        index,
+        suppressCall
+            ? 1
+            : 0,
+        writesBefore,
+        notificationsBefore,
+        updatesBefore,
+        beforeSnapshot.valid
+            ? 1
+            : 0,
+        beforeSnapshot.byteLength,
+        static_cast<
+            unsigned long long
+        >(
+            beforeSnapshot.hash
+        )
+    );
+
+    int result =
+        0;
+
+    if (
+        suppressCall
+    ) {
+        Wh_Log(
+            L"MOVE_REQUEST_SUPPRESSED "
+            L"call=%llu "
+            L"thread=%lu "
+            L"this=%p "
+            L"iconAbi=%p "
+            L"location=%d "
+            L"index=%u "
+            L"returnedHresult=0x00000000",
+            callNumber,
+            threadId,
+            pThis,
+            notificationAreaIconAbi,
+            location,
+            index
+        );
+    }
+    else {
+        result =
+            TaskbarModel_MoveNotificationAreaIcon_Original(
+                pThis,
+                notificationAreaIconAbi,
+                location,
+                index
+            );
+    }
+
+    const UIOrderSnapshot
+        afterSnapshot =
+            CaptureUIOrderSnapshot();
+
+    const int comparable =
+        beforeSnapshot.valid &&
+        afterSnapshot.valid
+            ? 1
+            : 0;
+
+    const int changed =
+        comparable &&
+        !AreSnapshotsEqual(
+            beforeSnapshot,
+            afterSnapshot
+        )
+            ? 1
+            : 0;
+
+    Wh_Log(
+        L"MOVE_REQUEST_END "
+        L"call=%llu "
+        L"thread=%lu "
+        L"suppressed=%d "
+        L"hresult=0x%08lX "
+        L"comparable=%d "
+        L"changed=%d "
+        L"afterValid=%d "
+        L"afterBytes=%lu "
+        L"afterHash=0x%016llX "
+        L"writeAttemptsBefore=%llu "
+        L"writeAttemptsAfter=%llu "
+        L"registryNotificationsBefore=%llu "
+        L"registryNotificationsAfter=%llu "
+        L"updateCallsBefore=%llu "
+        L"updateCallsAfter=%llu",
+        callNumber,
+        threadId,
+        suppressCall
+            ? 1
+            : 0,
+        static_cast<ULONG>(
+            result
+        ),
+        comparable,
+        changed,
+        afterSnapshot.valid
+            ? 1
+            : 0,
+        afterSnapshot.byteLength,
+        static_cast<
+            unsigned long long
+        >(
+            afterSnapshot.hash
+        ),
+        writesBefore,
+        g_uiOrderWriteAttemptCount
+            .load(
+                std::memory_order_acquire
+            ),
+        notificationsBefore,
+        g_registryNotificationCount
+            .load(
+                std::memory_order_acquire
+            ),
+        updatesBefore,
+        g_updateCallCount
+            .load(
+                std::memory_order_acquire
+            )
+    );
+
+    return result;
 }
 
 void WINAPI
@@ -1394,17 +1635,24 @@ StackViewModel_UpdateIconIndexes_Hook(
         L"call=%llu "
         L"thread=%lu "
         L"this=%p "
-        L"writeAttemptsObserved=%llu "
-        L"suppressedWritesObserved=%llu",
+        L"moveRequestsObserved=%llu "
+        L"suppressedMoveRequestsObserved=%llu "
+        L"writeAttemptsObserved=%llu",
         callNumber,
         threadId,
         pThis,
-        g_uiOrderWriteAttemptCount.load(
-            std::memory_order_acquire
-        ),
-        g_uiOrderSuppressedWriteCount.load(
-            std::memory_order_acquire
-        )
+        g_moveRequestCallCount
+            .load(
+                std::memory_order_acquire
+            ),
+        g_moveRequestSuppressedCount
+            .load(
+                std::memory_order_acquire
+            ),
+        g_uiOrderWriteAttemptCount
+            .load(
+                std::memory_order_acquire
+            )
     );
 
     const UIOrderSnapshot
@@ -1413,6 +1661,7 @@ StackViewModel_UpdateIconIndexes_Hook(
 
     LogUIOrderSnapshot(
         L"before",
+        L"index-update",
         callNumber,
         beforeSnapshot
     );
@@ -1427,6 +1676,7 @@ StackViewModel_UpdateIconIndexes_Hook(
 
     LogUIOrderSnapshot(
         L"after",
+        L"index-update",
         callNumber,
         afterSnapshot
     );
@@ -1448,6 +1698,7 @@ StackViewModel_UpdateIconIndexes_Hook(
 
     Wh_Log(
         L"UIORDER_COMPARE "
+        L"source=index-update "
         L"call=%llu "
         L"comparable=%d "
         L"changed=%d "
@@ -1477,18 +1728,72 @@ StackViewModel_UpdateIconIndexes_Hook(
         L"call=%llu "
         L"thread=%lu "
         L"this=%p "
-        L"writeAttemptsObserved=%llu "
-        L"suppressedWritesObserved=%llu",
+        L"moveRequestsObserved=%llu "
+        L"suppressedMoveRequestsObserved=%llu "
+        L"writeAttemptsObserved=%llu",
         callNumber,
         threadId,
         pThis,
-        g_uiOrderWriteAttemptCount.load(
-            std::memory_order_acquire
-        ),
-        g_uiOrderSuppressedWriteCount.load(
-            std::memory_order_acquire
-        )
+        g_moveRequestCallCount
+            .load(
+                std::memory_order_acquire
+            ),
+        g_moveRequestSuppressedCount
+            .load(
+                std::memory_order_acquire
+            ),
+        g_uiOrderWriteAttemptCount
+            .load(
+                std::memory_order_acquire
+            )
     );
+}
+
+bool HookTaskbarSymbols(
+    HMODULE module
+) {
+    WindhawkUtils::SYMBOL_HOOK
+        symbolHooks[] = {
+            {
+                {
+                    LR"(public: virtual int __cdecl winrt::impl::produce<struct winrt::WindowsUdk::UI::Shell::implementation::TaskbarModel,struct winrt::WindowsUdk::UI::Shell::ITaskbarModel5>::MoveNotificationAreaIcon(void *,int,unsigned int))"
+                },
+                &TaskbarModel_MoveNotificationAreaIcon_Original,
+                TaskbarModel_MoveNotificationAreaIcon_Hook,
+            },
+        };
+
+    if (
+        !WindhawkUtils::HookSymbols(
+            module,
+            symbolHooks,
+            ARRAYSIZE(
+                symbolHooks
+            )
+        )
+    ) {
+        Wh_Log(
+            L"Failed to locate or hook "
+            L"ITaskbarModel5::"
+            L"MoveNotificationAreaIcon"
+        );
+
+        return false;
+    }
+
+    LogModuleInformation(
+        L"Taskbar",
+        module
+    );
+
+    Wh_Log(
+        L"ITaskbarModel5::"
+        L"MoveNotificationAreaIcon "
+        L"hook installed; "
+        L"one-shot suppression armed"
+    );
+
+    return true;
 }
 
 bool HookSystemTraySymbols(
@@ -1524,6 +1829,7 @@ bool HookSystemTraySymbols(
     }
 
     LogModuleInformation(
+        L"System tray",
         module
     );
 
@@ -1534,6 +1840,13 @@ bool HookSystemTraySymbols(
     );
 
     return true;
+}
+
+HMODULE GetTaskbarModuleHandle() {
+    return
+        GetModuleHandleW(
+            L"taskbar.dll"
+        );
 }
 
 HMODULE GetSystemTrayModuleHandle() {
@@ -1554,28 +1867,69 @@ HMODULE GetSystemTrayModuleHandle() {
         );
 }
 
-void HandleLoadedModule(
+bool TryHookTaskbarModule(
     HMODULE module,
-    LPCWSTR requestedPath
+    bool applyHooks
 ) {
     if (
         !module ||
-        g_systemTrayModuleHooked.load(
-            std::memory_order_acquire
-        )
+        g_taskbarModuleHooked
+            .load(
+                std::memory_order_acquire
+            )
     ) {
-        return;
+        return true;
     }
 
-    HMODULE systemTrayModule =
-        GetSystemTrayModuleHandle();
+    bool expected =
+        false;
 
     if (
-        !systemTrayModule ||
-        systemTrayModule !=
-            module
+        !g_taskbarModuleHooked
+             .compare_exchange_strong(
+                 expected,
+                 true,
+                 std::memory_order_acq_rel
+             )
     ) {
-        return;
+        return true;
+    }
+
+    if (
+        !HookTaskbarSymbols(
+            module
+        )
+    ) {
+        g_taskbarModuleHooked
+            .store(
+                false,
+                std::memory_order_release
+            );
+
+        return false;
+    }
+
+    if (
+        applyHooks
+    ) {
+        Wh_ApplyHookOperations();
+    }
+
+    return true;
+}
+
+bool TryHookSystemTrayModule(
+    HMODULE module,
+    bool applyHooks
+) {
+    if (
+        !module ||
+        g_systemTrayModuleHooked
+            .load(
+                std::memory_order_acquire
+            )
+    ) {
+        return true;
     }
 
     bool expected =
@@ -1589,31 +1943,110 @@ void HandleLoadedModule(
                  std::memory_order_acq_rel
              )
     ) {
-        return;
+        return true;
     }
-
-    Wh_Log(
-        L"Detected system tray module "
-        L"load: requestedPath=\"%s\"",
-        requestedPath
-            ? requestedPath
-            : L"<null>"
-    );
 
     if (
         !HookSystemTraySymbols(
             module
         )
     ) {
-        g_systemTrayModuleHooked.store(
-            false,
-            std::memory_order_release
-        );
+        g_systemTrayModuleHooked
+            .store(
+                false,
+                std::memory_order_release
+            );
 
+        return false;
+    }
+
+    if (
+        applyHooks
+    ) {
+        Wh_ApplyHookOperations();
+    }
+
+    return true;
+}
+
+void HandleLoadedModule(
+    HMODULE module,
+    LPCWSTR requestedPath
+) {
+    if (
+        !module
+    ) {
         return;
     }
 
-    Wh_ApplyHookOperations();
+    bool installedAnyHook =
+        false;
+
+    HMODULE taskbarModule =
+        GetTaskbarModuleHandle();
+
+    if (
+        taskbarModule ==
+            module &&
+        !g_taskbarModuleHooked
+             .load(
+                 std::memory_order_acquire
+             )
+    ) {
+        Wh_Log(
+            L"Detected taskbar module load: "
+            L"requestedPath=\"%s\"",
+            requestedPath
+                ? requestedPath
+                : L"<null>"
+        );
+
+        if (
+            TryHookTaskbarModule(
+                module,
+                false
+            )
+        ) {
+            installedAnyHook =
+                true;
+        }
+    }
+
+    HMODULE systemTrayModule =
+        GetSystemTrayModuleHandle();
+
+    if (
+        systemTrayModule ==
+            module &&
+        !g_systemTrayModuleHooked
+             .load(
+                 std::memory_order_acquire
+             )
+    ) {
+        Wh_Log(
+            L"Detected system tray module load: "
+            L"requestedPath=\"%s\"",
+            requestedPath
+                ? requestedPath
+                : L"<null>"
+        );
+
+        if (
+            TryHookSystemTrayModule(
+                module,
+                false
+            )
+        ) {
+            installedAnyHook =
+                true;
+        }
+    }
+
+    if (
+        installedAnyHook
+    ) {
+        Wh_ApplyHookOperations();
+    }
 }
 
 using LoadLibraryExW_t =
@@ -1659,8 +2092,7 @@ bool HookModuleLoader() {
         !kernelBase
     ) {
         Wh_Log(
-            L"kernelbase.dll "
-            L"is unavailable"
+            L"kernelbase.dll is unavailable"
         );
 
         return false;
@@ -1668,9 +2100,7 @@ bool HookModuleLoader() {
 
     auto loadLibraryExW =
         reinterpret_cast<
-            decltype(
-                &LoadLibraryExW
-            )
+            LoadLibraryExW_t
         >(
             GetProcAddress(
                 kernelBase,
@@ -1682,20 +2112,32 @@ bool HookModuleLoader() {
         !loadLibraryExW
     ) {
         Wh_Log(
-            L"LoadLibraryExW "
-            L"is unavailable"
+            L"LoadLibraryExW is unavailable"
         );
 
         return false;
     }
 
-    return
-        WindhawkUtils::
+    if (
+        !WindhawkUtils::
             Wh_SetFunctionHookT(
                 loadLibraryExW,
                 LoadLibraryExW_Hook,
                 &LoadLibraryExW_Original
-            );
+            )
+    ) {
+        Wh_Log(
+            L"Failed to hook LoadLibraryExW"
+        );
+
+        return false;
+    }
+
+    Wh_Log(
+        L"Module loader hook installed"
+    );
+
+    return true;
 }
 
 }  // namespace
@@ -1703,39 +2145,58 @@ bool HookModuleLoader() {
 BOOL Wh_ModInit() {
     Wh_Log(
         L"System Tray Index Analyzer "
-        L"0.5.0 initializing; "
-        L"one-shot suppression armed"
+        L"0.6.0 initializing; "
+        L"one-shot move-request "
+        L"suppression armed"
     );
 
-    g_systemTrayModuleHooked.store(
-        false,
-        std::memory_order_release
-    );
+    g_taskbarModuleHooked
+        .store(
+            false,
+            std::memory_order_release
+        );
 
-    g_firstMatchingWriteSuppressed.store(
-        false,
-        std::memory_order_release
-    );
+    g_systemTrayModuleHooked
+        .store(
+            false,
+            std::memory_order_release
+        );
 
-    g_updateCallCount.store(
-        0,
-        std::memory_order_release
-    );
+    g_firstMoveRequestSuppressed
+        .store(
+            false,
+            std::memory_order_release
+        );
 
-    g_registryNotificationCount.store(
-        0,
-        std::memory_order_release
-    );
+    g_moveRequestCallCount
+        .store(
+            0,
+            std::memory_order_release
+        );
 
-    g_uiOrderWriteAttemptCount.store(
-        0,
-        std::memory_order_release
-    );
+    g_moveRequestSuppressedCount
+        .store(
+            0,
+            std::memory_order_release
+        );
 
-    g_uiOrderSuppressedWriteCount.store(
-        0,
-        std::memory_order_release
-    );
+    g_updateCallCount
+        .store(
+            0,
+            std::memory_order_release
+        );
+
+    g_registryNotificationCount
+        .store(
+            0,
+            std::memory_order_release
+        );
+
+    g_uiOrderWriteAttemptCount
+        .store(
+            0,
+            std::memory_order_release
+        );
 
     if (
         !HookNativeRegistryWrites()
@@ -1749,101 +2210,108 @@ BOOL Wh_ModInit() {
         return FALSE;
     }
 
-    HMODULE module =
+    HMODULE taskbarModule =
+        GetTaskbarModuleHandle();
+
+    HMODULE systemTrayModule =
         GetSystemTrayModuleHandle();
 
     if (
-        module
-    ) {
-        g_systemTrayModuleHooked.store(
-            true,
-            std::memory_order_release
-        );
-
-        if (
-            !HookSystemTraySymbols(
-                module
-            )
-        ) {
-            g_systemTrayModuleHooked.store(
-                false,
-                std::memory_order_release
-            );
-
-            StopUIOrderRegistryWatcher();
-
-            return FALSE;
-        }
-
-        return TRUE;
-    }
-
-    Wh_Log(
-        L"SystemTray.dll is not "
-        L"loaded yet; waiting for "
-        L"module load"
-    );
-
-    if (
-        !HookModuleLoader()
+        taskbarModule &&
+        !TryHookTaskbarModule(
+            taskbarModule,
+            false
+        )
     ) {
         StopUIOrderRegistryWatcher();
 
         return FALSE;
     }
 
+    if (
+        systemTrayModule &&
+        !TryHookSystemTrayModule(
+            systemTrayModule,
+            false
+        )
+    ) {
+        StopUIOrderRegistryWatcher();
+
+        return FALSE;
+    }
+
+    if (
+        !taskbarModule ||
+        !systemTrayModule
+    ) {
+        Wh_Log(
+            L"One or more tray modules "
+            L"are not loaded yet; "
+            L"waiting for module load"
+        );
+
+        if (
+            !HookModuleLoader()
+        ) {
+            StopUIOrderRegistryWatcher();
+
+            return FALSE;
+        }
+    }
+
     return TRUE;
 }
 
 void Wh_ModAfterInit() {
+    bool installedAnyHook =
+        false;
+
+    HMODULE taskbarModule =
+        GetTaskbarModuleHandle();
+
     if (
-        g_systemTrayModuleHooked.load(
-            std::memory_order_acquire
-        )
+        taskbarModule &&
+        !g_taskbarModuleHooked
+             .load(
+                 std::memory_order_acquire
+             )
     ) {
-        return;
+        if (
+            TryHookTaskbarModule(
+                taskbarModule,
+                false
+            )
+        ) {
+            installedAnyHook =
+                true;
+        }
     }
 
-    HMODULE module =
+    HMODULE systemTrayModule =
         GetSystemTrayModuleHandle();
 
     if (
-        !module
-    ) {
-        return;
-    }
-
-    bool expected =
-        false;
-
-    if (
+        systemTrayModule &&
         !g_systemTrayModuleHooked
-             .compare_exchange_strong(
-                 expected,
-                 true,
-                 std::memory_order_acq_rel
+             .load(
+                 std::memory_order_acquire
              )
     ) {
-        return;
+        if (
+            TryHookSystemTrayModule(
+                systemTrayModule,
+                false
+            )
+        ) {
+            installedAnyHook =
+                true;
+        }
     }
-
-    Wh_Log(
-        L"System tray module found "
-        L"after initialization"
-    );
 
     if (
-        HookSystemTraySymbols(
-            module
-        )
+        installedAnyHook
     ) {
         Wh_ApplyHookOperations();
-    }
-    else {
-        g_systemTrayModuleHooked.store(
-            false,
-            std::memory_order_release
-        );
     }
 }
 
@@ -1851,23 +2319,31 @@ void Wh_ModUninit() {
     StopUIOrderRegistryWatcher();
 
     Wh_Log(
-        L"System Tray Index Analyzer "
-        L"stopped; "
+        L"System Tray Index Analyzer stopped; "
+        L"moveRequests=%llu "
+        L"suppressedMoveRequests=%llu "
         L"capturedCalls=%llu "
         L"registryNotifications=%llu "
-        L"uiOrderWriteAttempts=%llu "
-        L"suppressedWrites=%llu",
-        g_updateCallCount.load(
-            std::memory_order_relaxed
-        ),
-        g_registryNotificationCount.load(
-            std::memory_order_relaxed
-        ),
-        g_uiOrderWriteAttemptCount.load(
-            std::memory_order_relaxed
-        ),
-        g_uiOrderSuppressedWriteCount.load(
-            std::memory_order_relaxed
-        )
+        L"uiOrderWriteAttempts=%llu",
+        g_moveRequestCallCount
+            .load(
+                std::memory_order_relaxed
+            ),
+        g_moveRequestSuppressedCount
+            .load(
+                std::memory_order_relaxed
+            ),
+        g_updateCallCount
+            .load(
+                std::memory_order_relaxed
+            ),
+        g_registryNotificationCount
+            .load(
+                std::memory_order_relaxed
+            ),
+        g_uiOrderWriteAttemptCount
+            .load(
+                std::memory_order_relaxed
+            )
     );
 }
