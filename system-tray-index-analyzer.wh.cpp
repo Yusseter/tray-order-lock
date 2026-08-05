@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              system-tray-index-analyzer
 // @name            System Tray Index Analyzer
-// @description     Logs UIOrderList registry writes and correlates them with SystemTray index updates.
-// @version         0.4.0
+// @description     Tests whether suppressing one UIOrderList write also prevents the visible tray reorder.
+// @version         0.5.0
 // @author          Yusseter
 // @github          https://github.com/Yusseter
 // @homepage        https://github.com/Yusseter/tray-order-lock
@@ -19,34 +19,31 @@
 A temporary diagnostic mod for researching Windows 11 notification-area icon
 ordering.
 
-The mod hooks:
+Version 0.5.0 performs a single controlled behavior test:
 
-    winrt::SystemTray::implementation::StackViewModel::UpdateIconIndexes()
-    ntdll!NtSetValueKey
+- It watches for NtSetValueKey calls targeting the REG_BINARY UIOrderList value
+  under HKCU\\Control Panel\\NotifyIconSettings.
+- The first exact matching write is suppressed and STATUS_SUCCESS is returned to
+  the caller.
+- Every later matching write is passed to the original NtSetValueKey function.
+- Writes with an unresolved key path, a different key, a different value name or
+  a different registry type are never suppressed.
 
-It records:
+The one-shot suppression makes it possible to test whether preventing the
+registry write also prevents the visible tray reorder. A second drag remains
+available for restoring and persisting the original icon position.
 
-- UpdateIconIndexes call number, thread ID and StackViewModel address
-- Read-only UIOrderList snapshots immediately before and after each
-  UpdateIconIndexes call
+The mod also records:
+
+- Matching UIOrderList write attempts and whether each one was suppressed
+- Read-only UIOrderList snapshots before and after each matching attempt
 - Read-only last-set notifications for the NotifyIconSettings registry key
-- NtSetValueKey calls that target the UIOrderList value under
-  NotifyIconSettings
-- The native registry key path, value type, data size and NTSTATUS result
-- UIOrderList snapshots immediately before and after each matching write
-- A captured call stack with module names and relative offsets for each write
-- The number of UpdateIconIndexes calls observed at each registry event
+- StackViewModel::UpdateIconIndexes calls and read-only before/after snapshots
+- Correlation counters for write attempts, suppressed writes, registry
+  notifications and index updates
 
-Registry notifications are key-wide and can be caused by values other than
-UIOrderList. Every notification is therefore followed by a read-only
-UIOrderList snapshot and comparison. Notifications can be coalesced by Windows.
-
-The NtSetValueKey hook only observes matching UIOrderList writes. The original
-function is always called with its original arguments and its return value is
-preserved.
-
-The analyzer itself does not modify tray icons, tray ordering, registry values,
-XAML elements, function arguments or original return behavior.
+This is an experimental diagnostic version. It intentionally changes the first
+exact matching UIOrderList write after the mod is loaded.
 */
 // ==/WindhawkModReadme==
 
@@ -56,6 +53,7 @@ XAML elements, function arguments or original return behavior.
 
 #include <atomic>
 #include <cstdint>
+#include <cwchar>
 #include <string>
 #include <vector>
 
@@ -77,13 +75,23 @@ constexpr std::uint64_t kFnv1aPrime =
     1099511628211ULL;
 
 constexpr ULONG kKeyNameInformationClass = 3;
-constexpr USHORT kMaximumCapturedStackFrames = 32;
-constexpr ULONG kStackFramesToSkip = 1;
+constexpr NTSTATUS kStatusSuccess =
+    static_cast<NTSTATUS>(0);
 
 std::atomic<bool> g_systemTrayModuleHooked = false;
-std::atomic<unsigned long long> g_updateCallCount = 0;
-std::atomic<unsigned long long> g_registryNotificationCount = 0;
-std::atomic<unsigned long long> g_uiOrderWriteCount = 0;
+std::atomic<bool> g_firstMatchingWriteSuppressed = false;
+
+std::atomic<unsigned long long>
+    g_updateCallCount = 0;
+
+std::atomic<unsigned long long>
+    g_registryNotificationCount = 0;
+
+std::atomic<unsigned long long>
+    g_uiOrderWriteAttemptCount = 0;
+
+std::atomic<unsigned long long>
+    g_uiOrderSuppressedWriteCount = 0;
 
 HANDLE g_registryWatcherStopEvent = nullptr;
 HANDLE g_registryWatcherChangeEvent = nullptr;
@@ -102,14 +110,34 @@ struct UIOrderSnapshot {
     bool valid = false;
 };
 
-struct CapturedStack {
-    USHORT frameCount = 0;
-    void* frames[kMaximumCapturedStackFrames]{};
-};
-
 struct NativeKeyNameInformation {
     ULONG nameLength;
     WCHAR name[1];
+};
+
+class NtSetValueKeyHookGuard {
+public:
+    explicit NtSetValueKeyHookGuard(
+        bool& insideFlag
+    )
+        : insideFlag_(insideFlag) {
+        insideFlag_ = true;
+    }
+
+    ~NtSetValueKeyHookGuard() {
+        insideFlag_ = false;
+    }
+
+    NtSetValueKeyHookGuard(
+        const NtSetValueKeyHookGuard&
+    ) = delete;
+
+    NtSetValueKeyHookGuard& operator=(
+        const NtSetValueKeyHookGuard&
+    ) = delete;
+
+private:
+    bool& insideFlag_;
 };
 
 using StackViewModel_UpdateIconIndexes_t =
@@ -133,18 +161,27 @@ using NtQueryKey_t = NTSTATUS(NTAPI*)(
 );
 
 StackViewModel_UpdateIconIndexes_t
-    StackViewModel_UpdateIconIndexes_Original = nullptr;
+    StackViewModel_UpdateIconIndexes_Original =
+        nullptr;
 
-NtSetValueKey_t NtSetValueKey_Original = nullptr;
-NtQueryKey_t NtQueryKey_Function = nullptr;
+NtSetValueKey_t NtSetValueKey_Original =
+    nullptr;
+
+NtQueryKey_t NtQueryKey_Function =
+    nullptr;
 
 std::uint64_t CalculateFnv1aHash(
     const BYTE* data,
     DWORD length
 ) {
-    std::uint64_t hash = kFnv1aOffsetBasis;
+    std::uint64_t hash =
+        kFnv1aOffsetBasis;
 
-    for (DWORD index = 0; index < length; index++) {
+    for (
+        DWORD index = 0;
+        index < length;
+        index++
+    ) {
         hash ^= data[index];
         hash *= kFnv1aPrime;
     }
@@ -155,75 +192,122 @@ std::uint64_t CalculateFnv1aHash(
 UIOrderSnapshot CaptureUIOrderSnapshot() {
     UIOrderSnapshot snapshot;
 
-    /*
-    UIOrderList can theoretically change between the size query and the data
-    query. Retry a small number of times when that happens.
-    */
-    for (int attempt = 0; attempt < 3; attempt++) {
-        DWORD registryType = REG_NONE;
-        DWORD requiredBytes = 0;
+    for (
+        int attempt = 0;
+        attempt < 3;
+        attempt++
+    ) {
+        DWORD registryType =
+            REG_NONE;
 
-        LONG status = RegGetValueW(
-            HKEY_CURRENT_USER,
-            kNotifyIconSettingsPath,
-            kUIOrderListValueName,
-            RRF_RT_REG_BINARY,
-            &registryType,
-            nullptr,
-            &requiredBytes
-        );
+        DWORD requiredBytes =
+            0;
 
-        if (status != ERROR_SUCCESS) {
-            snapshot.status = status;
-            snapshot.registryType = registryType;
+        LONG status =
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                kNotifyIconSettingsPath,
+                kUIOrderListValueName,
+                RRF_RT_REG_BINARY,
+                &registryType,
+                nullptr,
+                &requiredBytes
+            );
+
+        if (
+            status !=
+            ERROR_SUCCESS
+        ) {
+            snapshot.status =
+                status;
+
+            snapshot.registryType =
+                registryType;
+
             return snapshot;
         }
 
-        std::vector<BYTE> data(requiredBytes);
-        DWORD actualBytes = requiredBytes;
-
-        status = RegGetValueW(
-            HKEY_CURRENT_USER,
-            kNotifyIconSettingsPath,
-            kUIOrderListValueName,
-            RRF_RT_REG_BINARY,
-            &registryType,
-            data.empty() ? nullptr : data.data(),
-            &actualBytes
+        std::vector<BYTE> data(
+            requiredBytes
         );
 
-        if (status == ERROR_MORE_DATA) {
+        DWORD actualBytes =
+            requiredBytes;
+
+        status =
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                kNotifyIconSettingsPath,
+                kUIOrderListValueName,
+                RRF_RT_REG_BINARY,
+                &registryType,
+                data.empty()
+                    ? nullptr
+                    : data.data(),
+                &actualBytes
+            );
+
+        if (
+            status ==
+            ERROR_MORE_DATA
+        ) {
             continue;
         }
 
-        snapshot.status = status;
-        snapshot.registryType = registryType;
+        snapshot.status =
+            status;
 
-        if (status != ERROR_SUCCESS) {
+        snapshot.registryType =
+            registryType;
+
+        if (
+            status !=
+            ERROR_SUCCESS
+        ) {
             return snapshot;
         }
 
-        data.resize(actualBytes);
-
-        snapshot.byteLength = actualBytes;
-        snapshot.entryCount =
-            static_cast<unsigned long long>(
-                actualBytes / sizeof(std::uint64_t)
-            );
-
-        snapshot.lengthAligned =
-            actualBytes % sizeof(std::uint64_t) == 0;
-
-        snapshot.hash = CalculateFnv1aHash(
-            data.empty() ? nullptr : data.data(),
+        data.resize(
             actualBytes
         );
 
-        snapshot.valid = true;
+        snapshot.byteLength =
+            actualBytes;
+
+        snapshot.entryCount =
+            static_cast<
+                unsigned long long
+            >(
+                actualBytes /
+                sizeof(
+                    std::uint64_t
+                )
+            );
+
+        snapshot.lengthAligned =
+            actualBytes %
+                sizeof(
+                    std::uint64_t
+                ) ==
+            0;
+
+        snapshot.hash =
+            CalculateFnv1aHash(
+                data.empty()
+                    ? nullptr
+                    : data.data(),
+                actualBytes
+            );
+
+        snapshot.valid =
+            true;
+
         return snapshot;
     }
 
-    snapshot.status = ERROR_MORE_DATA;
+    snapshot.status =
+        ERROR_MORE_DATA;
+
     return snapshot;
 }
 
@@ -231,14 +315,20 @@ bool AreSnapshotsEqual(
     const UIOrderSnapshot& first,
     const UIOrderSnapshot& second
 ) {
-    if (!first.valid || !second.valid) {
+    if (
+        !first.valid ||
+        !second.valid
+    ) {
         return false;
     }
 
     return
-        first.registryType == second.registryType &&
-        first.byteLength == second.byteLength &&
-        first.hash == second.hash;
+        first.registryType ==
+            second.registryType &&
+        first.byteLength ==
+            second.byteLength &&
+        first.hash ==
+            second.hash;
 }
 
 void LogUIOrderSnapshot(
@@ -259,13 +349,21 @@ void LogUIOrderSnapshot(
         L"hash=0x%016llX",
         phase,
         callNumber,
-        snapshot.valid ? 1 : 0,
+        snapshot.valid
+            ? 1
+            : 0,
         snapshot.status,
         snapshot.registryType,
         snapshot.byteLength,
         snapshot.entryCount,
-        snapshot.lengthAligned ? 1 : 0,
-        static_cast<unsigned long long>(snapshot.hash)
+        snapshot.lengthAligned
+            ? 1
+            : 0,
+        static_cast<
+            unsigned long long
+        >(
+            snapshot.hash
+        )
     );
 }
 
@@ -275,23 +373,34 @@ bool IsUIOrderListValueName(
     if (
         !valueName ||
         !valueName->Buffer ||
-        valueName->Length % sizeof(wchar_t) != 0
+        valueName->Length %
+                sizeof(
+                    wchar_t
+                ) !=
+            0
     ) {
         return false;
     }
 
     const int valueNameLength =
         static_cast<int>(
-            valueName->Length / sizeof(wchar_t)
+            valueName->Length /
+            sizeof(
+                wchar_t
+            )
         );
 
-    return CompareStringOrdinal(
-        valueName->Buffer,
-        valueNameLength,
-        kUIOrderListValueName,
-        ARRAYSIZE(kUIOrderListValueName) - 1,
-        TRUE
-    ) == CSTR_EQUAL;
+    return
+        CompareStringOrdinal(
+            valueName->Buffer,
+            valueNameLength,
+            kUIOrderListValueName,
+            ARRAYSIZE(
+                kUIOrderListValueName
+            ) - 1,
+            TRUE
+        ) ==
+        CSTR_EQUAL;
 }
 
 bool EndsWithOrdinalIgnoreCase(
@@ -299,25 +408,37 @@ bool EndsWithOrdinalIgnoreCase(
     const wchar_t* suffix
 ) {
     const int suffixLength =
-        static_cast<int>(wcslen(suffix));
+        static_cast<int>(
+            std::wcslen(
+                suffix
+            )
+        );
 
     if (
-        suffixLength < 0 ||
-        value.size() < static_cast<std::size_t>(suffixLength)
+        value.size() <
+        static_cast<
+            std::size_t
+        >(
+            suffixLength
+        )
     ) {
         return false;
     }
 
     const wchar_t* valueSuffix =
-        value.data() + value.size() - suffixLength;
+        value.data() +
+        value.size() -
+        suffixLength;
 
-    return CompareStringOrdinal(
-        valueSuffix,
-        suffixLength,
-        suffix,
-        suffixLength,
-        TRUE
-    ) == CSTR_EQUAL;
+    return
+        CompareStringOrdinal(
+            valueSuffix,
+            suffixLength,
+            suffix,
+            suffixLength,
+            TRUE
+        ) ==
+        CSTR_EQUAL;
 }
 
 bool QueryNativeRegistryKeyPath(
@@ -326,162 +447,97 @@ bool QueryNativeRegistryKeyPath(
     NTSTATUS& queryStatus
 ) {
     keyPath.clear();
-    queryStatus = static_cast<NTSTATUS>(0xC0000001L);
 
-    if (!NtQueryKey_Function || !keyHandle) {
+    queryStatus =
+        static_cast<NTSTATUS>(
+            0xC0000001L
+        );
+
+    if (
+        !NtQueryKey_Function ||
+        !keyHandle
+    ) {
         return false;
     }
 
-    ULONG requiredLength = 0;
+    ULONG requiredLength =
+        0;
 
-    queryStatus = NtQueryKey_Function(
-        keyHandle,
-        kKeyNameInformationClass,
-        nullptr,
-        0,
-        &requiredLength
-    );
+    queryStatus =
+        NtQueryKey_Function(
+            keyHandle,
+            kKeyNameInformationClass,
+            nullptr,
+            0,
+            &requiredLength
+        );
 
-    if (requiredLength < sizeof(ULONG)) {
+    if (
+        requiredLength <
+        sizeof(
+            ULONG
+        )
+    ) {
         return false;
     }
 
     std::vector<BYTE> buffer(
-        static_cast<std::size_t>(requiredLength) +
-        sizeof(wchar_t)
+        static_cast<
+            std::size_t
+        >(
+            requiredLength
+        ) +
+        sizeof(
+            wchar_t
+        )
     );
 
-    queryStatus = NtQueryKey_Function(
-        keyHandle,
-        kKeyNameInformationClass,
-        buffer.data(),
-        requiredLength,
-        &requiredLength
-    );
+    queryStatus =
+        NtQueryKey_Function(
+            keyHandle,
+            kKeyNameInformationClass,
+            buffer.data(),
+            requiredLength,
+            &requiredLength
+        );
 
-    if (queryStatus < 0) {
+    if (
+        queryStatus < 0
+    ) {
         return false;
     }
 
     const auto* information =
-        reinterpret_cast<const NativeKeyNameInformation*>(
+        reinterpret_cast<
+            const NativeKeyNameInformation*
+        >(
             buffer.data()
         );
 
     if (
-        information->nameLength % sizeof(wchar_t) != 0 ||
+        information->nameLength %
+                sizeof(
+                    wchar_t
+                ) !=
+            0 ||
         information->nameLength >
-            requiredLength - sizeof(ULONG)
+            requiredLength -
+                sizeof(
+                    ULONG
+                )
     ) {
         return false;
     }
 
     keyPath.assign(
         information->name,
-        information->nameLength / sizeof(wchar_t)
+        information->nameLength /
+            sizeof(
+                wchar_t
+            )
     );
 
     return true;
-}
-
-CapturedStack CaptureCurrentCallStack() {
-    CapturedStack stack;
-
-    stack.frameCount = CaptureStackBackTrace(
-        kStackFramesToSkip,
-        kMaximumCapturedStackFrames,
-        stack.frames,
-        nullptr
-    );
-
-    return stack;
-}
-
-void LogCapturedStack(
-    unsigned long long writeNumber,
-    const CapturedStack& stack
-) {
-    Wh_Log(
-        L"UIORDER_WRITE_STACK_BEGIN "
-        L"write=%llu frames=%hu",
-        writeNumber,
-        stack.frameCount
-    );
-
-    for (USHORT index = 0; index < stack.frameCount; index++) {
-        void* frameAddress = stack.frames[index];
-        HMODULE module = nullptr;
-
-        BOOL moduleResolved = GetModuleHandleExW(
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            reinterpret_cast<LPCWSTR>(frameAddress),
-            &module
-        );
-
-        wchar_t modulePath[1024]{};
-        DWORD modulePathLength = 0;
-
-        if (moduleResolved && module) {
-            modulePathLength = GetModuleFileNameW(
-                module,
-                modulePath,
-                ARRAYSIZE(modulePath)
-            );
-        }
-
-        const unsigned long long moduleOffset =
-            module
-                ? static_cast<unsigned long long>(
-                      reinterpret_cast<std::uintptr_t>(frameAddress) -
-                      reinterpret_cast<std::uintptr_t>(module)
-                  )
-                : 0;
-
-        if (
-            moduleResolved &&
-            module &&
-            modulePathLength > 0 &&
-            modulePathLength < ARRAYSIZE(modulePath)
-        ) {
-            Wh_Log(
-                L"UIORDER_WRITE_STACK "
-                L"write=%llu "
-                L"frame=%hu "
-                L"address=%p "
-                L"moduleBase=%p "
-                L"offset=0x%llX "
-                L"module=\"%s\"",
-                writeNumber,
-                index,
-                frameAddress,
-                module,
-                moduleOffset,
-                modulePath
-            );
-        }
-        else {
-            Wh_Log(
-                L"UIORDER_WRITE_STACK "
-                L"write=%llu "
-                L"frame=%hu "
-                L"address=%p "
-                L"moduleBase=%p "
-                L"offset=0x%llX "
-                L"module=\"<unresolved>\"",
-                writeNumber,
-                index,
-                frameAddress,
-                module,
-                moduleOffset
-            );
-        }
-    }
-
-    Wh_Log(
-        L"UIORDER_WRITE_STACK_END write=%llu",
-        writeNumber
-    );
 }
 
 NTSTATUS NTAPI NtSetValueKey_Hook(
@@ -494,22 +550,28 @@ NTSTATUS NTAPI NtSetValueKey_Hook(
 ) {
     if (
         g_insideNtSetValueKeyHook ||
-        !IsUIOrderListValueName(valueName)
+        !IsUIOrderListValueName(
+            valueName
+        )
     ) {
-        return NtSetValueKey_Original(
-            keyHandle,
-            valueName,
-            titleIndex,
-            type,
-            data,
-            dataSize
-        );
+        return
+            NtSetValueKey_Original(
+                keyHandle,
+                valueName,
+                titleIndex,
+                type,
+                data,
+                dataSize
+            );
     }
 
-    g_insideNtSetValueKeyHook = true;
+    NtSetValueKeyHookGuard hookGuard(
+        g_insideNtSetValueKeyHook
+    );
 
     std::wstring keyPath;
-    NTSTATUS keyQueryStatus = 0;
+    NTSTATUS keyQueryStatus =
+        0;
 
     const bool keyPathResolved =
         QueryNativeRegistryKeyPath(
@@ -518,85 +580,155 @@ NTSTATUS NTAPI NtSetValueKey_Hook(
             keyQueryStatus
         );
 
-    if (
+    const bool exactTarget =
         keyPathResolved &&
-        !EndsWithOrdinalIgnoreCase(
+        type ==
+            REG_BINARY &&
+        EndsWithOrdinalIgnoreCase(
             keyPath,
             kNotifyIconSettingsSuffix
-        )
-    ) {
-        g_insideNtSetValueKeyHook = false;
-
-        return NtSetValueKey_Original(
-            keyHandle,
-            valueName,
-            titleIndex,
-            type,
-            data,
-            dataSize
         );
+
+    if (
+        !exactTarget
+    ) {
+        if (
+            !keyPathResolved
+        ) {
+            Wh_Log(
+                L"UIORDER_WRITE_PASSTHROUGH "
+                L"reason=key-unresolved "
+                L"keyQueryStatus=0x%08lX "
+                L"type=%lu "
+                L"bytes=%lu",
+                static_cast<ULONG>(
+                    keyQueryStatus
+                ),
+                type,
+                dataSize
+            );
+        }
+
+        return
+            NtSetValueKey_Original(
+                keyHandle,
+                valueName,
+                titleIndex,
+                type,
+                data,
+                dataSize
+            );
     }
 
-    const unsigned long long writeNumber =
-        g_uiOrderWriteCount.fetch_add(
-            1,
-            std::memory_order_relaxed
-        ) + 1;
+    const unsigned long long
+        attemptNumber =
+            g_uiOrderWriteAttemptCount
+                .fetch_add(
+                    1,
+                    std::memory_order_relaxed
+                ) +
+            1;
 
-    const DWORD threadId = GetCurrentThreadId();
-    const unsigned long long updateCallsBefore =
-        g_updateCallCount.load(
-            std::memory_order_acquire
-        );
+    bool expected =
+        false;
 
-    const UIOrderSnapshot beforeSnapshot =
-        CaptureUIOrderSnapshot();
+    const bool suppressWrite =
+        g_firstMatchingWriteSuppressed
+            .compare_exchange_strong(
+                expected,
+                true,
+                std::memory_order_acq_rel
+            );
 
-    const CapturedStack stack =
-        CaptureCurrentCallStack();
+    if (
+        suppressWrite
+    ) {
+        g_uiOrderSuppressedWriteCount
+            .fetch_add(
+                1,
+                std::memory_order_relaxed
+            );
+    }
+
+    const DWORD threadId =
+        GetCurrentThreadId();
+
+    const unsigned long long
+        updateCallsBefore =
+            g_updateCallCount.load(
+                std::memory_order_acquire
+            );
+
+    const UIOrderSnapshot
+        beforeSnapshot =
+            CaptureUIOrderSnapshot();
 
     Wh_Log(
         L"UIORDER_WRITE_BEGIN "
-        L"write=%llu "
+        L"attempt=%llu "
         L"thread=%lu "
-        L"keyResolved=%d "
-        L"keyQueryStatus=0x%08lX "
         L"key=\"%s\" "
         L"value=\"UIOrderList\" "
         L"type=%lu "
         L"bytes=%lu "
+        L"suppress=%d "
         L"updateCallsObserved=%llu "
         L"beforeValid=%d "
         L"beforeBytes=%lu "
         L"beforeHash=0x%016llX",
-        writeNumber,
+        attemptNumber,
         threadId,
-        keyPathResolved ? 1 : 0,
-        static_cast<ULONG>(keyQueryStatus),
-        keyPathResolved
-            ? keyPath.c_str()
-            : L"<unresolved>",
+        keyPath.c_str(),
         type,
         dataSize,
+        suppressWrite
+            ? 1
+            : 0,
         updateCallsBefore,
-        beforeSnapshot.valid ? 1 : 0,
+        beforeSnapshot.valid
+            ? 1
+            : 0,
         beforeSnapshot.byteLength,
-        static_cast<unsigned long long>(
+        static_cast<
+            unsigned long long
+        >(
             beforeSnapshot.hash
         )
     );
 
-    const NTSTATUS status = NtSetValueKey_Original(
-        keyHandle,
-        valueName,
-        titleIndex,
-        type,
-        data,
-        dataSize
-    );
+    NTSTATUS status =
+        kStatusSuccess;
 
-    const UIOrderSnapshot afterSnapshot =
-        CaptureUIOrderSnapshot();
+    if (
+        suppressWrite
+    ) {
+        Wh_Log(
+            L"UIORDER_WRITE_SUPPRESSED "
+            L"attempt=%llu "
+            L"thread=%lu "
+            L"returnedStatus=0x%08lX",
+            attemptNumber,
+            threadId,
+            static_cast<ULONG>(
+                kStatusSuccess
+            )
+        );
+    }
+    else {
+        status =
+            NtSetValueKey_Original(
+                keyHandle,
+                valueName,
+                titleIndex,
+                type,
+                data,
+                dataSize
+            );
+    }
+
+    const UIOrderSnapshot
+        afterSnapshot =
+            CaptureUIOrderSnapshot();
 
     const int comparable =
         beforeSnapshot.valid &&
@@ -613,15 +745,17 @@ NTSTATUS NTAPI NtSetValueKey_Hook(
             ? 1
             : 0;
 
-    const unsigned long long updateCallsAfter =
-        g_updateCallCount.load(
-            std::memory_order_acquire
-        );
+    const unsigned long long
+        updateCallsAfter =
+            g_updateCallCount.load(
+                std::memory_order_acquire
+            );
 
     Wh_Log(
         L"UIORDER_WRITE_END "
-        L"write=%llu "
+        L"attempt=%llu "
         L"thread=%lu "
+        L"suppressed=%d "
         L"ntstatus=0x%08lX "
         L"comparable=%d "
         L"changed=%d "
@@ -630,35 +764,41 @@ NTSTATUS NTAPI NtSetValueKey_Hook(
         L"afterHash=0x%016llX "
         L"updateCallsBefore=%llu "
         L"updateCallsAfter=%llu",
-        writeNumber,
+        attemptNumber,
         threadId,
-        static_cast<ULONG>(status),
+        suppressWrite
+            ? 1
+            : 0,
+        static_cast<ULONG>(
+            status
+        ),
         comparable,
         changed,
-        afterSnapshot.valid ? 1 : 0,
+        afterSnapshot.valid
+            ? 1
+            : 0,
         afterSnapshot.byteLength,
-        static_cast<unsigned long long>(
+        static_cast<
+            unsigned long long
+        >(
             afterSnapshot.hash
         ),
         updateCallsBefore,
         updateCallsAfter
     );
 
-    LogCapturedStack(
-        writeNumber,
-        stack
-    );
-
-    g_insideNtSetValueKeyHook = false;
     return status;
 }
 
 bool HookNativeRegistryWrites() {
-    HMODULE ntdll = GetModuleHandleW(
-        L"ntdll.dll"
-    );
+    HMODULE ntdll =
+        GetModuleHandleW(
+            L"ntdll.dll"
+        );
 
-    if (!ntdll) {
+    if (
+        !ntdll
+    ) {
         Wh_Log(
             L"ntdll.dll is unavailable"
         );
@@ -667,7 +807,9 @@ bool HookNativeRegistryWrites() {
     }
 
     auto ntSetValueKey =
-        reinterpret_cast<NtSetValueKey_t>(
+        reinterpret_cast<
+            NtSetValueKey_t
+        >(
             GetProcAddress(
                 ntdll,
                 "NtSetValueKey"
@@ -675,14 +817,18 @@ bool HookNativeRegistryWrites() {
         );
 
     NtQueryKey_Function =
-        reinterpret_cast<NtQueryKey_t>(
+        reinterpret_cast<
+            NtQueryKey_t
+        >(
             GetProcAddress(
                 ntdll,
                 "NtQueryKey"
             )
         );
 
-    if (!ntSetValueKey) {
+    if (
+        !ntSetValueKey
+    ) {
         Wh_Log(
             L"NtSetValueKey is unavailable"
         );
@@ -690,7 +836,9 @@ bool HookNativeRegistryWrites() {
         return false;
     }
 
-    if (!NtQueryKey_Function) {
+    if (
+        !NtQueryKey_Function
+    ) {
         Wh_Log(
             L"NtQueryKey is unavailable"
         );
@@ -698,11 +846,14 @@ bool HookNativeRegistryWrites() {
         return false;
     }
 
-    if (!WindhawkUtils::Wh_SetFunctionHookT(
-            ntSetValueKey,
-            NtSetValueKey_Hook,
-            &NtSetValueKey_Original
-        )) {
+    if (
+        !WindhawkUtils::
+            Wh_SetFunctionHookT(
+                ntSetValueKey,
+                NtSetValueKey_Hook,
+                &NtSetValueKey_Original
+            )
+    ) {
         Wh_Log(
             L"Failed to hook NtSetValueKey"
         );
@@ -711,7 +862,9 @@ bool HookNativeRegistryWrites() {
     }
 
     Wh_Log(
-        L"NtSetValueKey hook installed"
+        L"NtSetValueKey hook installed; "
+        L"one-shot UIOrderList "
+        L"suppression armed"
     );
 
     return true;
@@ -739,19 +892,24 @@ void LogUIOrderRegistryWatcherSnapshot(
             ? 1
             : 0;
 
-    const unsigned long long previousHash =
-        previousSnapshot
-            ? static_cast<unsigned long long>(
-                  previousSnapshot->hash
-              )
-            : 0;
+    const unsigned long long
+        previousHash =
+            previousSnapshot
+                ? static_cast<
+                      unsigned long long
+                  >(
+                      previousSnapshot
+                          ->hash
+                  )
+                : 0;
 
     Wh_Log(
         L"UIORDER_WATCH "
         L"phase=%s "
         L"notification=%llu "
         L"updateCallsObserved=%llu "
-        L"writesObserved=%llu "
+        L"writeAttemptsObserved=%llu "
+        L"suppressedWritesObserved=%llu "
         L"valid=%d "
         L"status=%ld "
         L"type=%lu "
@@ -767,16 +925,25 @@ void LogUIOrderRegistryWatcherSnapshot(
         g_updateCallCount.load(
             std::memory_order_acquire
         ),
-        g_uiOrderWriteCount.load(
+        g_uiOrderWriteAttemptCount.load(
             std::memory_order_acquire
         ),
-        currentSnapshot.valid ? 1 : 0,
+        g_uiOrderSuppressedWriteCount.load(
+            std::memory_order_acquire
+        ),
+        currentSnapshot.valid
+            ? 1
+            : 0,
         currentSnapshot.status,
         currentSnapshot.registryType,
         currentSnapshot.byteLength,
         currentSnapshot.entryCount,
-        currentSnapshot.lengthAligned ? 1 : 0,
-        static_cast<unsigned long long>(
+        currentSnapshot.lengthAligned
+            ? 1
+            : 0,
+        static_cast<
+            unsigned long long
+        >(
             currentSnapshot.hash
         ),
         comparable,
@@ -786,28 +953,33 @@ void LogUIOrderRegistryWatcherSnapshot(
 }
 
 LONG ArmUIOrderRegistryNotification() {
-    return RegNotifyChangeKeyValue(
-        g_registryWatcherKey,
-        FALSE,
-        REG_NOTIFY_CHANGE_LAST_SET,
-        g_registryWatcherChangeEvent,
-        TRUE
-    );
+    return
+        RegNotifyChangeKeyValue(
+            g_registryWatcherKey,
+            FALSE,
+            REG_NOTIFY_CHANGE_LAST_SET,
+            g_registryWatcherChangeEvent,
+            TRUE
+        );
 }
 
-DWORD WINAPI UIOrderRegistryWatcherThreadProc(
+DWORD WINAPI
+UIOrderRegistryWatcherThreadProc(
     LPVOID
 ) {
     Wh_Log(
-        L"UIOrderList registry watcher started; "
-        L"thread=%lu",
+        L"UIOrderList registry watcher "
+        L"started; thread=%lu",
         GetCurrentThreadId()
     );
 
     LONG notifyStatus =
         ArmUIOrderRegistryNotification();
 
-    if (notifyStatus != ERROR_SUCCESS) {
+    if (
+        notifyStatus !=
+        ERROR_SUCCESS
+    ) {
         Wh_Log(
             L"Initial registry notification "
             L"registration failed; status=%ld",
@@ -833,26 +1005,34 @@ DWORD WINAPI UIOrderRegistryWatcherThreadProc(
     };
 
     for (;;) {
-        DWORD waitResult = WaitForMultipleObjects(
-            ARRAYSIZE(waitHandles),
-            waitHandles,
-            FALSE,
-            INFINITE
-        );
+        DWORD waitResult =
+            WaitForMultipleObjects(
+                ARRAYSIZE(
+                    waitHandles
+                ),
+                waitHandles,
+                FALSE,
+                INFINITE
+            );
 
-        if (waitResult == WAIT_OBJECT_0) {
+        if (
+            waitResult ==
+            WAIT_OBJECT_0
+        ) {
             break;
         }
 
-        if (waitResult == WAIT_OBJECT_0 + 1) {
-            /*
-            RegNotifyChangeKeyValue is one-shot. Re-arm it before reading
-            UIOrderList so a change during the read can still signal the event.
-            */
+        if (
+            waitResult ==
+            WAIT_OBJECT_0 + 1
+        ) {
             notifyStatus =
                 ArmUIOrderRegistryNotification();
 
-            if (notifyStatus != ERROR_SUCCESS) {
+            if (
+                notifyStatus !=
+                ERROR_SUCCESS
+            ) {
                 Wh_Log(
                     L"Registry notification "
                     L"re-registration failed; "
@@ -863,14 +1043,18 @@ DWORD WINAPI UIOrderRegistryWatcherThreadProc(
                 break;
             }
 
-            UIOrderSnapshot currentSnapshot =
-                CaptureUIOrderSnapshot();
+            UIOrderSnapshot
+                currentSnapshot =
+                    CaptureUIOrderSnapshot();
 
-            const unsigned long long notificationNumber =
-                g_registryNotificationCount.fetch_add(
-                    1,
-                    std::memory_order_relaxed
-                ) + 1;
+            const unsigned long long
+                notificationNumber =
+                    g_registryNotificationCount
+                        .fetch_add(
+                            1,
+                            std::memory_order_relaxed
+                        ) +
+                    1;
 
             LogUIOrderRegistryWatcherSnapshot(
                 L"change",
@@ -879,14 +1063,19 @@ DWORD WINAPI UIOrderRegistryWatcherThreadProc(
                 currentSnapshot
             );
 
-            previousSnapshot = currentSnapshot;
+            previousSnapshot =
+                currentSnapshot;
+
             continue;
         }
 
-        if (waitResult == WAIT_FAILED) {
+        if (
+            waitResult ==
+            WAIT_FAILED
+        ) {
             Wh_Log(
-                L"Registry watcher wait failed; "
-                L"error=%lu",
+                L"Registry watcher wait "
+                L"failed; error=%lu",
                 GetLastError()
             );
         }
@@ -902,8 +1091,9 @@ DWORD WINAPI UIOrderRegistryWatcherThreadProc(
     }
 
     Wh_Log(
-        L"UIOrderList registry watcher stopped; "
-        L"thread=%lu notifications=%llu",
+        L"UIOrderList registry watcher "
+        L"stopped; thread=%lu "
+        L"notifications=%llu",
         GetCurrentThreadId(),
         g_registryNotificationCount.load(
             std::memory_order_relaxed
@@ -914,7 +1104,9 @@ DWORD WINAPI UIOrderRegistryWatcherThreadProc(
 }
 
 bool StartUIOrderRegistryWatcher() {
-    if (g_registryWatcherThread) {
+    if (
+        g_registryWatcherThread
+    ) {
         return true;
     }
 
@@ -923,95 +1115,137 @@ bool StartUIOrderRegistryWatcher() {
         std::memory_order_release
     );
 
-    LONG openStatus = RegOpenKeyExW(
-        HKEY_CURRENT_USER,
-        kNotifyIconSettingsPath,
-        0,
-        KEY_NOTIFY,
-        &g_registryWatcherKey
-    );
+    LONG openStatus =
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            kNotifyIconSettingsPath,
+            0,
+            KEY_NOTIFY,
+            &g_registryWatcherKey
+        );
 
-    if (openStatus != ERROR_SUCCESS) {
+    if (
+        openStatus !=
+        ERROR_SUCCESS
+    ) {
         Wh_Log(
-            L"Failed to open NotifyIconSettings "
-            L"for notifications; status=%ld",
+            L"Failed to open "
+            L"NotifyIconSettings for "
+            L"notifications; status=%ld",
             openStatus
         );
 
         return false;
     }
 
-    g_registryWatcherStopEvent = CreateEventW(
-        nullptr,
-        TRUE,
-        FALSE,
-        nullptr
-    );
+    g_registryWatcherStopEvent =
+        CreateEventW(
+            nullptr,
+            TRUE,
+            FALSE,
+            nullptr
+        );
 
-    if (!g_registryWatcherStopEvent) {
-        const DWORD error = GetLastError();
+    if (
+        !g_registryWatcherStopEvent
+    ) {
+        const DWORD error =
+            GetLastError();
 
-        RegCloseKey(g_registryWatcherKey);
-        g_registryWatcherKey = nullptr;
+        RegCloseKey(
+            g_registryWatcherKey
+        );
+
+        g_registryWatcherKey =
+            nullptr;
 
         Wh_Log(
-            L"Failed to create registry watcher "
-            L"stop event; error=%lu",
+            L"Failed to create registry "
+            L"watcher stop event; error=%lu",
             error
         );
 
         return false;
     }
 
-    g_registryWatcherChangeEvent = CreateEventW(
-        nullptr,
-        FALSE,
-        FALSE,
-        nullptr
-    );
+    g_registryWatcherChangeEvent =
+        CreateEventW(
+            nullptr,
+            FALSE,
+            FALSE,
+            nullptr
+        );
 
-    if (!g_registryWatcherChangeEvent) {
-        const DWORD error = GetLastError();
+    if (
+        !g_registryWatcherChangeEvent
+    ) {
+        const DWORD error =
+            GetLastError();
 
-        CloseHandle(g_registryWatcherStopEvent);
-        g_registryWatcherStopEvent = nullptr;
+        CloseHandle(
+            g_registryWatcherStopEvent
+        );
 
-        RegCloseKey(g_registryWatcherKey);
-        g_registryWatcherKey = nullptr;
+        g_registryWatcherStopEvent =
+            nullptr;
+
+        RegCloseKey(
+            g_registryWatcherKey
+        );
+
+        g_registryWatcherKey =
+            nullptr;
 
         Wh_Log(
-            L"Failed to create registry watcher "
-            L"change event; error=%lu",
+            L"Failed to create registry "
+            L"watcher change event; "
+            L"error=%lu",
             error
         );
 
         return false;
     }
 
-    g_registryWatcherThread = CreateThread(
-        nullptr,
-        0,
-        UIOrderRegistryWatcherThreadProc,
-        nullptr,
-        0,
-        nullptr
-    );
+    g_registryWatcherThread =
+        CreateThread(
+            nullptr,
+            0,
+            UIOrderRegistryWatcherThreadProc,
+            nullptr,
+            0,
+            nullptr
+        );
 
-    if (!g_registryWatcherThread) {
-        const DWORD error = GetLastError();
+    if (
+        !g_registryWatcherThread
+    ) {
+        const DWORD error =
+            GetLastError();
 
-        CloseHandle(g_registryWatcherChangeEvent);
-        g_registryWatcherChangeEvent = nullptr;
+        CloseHandle(
+            g_registryWatcherChangeEvent
+        );
 
-        CloseHandle(g_registryWatcherStopEvent);
-        g_registryWatcherStopEvent = nullptr;
+        g_registryWatcherChangeEvent =
+            nullptr;
 
-        RegCloseKey(g_registryWatcherKey);
-        g_registryWatcherKey = nullptr;
+        CloseHandle(
+            g_registryWatcherStopEvent
+        );
+
+        g_registryWatcherStopEvent =
+            nullptr;
+
+        RegCloseKey(
+            g_registryWatcherKey
+        );
+
+        g_registryWatcherKey =
+            nullptr;
 
         Wh_Log(
-            L"Failed to create registry watcher "
-            L"thread; error=%lu",
+            L"Failed to create registry "
+            L"watcher thread; error=%lu",
             error
         );
 
@@ -1022,42 +1256,75 @@ bool StartUIOrderRegistryWatcher() {
 }
 
 void StopUIOrderRegistryWatcher() {
-    if (g_registryWatcherStopEvent) {
-        SetEvent(g_registryWatcherStopEvent);
+    if (
+        g_registryWatcherStopEvent
+    ) {
+        SetEvent(
+            g_registryWatcherStopEvent
+        );
     }
 
-    if (g_registryWatcherThread) {
-        const DWORD waitResult = WaitForSingleObject(
-            g_registryWatcherThread,
-            INFINITE
-        );
+    if (
+        g_registryWatcherThread
+    ) {
+        const DWORD waitResult =
+            WaitForSingleObject(
+                g_registryWatcherThread,
+                INFINITE
+            );
 
-        if (waitResult != WAIT_OBJECT_0) {
+        if (
+            waitResult !=
+            WAIT_OBJECT_0
+        ) {
             Wh_Log(
-                L"Waiting for registry watcher "
-                L"failed; result=%lu error=%lu",
+                L"Waiting for registry "
+                L"watcher failed; result=%lu "
+                L"error=%lu",
                 waitResult,
                 GetLastError()
             );
         }
 
-        CloseHandle(g_registryWatcherThread);
-        g_registryWatcherThread = nullptr;
+        CloseHandle(
+            g_registryWatcherThread
+        );
+
+        g_registryWatcherThread =
+            nullptr;
     }
 
-    if (g_registryWatcherKey) {
-        RegCloseKey(g_registryWatcherKey);
-        g_registryWatcherKey = nullptr;
+    if (
+        g_registryWatcherKey
+    ) {
+        RegCloseKey(
+            g_registryWatcherKey
+        );
+
+        g_registryWatcherKey =
+            nullptr;
     }
 
-    if (g_registryWatcherChangeEvent) {
-        CloseHandle(g_registryWatcherChangeEvent);
-        g_registryWatcherChangeEvent = nullptr;
+    if (
+        g_registryWatcherChangeEvent
+    ) {
+        CloseHandle(
+            g_registryWatcherChangeEvent
+        );
+
+        g_registryWatcherChangeEvent =
+            nullptr;
     }
 
-    if (g_registryWatcherStopEvent) {
-        CloseHandle(g_registryWatcherStopEvent);
-        g_registryWatcherStopEvent = nullptr;
+    if (
+        g_registryWatcherStopEvent
+    ) {
+        CloseHandle(
+            g_registryWatcherStopEvent
+        );
+
+        g_registryWatcherStopEvent =
+            nullptr;
     }
 
     Wh_Log(
@@ -1066,18 +1333,32 @@ void StopUIOrderRegistryWatcher() {
     );
 }
 
-void LogModuleInformation(HMODULE module) {
-    wchar_t modulePath[MAX_PATH]{};
+void LogModuleInformation(
+    HMODULE module
+) {
+    wchar_t modulePath[
+        MAX_PATH
+    ]{};
 
-    const DWORD length = GetModuleFileNameW(
-        module,
-        modulePath,
-        ARRAYSIZE(modulePath)
-    );
+    const DWORD length =
+        GetModuleFileNameW(
+            module,
+            modulePath,
+            ARRAYSIZE(
+                modulePath
+            )
+        );
 
-    if (length == 0 || length >= ARRAYSIZE(modulePath)) {
+    if (
+        length == 0 ||
+        length >=
+            ARRAYSIZE(
+                modulePath
+            )
+    ) {
         Wh_Log(
-            L"System tray module=%p, path unavailable",
+            L"System tray module=%p, "
+            L"path unavailable",
             module
         );
 
@@ -1085,39 +1366,50 @@ void LogModuleInformation(HMODULE module) {
     }
 
     Wh_Log(
-        L"System tray module=%p, path=\"%s\"",
+        L"System tray module=%p, "
+        L"path=\"%s\"",
         module,
         modulePath
     );
 }
 
-void WINAPI StackViewModel_UpdateIconIndexes_Hook(
+void WINAPI
+StackViewModel_UpdateIconIndexes_Hook(
     void* pThis
 ) {
-    const unsigned long long callNumber =
-        g_updateCallCount.fetch_add(
-            1,
-            std::memory_order_relaxed
-        ) + 1;
+    const unsigned long long
+        callNumber =
+            g_updateCallCount
+                .fetch_add(
+                    1,
+                    std::memory_order_relaxed
+                ) +
+            1;
 
-    const DWORD threadId = GetCurrentThreadId();
+    const DWORD threadId =
+        GetCurrentThreadId();
 
     Wh_Log(
         L"INDEX_UPDATE_BEGIN "
         L"call=%llu "
         L"thread=%lu "
         L"this=%p "
-        L"writesObserved=%llu",
+        L"writeAttemptsObserved=%llu "
+        L"suppressedWritesObserved=%llu",
         callNumber,
         threadId,
         pThis,
-        g_uiOrderWriteCount.load(
+        g_uiOrderWriteAttemptCount.load(
+            std::memory_order_acquire
+        ),
+        g_uiOrderSuppressedWriteCount.load(
             std::memory_order_acquire
         )
     );
 
-    const UIOrderSnapshot beforeSnapshot =
-        CaptureUIOrderSnapshot();
+    const UIOrderSnapshot
+        beforeSnapshot =
+            CaptureUIOrderSnapshot();
 
     LogUIOrderSnapshot(
         L"before",
@@ -1129,8 +1421,9 @@ void WINAPI StackViewModel_UpdateIconIndexes_Hook(
         pThis
     );
 
-    const UIOrderSnapshot afterSnapshot =
-        CaptureUIOrderSnapshot();
+    const UIOrderSnapshot
+        afterSnapshot =
+            CaptureUIOrderSnapshot();
 
     LogUIOrderSnapshot(
         L"after",
@@ -1167,10 +1460,14 @@ void WINAPI StackViewModel_UpdateIconIndexes_Hook(
         changed,
         beforeSnapshot.byteLength,
         afterSnapshot.byteLength,
-        static_cast<unsigned long long>(
+        static_cast<
+            unsigned long long
+        >(
             beforeSnapshot.hash
         ),
-        static_cast<unsigned long long>(
+        static_cast<
+            unsigned long long
+        >(
             afterSnapshot.hash
         )
     );
@@ -1180,44 +1477,59 @@ void WINAPI StackViewModel_UpdateIconIndexes_Hook(
         L"call=%llu "
         L"thread=%lu "
         L"this=%p "
-        L"writesObserved=%llu",
+        L"writeAttemptsObserved=%llu "
+        L"suppressedWritesObserved=%llu",
         callNumber,
         threadId,
         pThis,
-        g_uiOrderWriteCount.load(
+        g_uiOrderWriteAttemptCount.load(
+            std::memory_order_acquire
+        ),
+        g_uiOrderSuppressedWriteCount.load(
             std::memory_order_acquire
         )
     );
 }
 
-bool HookSystemTraySymbols(HMODULE module) {
-    WindhawkUtils::SYMBOL_HOOK symbolHooks[] = {
-        {
+bool HookSystemTraySymbols(
+    HMODULE module
+) {
+    WindhawkUtils::SYMBOL_HOOK
+        symbolHooks[] = {
             {
-                LR"(private: void __cdecl winrt::SystemTray::implementation::StackViewModel::UpdateIconIndexes(void))"
+                {
+                    LR"(private: void __cdecl winrt::SystemTray::implementation::StackViewModel::UpdateIconIndexes(void))"
+                },
+                &StackViewModel_UpdateIconIndexes_Original,
+                StackViewModel_UpdateIconIndexes_Hook,
             },
-            &StackViewModel_UpdateIconIndexes_Original,
-            StackViewModel_UpdateIconIndexes_Hook,
-        },
-    };
+        };
 
-    if (!WindhawkUtils::HookSymbols(
+    if (
+        !WindhawkUtils::HookSymbols(
             module,
             symbolHooks,
-            ARRAYSIZE(symbolHooks)
-        )) {
+            ARRAYSIZE(
+                symbolHooks
+            )
+        )
+    ) {
         Wh_Log(
             L"Failed to locate or hook "
-            L"StackViewModel::UpdateIconIndexes"
+            L"StackViewModel::"
+            L"UpdateIconIndexes"
         );
 
         return false;
     }
 
-    LogModuleInformation(module);
+    LogModuleInformation(
+        module
+    );
 
     Wh_Log(
-        L"StackViewModel::UpdateIconIndexes "
+        L"StackViewModel::"
+        L"UpdateIconIndexes "
         L"hook installed"
     );
 
@@ -1225,17 +1537,21 @@ bool HookSystemTraySymbols(HMODULE module) {
 }
 
 HMODULE GetSystemTrayModuleHandle() {
-    HMODULE module = GetModuleHandleW(
-        L"SystemTray.dll"
-    );
+    HMODULE module =
+        GetModuleHandleW(
+            L"SystemTray.dll"
+        );
 
-    if (module) {
+    if (
+        module
+    ) {
         return module;
     }
 
-    return GetModuleHandleW(
-        L"Taskbar.View.dll"
-    );
+    return
+        GetModuleHandleW(
+            L"Taskbar.View.dll"
+        );
 }
 
 void HandleLoadedModule(
@@ -1256,12 +1572,14 @@ void HandleLoadedModule(
 
     if (
         !systemTrayModule ||
-        systemTrayModule != module
+        systemTrayModule !=
+            module
     ) {
         return;
     }
 
-    bool expected = false;
+    bool expected =
+        false;
 
     if (
         !g_systemTrayModuleHooked
@@ -1275,14 +1593,18 @@ void HandleLoadedModule(
     }
 
     Wh_Log(
-        L"Detected system tray module load: "
-        L"requestedPath=\"%s\"",
+        L"Detected system tray module "
+        L"load: requestedPath=\"%s\"",
         requestedPath
             ? requestedPath
             : L"<null>"
     );
 
-    if (!HookSystemTraySymbols(module)) {
+    if (
+        !HookSystemTraySymbols(
+            module
+        )
+    ) {
         g_systemTrayModuleHooked.store(
             false,
             std::memory_order_release
@@ -1295,23 +1617,29 @@ void HandleLoadedModule(
 }
 
 using LoadLibraryExW_t =
-    decltype(&LoadLibraryExW);
+    decltype(
+        &LoadLibraryExW
+    );
 
-LoadLibraryExW_t LoadLibraryExW_Original =
-    nullptr;
+LoadLibraryExW_t
+    LoadLibraryExW_Original =
+        nullptr;
 
 HMODULE WINAPI LoadLibraryExW_Hook(
     LPCWSTR libraryPath,
     HANDLE file,
     DWORD flags
 ) {
-    HMODULE module = LoadLibraryExW_Original(
-        libraryPath,
-        file,
-        flags
-    );
+    HMODULE module =
+        LoadLibraryExW_Original(
+            libraryPath,
+            file,
+            flags
+        );
 
-    if (module) {
+    if (
+        module
+    ) {
         HandleLoadedModule(
             module,
             libraryPath
@@ -1322,72 +1650,128 @@ HMODULE WINAPI LoadLibraryExW_Hook(
 }
 
 bool HookModuleLoader() {
-    HMODULE kernelBase = GetModuleHandleW(
-        L"kernelbase.dll"
-    );
+    HMODULE kernelBase =
+        GetModuleHandleW(
+            L"kernelbase.dll"
+        );
 
-    if (!kernelBase) {
+    if (
+        !kernelBase
+    ) {
         Wh_Log(
-            L"kernelbase.dll is unavailable"
+            L"kernelbase.dll "
+            L"is unavailable"
         );
 
         return false;
     }
 
     auto loadLibraryExW =
-        reinterpret_cast<decltype(&LoadLibraryExW)>(
+        reinterpret_cast<
+            decltype(
+                &LoadLibraryExW
+            )
+        >(
             GetProcAddress(
                 kernelBase,
                 "LoadLibraryExW"
             )
         );
 
-    if (!loadLibraryExW) {
+    if (
+        !loadLibraryExW
+    ) {
         Wh_Log(
-            L"LoadLibraryExW is unavailable"
+            L"LoadLibraryExW "
+            L"is unavailable"
         );
 
         return false;
     }
 
-    return WindhawkUtils::Wh_SetFunctionHookT(
-        loadLibraryExW,
-        LoadLibraryExW_Hook,
-        &LoadLibraryExW_Original
-    );
+    return
+        WindhawkUtils::
+            Wh_SetFunctionHookT(
+                loadLibraryExW,
+                LoadLibraryExW_Hook,
+                &LoadLibraryExW_Original
+            );
 }
 
 }  // namespace
 
 BOOL Wh_ModInit() {
     Wh_Log(
-        L"System Tray Index Analyzer 0.4.0 "
-        L"initializing"
+        L"System Tray Index Analyzer "
+        L"0.5.0 initializing; "
+        L"one-shot suppression armed"
     );
 
-    if (!HookNativeRegistryWrites()) {
+    g_systemTrayModuleHooked.store(
+        false,
+        std::memory_order_release
+    );
+
+    g_firstMatchingWriteSuppressed.store(
+        false,
+        std::memory_order_release
+    );
+
+    g_updateCallCount.store(
+        0,
+        std::memory_order_release
+    );
+
+    g_registryNotificationCount.store(
+        0,
+        std::memory_order_release
+    );
+
+    g_uiOrderWriteAttemptCount.store(
+        0,
+        std::memory_order_release
+    );
+
+    g_uiOrderSuppressedWriteCount.store(
+        0,
+        std::memory_order_release
+    );
+
+    if (
+        !HookNativeRegistryWrites()
+    ) {
         return FALSE;
     }
 
-    if (!StartUIOrderRegistryWatcher()) {
+    if (
+        !StartUIOrderRegistryWatcher()
+    ) {
         return FALSE;
     }
 
-    HMODULE module = GetSystemTrayModuleHandle();
+    HMODULE module =
+        GetSystemTrayModuleHandle();
 
-    if (module) {
+    if (
+        module
+    ) {
         g_systemTrayModuleHooked.store(
             true,
             std::memory_order_release
         );
 
-        if (!HookSystemTraySymbols(module)) {
+        if (
+            !HookSystemTraySymbols(
+                module
+            )
+        ) {
             g_systemTrayModuleHooked.store(
                 false,
                 std::memory_order_release
             );
 
             StopUIOrderRegistryWatcher();
+
             return FALSE;
         }
 
@@ -1395,12 +1779,16 @@ BOOL Wh_ModInit() {
     }
 
     Wh_Log(
-        L"SystemTray.dll is not loaded yet; "
-        L"waiting for module load"
+        L"SystemTray.dll is not "
+        L"loaded yet; waiting for "
+        L"module load"
     );
 
-    if (!HookModuleLoader()) {
+    if (
+        !HookModuleLoader()
+    ) {
         StopUIOrderRegistryWatcher();
+
         return FALSE;
     }
 
@@ -1416,13 +1804,17 @@ void Wh_ModAfterInit() {
         return;
     }
 
-    HMODULE module = GetSystemTrayModuleHandle();
+    HMODULE module =
+        GetSystemTrayModuleHandle();
 
-    if (!module) {
+    if (
+        !module
+    ) {
         return;
     }
 
-    bool expected = false;
+    bool expected =
+        false;
 
     if (
         !g_systemTrayModuleHooked
@@ -1440,7 +1832,11 @@ void Wh_ModAfterInit() {
         L"after initialization"
     );
 
-    if (HookSystemTraySymbols(module)) {
+    if (
+        HookSystemTraySymbols(
+            module
+        )
+    ) {
         Wh_ApplyHookOperations();
     }
     else {
@@ -1455,17 +1851,22 @@ void Wh_ModUninit() {
     StopUIOrderRegistryWatcher();
 
     Wh_Log(
-        L"System Tray Index Analyzer stopped; "
+        L"System Tray Index Analyzer "
+        L"stopped; "
         L"capturedCalls=%llu "
         L"registryNotifications=%llu "
-        L"uiOrderWrites=%llu",
+        L"uiOrderWriteAttempts=%llu "
+        L"suppressedWrites=%llu",
         g_updateCallCount.load(
             std::memory_order_relaxed
         ),
         g_registryNotificationCount.load(
             std::memory_order_relaxed
         ),
-        g_uiOrderWriteCount.load(
+        g_uiOrderWriteAttemptCount.load(
+            std::memory_order_relaxed
+        ),
+        g_uiOrderSuppressedWriteCount.load(
             std::memory_order_relaxed
         )
     );
