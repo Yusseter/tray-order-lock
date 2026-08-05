@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              system-tray-index-analyzer
 // @name            System Tray Index Analyzer
-// @description     Tests whether suppressing one ITaskbarModel5::MoveNotificationAreaIcon request prevents a visible tray reorder.
-// @version         0.6.0
+// @description     Tests whether continuously suppressing ITaskbarModel5::MoveNotificationAreaIcon locks tray icon order.
+// @version         0.7.0
 // @author          Yusseter
 // @github          https://github.com/Yusseter
 // @homepage        https://github.com/Yusseter/tray-order-lock
@@ -19,30 +19,29 @@
 A temporary diagnostic mod for researching Windows 11 notification-area icon
 ordering.
 
-Version 0.6.0 performs a single controlled behavior test:
+Version 0.7.0 performs a continuous suppression test:
 
 - It hooks the ABI-facing `ITaskbarModel5::MoveNotificationAreaIcon` producer in
   `taskbar.dll` using the exact public symbol recovered from Microsoft symbols.
-- The first move request after the mod is loaded returns `S_OK` without calling
-  the original producer, so the lower `NotificationAreaIconManager2::MoveIcon`
-  function is never entered.
-- Every later move request is passed through unchanged.
-- `NtSetValueKey` is still observed for exact `UIOrderList` writes, but no
-  registry write is suppressed in this version.
+- Every move request returns `S_OK` without calling the original producer, so
+  the lower `NotificationAreaIconManager2::MoveIcon` function is never entered.
+- `NtSetValueKey` is observed for exact `UIOrderList` writes, but registry writes
+  are never modified or suppressed by that hook.
 
-The test determines whether suppressing the move request above `MoveIcon` stops
-both the live collection update and the persistent `UIOrderList` update.
+The test determines whether continuously suppressing the move request locks tray
+icon order while allowing unrelated tray icon creation and removal to continue.
 
-The mod also records:
+The mod records:
 
-- Move requests, arguments, and whether the request was suppressed
+- Every move request and its arguments
+- Every suppressed move request
 - Exact `UIOrderList` write attempts and read-only before/after snapshots
 - Read-only last-set notifications for `NotifyIconSettings`
 - `StackViewModel::UpdateIconIndexes` calls and read-only before/after snapshots
 - Correlation counters for moves, writes, notifications, and index updates
 
-This is an experimental diagnostic version. It intentionally suppresses the
-first `ITaskbarModel5::MoveNotificationAreaIcon` request after the mod is loaded.
+This is an experimental diagnostic version. It intentionally suppresses every
+`ITaskbarModel5::MoveNotificationAreaIcon` request while the mod is enabled.
 */
 // ==/WindhawkModReadme==
 
@@ -83,28 +82,20 @@ std::atomic<bool> g_taskbarModuleHooked =
 std::atomic<bool> g_systemTrayModuleHooked =
     false;
 
-std::atomic<bool> g_firstMoveRequestSuppressed =
-    false;
+std::atomic<unsigned long long> g_moveRequestCallCount =
+    0;
 
-std::atomic<unsigned long long>
-    g_moveRequestCallCount =
-        0;
+std::atomic<unsigned long long> g_moveRequestSuppressedCount =
+    0;
 
-std::atomic<unsigned long long>
-    g_moveRequestSuppressedCount =
-        0;
+std::atomic<unsigned long long> g_updateCallCount =
+    0;
 
-std::atomic<unsigned long long>
-    g_updateCallCount =
-        0;
+std::atomic<unsigned long long> g_registryNotificationCount =
+    0;
 
-std::atomic<unsigned long long>
-    g_registryNotificationCount =
-        0;
-
-std::atomic<unsigned long long>
-    g_uiOrderWriteAttemptCount =
-        0;
+std::atomic<unsigned long long> g_uiOrderWriteAttemptCount =
+    0;
 
 HANDLE g_registryWatcherStopEvent =
     nullptr;
@@ -118,9 +109,8 @@ HANDLE g_registryWatcherThread =
 HKEY g_registryWatcherKey =
     nullptr;
 
-thread_local bool
-    g_insideNtSetValueKeyHook =
-        false;
+thread_local bool g_insideNtSetValueKeyHook =
+    false;
 
 struct UIOrderSnapshot {
     LONG status =
@@ -219,13 +209,11 @@ StackViewModel_UpdateIconIndexes_t
     StackViewModel_UpdateIconIndexes_Original =
         nullptr;
 
-NtSetValueKey_t
-    NtSetValueKey_Original =
-        nullptr;
+NtSetValueKey_t NtSetValueKey_Original =
+    nullptr;
 
-NtQueryKey_t
-    NtQueryKey_Function =
-        nullptr;
+NtQueryKey_t NtQueryKey_Function =
+    nullptr;
 
 std::uint64_t CalculateFnv1aHash(
     const BYTE* data,
@@ -620,10 +608,9 @@ NTSTATUS NTAPI NtSetValueKey_Hook(
             );
     }
 
-    NtSetValueKeyHookGuard
-        hookGuard(
-            g_insideNtSetValueKeyHook
-        );
+    NtSetValueKeyHookGuard hookGuard(
+        g_insideNtSetValueKeyHook
+    );
 
     std::wstring keyPath;
 
@@ -921,15 +908,14 @@ void LogUIOrderRegistryWatcherSnapshot(
             ? 1
             : 0;
 
-    const unsigned long long
-        previousHash =
-            previousSnapshot
-                ? static_cast<
-                      unsigned long long
-                  >(
-                      previousSnapshot->hash
-                  )
-                : 0;
+    const unsigned long long previousHash =
+        previousSnapshot
+            ? static_cast<
+                  unsigned long long
+              >(
+                  previousSnapshot->hash
+              )
+            : 0;
 
     Wh_Log(
         L"UIORDER_WATCH "
@@ -1079,9 +1065,8 @@ UIOrderRegistryWatcherThreadProc(
                 break;
             }
 
-            UIOrderSnapshot
-                currentSnapshot =
-                    CaptureUIOrderSnapshot();
+            UIOrderSnapshot currentSnapshot =
+                CaptureUIOrderSnapshot();
 
             const unsigned long long
                 notificationNumber =
@@ -1147,7 +1132,7 @@ bool StartUIOrderRegistryWatcher() {
         return true;
     }
 
-    LONG openStatus =
+    const LONG openStatus =
         RegOpenKeyExW(
             HKEY_CURRENT_USER,
             kNotifyIconSettingsPath,
@@ -1419,54 +1404,35 @@ TaskbarModel_MoveNotificationAreaIcon_Hook(
                 ) +
             1;
 
-    bool expected =
-        false;
-
-    const bool suppressCall =
-        g_firstMoveRequestSuppressed
-            .compare_exchange_strong(
-                expected,
-                true,
-                std::memory_order_acq_rel
-            );
-
-    if (
-        suppressCall
-    ) {
-        g_moveRequestSuppressedCount
-            .fetch_add(
-                1,
-                std::memory_order_relaxed
-            );
-    }
+    g_moveRequestSuppressedCount
+        .fetch_add(
+            1,
+            std::memory_order_relaxed
+        );
 
     const DWORD threadId =
         GetCurrentThreadId();
 
-    const unsigned long long
-        writesBefore =
-            g_uiOrderWriteAttemptCount
-                .load(
-                    std::memory_order_acquire
-                );
+    const unsigned long long writesBefore =
+        g_uiOrderWriteAttemptCount
+            .load(
+                std::memory_order_acquire
+            );
 
-    const unsigned long long
-        notificationsBefore =
-            g_registryNotificationCount
-                .load(
-                    std::memory_order_acquire
-                );
+    const unsigned long long notificationsBefore =
+        g_registryNotificationCount
+            .load(
+                std::memory_order_acquire
+            );
 
-    const unsigned long long
-        updatesBefore =
-            g_updateCallCount
-                .load(
-                    std::memory_order_acquire
-                );
+    const unsigned long long updatesBefore =
+        g_updateCallCount
+            .load(
+                std::memory_order_acquire
+            );
 
-    const UIOrderSnapshot
-        beforeSnapshot =
-            CaptureUIOrderSnapshot();
+    const UIOrderSnapshot beforeSnapshot =
+        CaptureUIOrderSnapshot();
 
     Wh_Log(
         L"MOVE_REQUEST_BEGIN "
@@ -1476,7 +1442,7 @@ TaskbarModel_MoveNotificationAreaIcon_Hook(
         L"iconAbi=%p "
         L"location=%d "
         L"index=%u "
-        L"suppress=%d "
+        L"suppress=1 "
         L"writeAttemptsObserved=%llu "
         L"registryNotificationsObserved=%llu "
         L"updateCallsObserved=%llu "
@@ -1489,9 +1455,6 @@ TaskbarModel_MoveNotificationAreaIcon_Hook(
         notificationAreaIconAbi,
         location,
         index,
-        suppressCall
-            ? 1
-            : 0,
         writesBefore,
         notificationsBefore,
         updatesBefore,
@@ -1506,42 +1469,28 @@ TaskbarModel_MoveNotificationAreaIcon_Hook(
         )
     );
 
-    int result =
+    Wh_Log(
+        L"MOVE_REQUEST_SUPPRESSED "
+        L"call=%llu "
+        L"thread=%lu "
+        L"this=%p "
+        L"iconAbi=%p "
+        L"location=%d "
+        L"index=%u "
+        L"returnedHresult=0x00000000",
+        callNumber,
+        threadId,
+        pThis,
+        notificationAreaIconAbi,
+        location,
+        index
+    );
+
+    const int result =
         0;
 
-    if (
-        suppressCall
-    ) {
-        Wh_Log(
-            L"MOVE_REQUEST_SUPPRESSED "
-            L"call=%llu "
-            L"thread=%lu "
-            L"this=%p "
-            L"iconAbi=%p "
-            L"location=%d "
-            L"index=%u "
-            L"returnedHresult=0x00000000",
-            callNumber,
-            threadId,
-            pThis,
-            notificationAreaIconAbi,
-            location,
-            index
-        );
-    }
-    else {
-        result =
-            TaskbarModel_MoveNotificationAreaIcon_Original(
-                pThis,
-                notificationAreaIconAbi,
-                location,
-                index
-            );
-    }
-
-    const UIOrderSnapshot
-        afterSnapshot =
-            CaptureUIOrderSnapshot();
+    const UIOrderSnapshot afterSnapshot =
+        CaptureUIOrderSnapshot();
 
     const int comparable =
         beforeSnapshot.valid &&
@@ -1562,7 +1511,7 @@ TaskbarModel_MoveNotificationAreaIcon_Hook(
         L"MOVE_REQUEST_END "
         L"call=%llu "
         L"thread=%lu "
-        L"suppressed=%d "
+        L"suppressed=1 "
         L"hresult=0x%08lX "
         L"comparable=%d "
         L"changed=%d "
@@ -1577,9 +1526,6 @@ TaskbarModel_MoveNotificationAreaIcon_Hook(
         L"updateCallsAfter=%llu",
         callNumber,
         threadId,
-        suppressCall
-            ? 1
-            : 0,
         static_cast<ULONG>(
             result
         ),
@@ -1655,9 +1601,8 @@ StackViewModel_UpdateIconIndexes_Hook(
             )
     );
 
-    const UIOrderSnapshot
-        beforeSnapshot =
-            CaptureUIOrderSnapshot();
+    const UIOrderSnapshot beforeSnapshot =
+        CaptureUIOrderSnapshot();
 
     LogUIOrderSnapshot(
         L"before",
@@ -1670,9 +1615,8 @@ StackViewModel_UpdateIconIndexes_Hook(
         pThis
     );
 
-    const UIOrderSnapshot
-        afterSnapshot =
-            CaptureUIOrderSnapshot();
+    const UIOrderSnapshot afterSnapshot =
+        CaptureUIOrderSnapshot();
 
     LogUIOrderSnapshot(
         L"after",
@@ -1790,7 +1734,7 @@ bool HookTaskbarSymbols(
         L"ITaskbarModel5::"
         L"MoveNotificationAreaIcon "
         L"hook installed; "
-        L"one-shot suppression armed"
+        L"continuous suppression active"
     );
 
     return true;
@@ -1855,16 +1799,12 @@ HMODULE GetSystemTrayModuleHandle() {
             L"SystemTray.dll"
         );
 
-    if (
-        module
-    ) {
-        return module;
-    }
-
     return
-        GetModuleHandleW(
-            L"Taskbar.View.dll"
-        );
+        module
+            ? module
+            : GetModuleHandleW(
+                  L"Taskbar.View.dll"
+              );
 }
 
 bool TryHookTaskbarModule(
@@ -2054,9 +1994,8 @@ using LoadLibraryExW_t =
         &LoadLibraryExW
     );
 
-LoadLibraryExW_t
-    LoadLibraryExW_Original =
-        nullptr;
+LoadLibraryExW_t LoadLibraryExW_Original =
+    nullptr;
 
 HMODULE WINAPI LoadLibraryExW_Hook(
     LPCWSTR libraryPath,
@@ -2145,9 +2084,9 @@ bool HookModuleLoader() {
 BOOL Wh_ModInit() {
     Wh_Log(
         L"System Tray Index Analyzer "
-        L"0.6.0 initializing; "
-        L"one-shot move-request "
-        L"suppression armed"
+        L"0.7.0 initializing; "
+        L"continuous move-request "
+        L"suppression active"
     );
 
     g_taskbarModuleHooked
@@ -2157,12 +2096,6 @@ BOOL Wh_ModInit() {
         );
 
     g_systemTrayModuleHooked
-        .store(
-            false,
-            std::memory_order_release
-        );
-
-    g_firstMoveRequestSuppressed
         .store(
             false,
             std::memory_order_release
