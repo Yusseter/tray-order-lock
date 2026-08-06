@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              tray-add-path-analyzer
 // @name            Tray Add Path Analyzer
-// @description     Tests dynamic automatic movement of a new tray icon to the final position.
-// @version         0.5.0
+// @description     Correlates new tray identities with the live overflow collection size.
+// @version         0.6.0
 // @author          Yusseter
 // @github          https://github.com/Yusseter
 // @homepage        https://github.com/Yusseter/tray-order-lock
@@ -16,21 +16,23 @@
 /*
 # Tray Add Path Analyzer
 
-A temporary one-shot diagnostic mod.
+A temporary read-only diagnostic mod.
 
-Version 0.5.0 moves a dedicated newly added test icon to the actual final tray
-position without using a fixed target index.
+Version 0.6.0 performs no tray movement.
 
-It repeatedly uses the verified `NotificationAreaIconManager2::MoveIcon` path
-with valid consecutive indexes. After every move, it reads `UIOrderList` and
-stops as soon as the test icon reaches the final persistent position.
+It:
 
-The test applies only to an executable named:
+- Captures the TaskbarModel6 ABI object through
+  `get_NotificationAreaOverflowIcons`.
+- Reads the current overflow collection size through
+  `IVector<NotificationAreaIcon>`.
+- Captures UIOrderList before `AddIcon`.
+- During `AddIconToVisibleCollection`, identifies the exact registry identity
+  added by the active AddIcon call.
+- Correlates the dedicated test icon with the live overflow size.
 
-`TrayDynamicEndTest.exe`
-
-The mod prevents recursive processing of visible-collection updates triggered
-by its own moves.
+The result will provide the valid final zero-based index for a later single
+MoveIcon call without repeating synchronous moves.
 */
 // ==/WindhawkModReadme==
 
@@ -44,7 +46,6 @@ by its own moves.
 #include <cstring>
 #include <cwchar>
 #include <cwctype>
-#include <iterator>
 #include <string>
 #include <utility>
 #include <vector>
@@ -58,13 +59,13 @@ constexpr wchar_t kUIOrderListValueName[] =
     L"UIOrderList";
 
 constexpr wchar_t kTargetExecutableName[] =
-    L"traydynamicendtest.exe";
+    L"traycollectioncounttest.exe";
 
-constexpr int kOverflowLocation =
-    1;
-
-constexpr unsigned int kMaximumMoveSteps =
-    128;
+using NotificationAreaIconManager_AddIcon_t =
+    void(__cdecl*)(
+        void* pThis,
+        void* trayNotifyData
+    );
 
 using NotificationAreaIconManager_AddVisible_t =
     void(__cdecl*)(
@@ -72,47 +73,50 @@ using NotificationAreaIconManager_AddVisible_t =
         void* iconImplementation
     );
 
-using NotificationAreaIconManager_MoveIcon_t =
-    void(__cdecl*)(
-        void* pThis,
-        void* iconArgumentStorage,
-        int location,
-        unsigned int index
-    );
-
-using NotificationAreaIcon_QueryInterface_t =
+using TaskbarModel_GetOverflowIcons_t =
     int(__cdecl*)(
-        void* iconImplementation,
-        const GUID& interfaceId,
+        void* pThis,
         void** result
     );
+
+using Vector_GetSize_t =
+    HRESULT(STDMETHODCALLTYPE*)(
+        void* pThis,
+        unsigned int* size
+    );
+
+NotificationAreaIconManager_AddIcon_t
+    NotificationAreaIconManager_AddIcon_Original =
+        nullptr;
 
 NotificationAreaIconManager_AddVisible_t
     NotificationAreaIconManager_AddVisible_Original =
         nullptr;
 
-NotificationAreaIconManager_MoveIcon_t
-    NotificationAreaIconManager_MoveIcon =
+TaskbarModel_GetOverflowIcons_t
+    TaskbarModel_GetOverflowIcons_Original =
         nullptr;
 
-NotificationAreaIcon_QueryInterface_t
-    NotificationAreaIcon_QueryInterface =
-        nullptr;
-
-const GUID* g_notificationAreaIconInterfaceId =
+const GUID* g_notificationAreaIconVectorId =
     nullptr;
 
-std::atomic<unsigned long long> g_visibleAddCallCount =
+std::atomic<void*> g_taskbarModel6 =
+    nullptr;
+
+std::atomic<unsigned long long> g_addIconCalls =
     0;
 
-std::atomic<unsigned long long> g_moveStepCount =
+std::atomic<unsigned long long> g_visibleAddCalls =
+    0;
+
+std::atomic<unsigned long long> g_overflowGetterCalls =
+    0;
+
+std::atomic<unsigned long long> g_targetObservations =
     0;
 
 std::atomic<bool> g_testConsumed =
     false;
-
-thread_local unsigned int g_internalMoveDepth =
-    0;
 
 struct UIOrderSnapshot {
     bool valid =
@@ -124,83 +128,28 @@ struct UIOrderSnapshot {
     std::vector<std::uint64_t> entries;
 };
 
-bool ContainsText(
-    const wchar_t* text,
-    const wchar_t* expected
-) {
-    return
-        text &&
-        expected &&
-        std::wcsstr(
-            text,
-            expected
-        ) !=
-        nullptr;
-}
+struct AddIconContext {
+    bool active =
+        false;
 
-bool IsNotificationAreaIconQueryInterfaceSymbol(
-    const wchar_t* symbol
-) {
-    return
-        ContainsText(
-            symbol,
-            L"root_implements<"
-        ) &&
-        ContainsText(
-            symbol,
-            L"NotificationAreaIcon2"
-        ) &&
-        ContainsText(
-            symbol,
-            L">::query_interface("
-        ) &&
-        ContainsText(
-            symbol,
-            L"winrt::guid const &"
-        ) &&
-        ContainsText(
-            symbol,
-            L"void * *"
-        ) &&
-        !ContainsText(
-            symbol,
-            L"query_interface_common"
-        ) &&
-        !ContainsText(
-            symbol,
-            L"query_interface_tearoff"
-        );
-}
+    unsigned long long callNumber =
+        0;
 
-bool IsNotificationAreaIconIidSymbol(
+    UIOrderSnapshot before;
+};
+
+thread_local AddIconContext g_addIconContext;
+
+bool IsVectorInterfaceIdSymbol(
     const wchar_t* symbol
 ) {
     constexpr wchar_t kExpectedSymbol[] =
         L"struct guid::guid const "
         L"winrt::impl::guid_v<struct "
+        L"winrt::Windows::Foundation::Collections::"
+        L"IVector<struct "
         L"winrt::WindowsUdk::UI::Shell::"
-        L"INotificationAreaIcon>";
-
-    return
-        symbol &&
-        std::wcscmp(
-            symbol,
-            kExpectedSymbol
-        ) ==
-        0;
-}
-
-bool IsMoveIconSymbol(
-    const wchar_t* symbol
-) {
-    constexpr wchar_t kExpectedSymbol[] =
-        L"public: void __cdecl "
-        L"NotificationAreaIconManager2::MoveIcon("
-        L"struct winrt::WindowsUdk::UI::Shell::"
-        L"NotificationAreaIcon,"
-        L"enum winrt::WindowsUdk::UI::Shell::"
-        L"NotificationAreaIconLocation,"
-        L"unsigned int)";
+        L"NotificationAreaIcon> >";
 
     return
         symbol &&
@@ -244,70 +193,22 @@ bool ResolveRequiredSymbols(
 
     do {
         if (
-            !NotificationAreaIcon_QueryInterface &&
-            IsNotificationAreaIconQueryInterfaceSymbol(
+            !g_notificationAreaIconVectorId &&
+            IsVectorInterfaceIdSymbol(
                 symbol.symbol
             )
         ) {
-            NotificationAreaIcon_QueryInterface =
-                reinterpret_cast<
-                    NotificationAreaIcon_QueryInterface_t
-                >(
+            g_notificationAreaIconVectorId =
+                reinterpret_cast<const GUID*>(
                     symbol.address
                 );
 
             Wh_Log(
-                L"QUERY_INTERFACE_SYMBOL "
+                L"VECTOR_INTERFACE_ID_SYMBOL "
                 L"address=%p",
                 symbol.address
             );
-        }
 
-        if (
-            !g_notificationAreaIconInterfaceId &&
-            IsNotificationAreaIconIidSymbol(
-                symbol.symbol
-            )
-        ) {
-            g_notificationAreaIconInterfaceId =
-                reinterpret_cast<
-                    const GUID*
-                >(
-                    symbol.address
-                );
-
-            Wh_Log(
-                L"INTERFACE_ID_SYMBOL "
-                L"address=%p",
-                symbol.address
-            );
-        }
-
-        if (
-            !NotificationAreaIconManager_MoveIcon &&
-            IsMoveIconSymbol(
-                symbol.symbol
-            )
-        ) {
-            NotificationAreaIconManager_MoveIcon =
-                reinterpret_cast<
-                    NotificationAreaIconManager_MoveIcon_t
-                >(
-                    symbol.address
-                );
-
-            Wh_Log(
-                L"MOVE_ICON_SYMBOL "
-                L"address=%p",
-                symbol.address
-            );
-        }
-
-        if (
-            NotificationAreaIcon_QueryInterface &&
-            g_notificationAreaIconInterfaceId &&
-            NotificationAreaIconManager_MoveIcon
-        ) {
             break;
         }
     } while (
@@ -321,41 +222,14 @@ bool ResolveRequiredSymbols(
         symbolSearch
     );
 
-    if (!NotificationAreaIcon_QueryInterface) {
+    if (!g_notificationAreaIconVectorId) {
         Wh_Log(
-            L"NotificationAreaIcon2 "
-            L"query_interface symbol not found"
+            L"IVector<NotificationAreaIcon> "
+            L"IID symbol not found"
         );
 
         return false;
     }
-
-    if (!g_notificationAreaIconInterfaceId) {
-        Wh_Log(
-            L"INotificationAreaIcon IID symbol not found"
-        );
-
-        return false;
-    }
-
-    if (!NotificationAreaIconManager_MoveIcon) {
-        Wh_Log(
-            L"NotificationAreaIconManager2::MoveIcon "
-            L"symbol not found"
-        );
-
-        return false;
-    }
-
-    Wh_Log(
-        L"DYNAMIC_END_SUPPORT_READY "
-        L"queryFunction=%p "
-        L"interfaceId=%p "
-        L"moveFunction=%p",
-        NotificationAreaIcon_QueryInterface,
-        g_notificationAreaIconInterfaceId,
-        NotificationAreaIconManager_MoveIcon
-    );
 
     return true;
 }
@@ -457,6 +331,40 @@ UIOrderSnapshot CaptureUIOrderSnapshot() {
         ERROR_MORE_DATA;
 
     return snapshot;
+}
+
+std::vector<std::uint64_t> FindAddedIdentities(
+    const UIOrderSnapshot& before,
+    const UIOrderSnapshot& after
+) {
+    std::vector<std::uint64_t> added;
+
+    if (
+        !before.valid ||
+        !after.valid
+    ) {
+        return added;
+    }
+
+    for (
+        std::uint64_t identity :
+        after.entries
+    ) {
+        if (
+            std::find(
+                before.entries.begin(),
+                before.entries.end(),
+                identity
+            ) ==
+            before.entries.end()
+        ) {
+            added.push_back(
+                identity
+            );
+        }
+    }
+
+    return added;
 }
 
 std::wstring MakeTrayEntrySubkey(
@@ -580,85 +488,556 @@ bool EndsWithOrdinalIgnoreCase(
     return true;
 }
 
-unsigned long long FindOneBasedPosition(
-    const UIOrderSnapshot& snapshot,
-    std::uint64_t identity
+bool QueryVectorSize(
+    void* collectionAbi,
+    unsigned int* size,
+    HRESULT* queryResult,
+    HRESULT* sizeResult
 ) {
-    const auto iterator =
-        std::find(
-            snapshot.entries.begin(),
-            snapshot.entries.end(),
-            identity
+    if (size) {
+        *size =
+            0;
+    }
+
+    if (queryResult) {
+        *queryResult =
+            E_FAIL;
+    }
+
+    if (sizeResult) {
+        *sizeResult =
+            E_FAIL;
+    }
+
+    if (
+        !collectionAbi ||
+        !g_notificationAreaIconVectorId
+    ) {
+        return false;
+    }
+
+    void* vectorAbi =
+        nullptr;
+
+    const HRESULT queryHr =
+        reinterpret_cast<IUnknown*>(
+            collectionAbi
+        )->QueryInterface(
+            *g_notificationAreaIconVectorId,
+            &vectorAbi
+        );
+
+    if (queryResult) {
+        *queryResult =
+            queryHr;
+    }
+
+    if (
+        FAILED(queryHr) ||
+        !vectorAbi
+    ) {
+        return false;
+    }
+
+    void*** objectPointer =
+        reinterpret_cast<void***>(
+            vectorAbi
+        );
+
+    void** vtable =
+        objectPointer
+            ? *objectPointer
+            : nullptr;
+
+    if (!vtable) {
+        reinterpret_cast<IUnknown*>(
+            vectorAbi
+        )->Release();
+
+        return false;
+    }
+
+    // IUnknown: 0-2
+    // IInspectable: 3-5
+    // IVector::GetAt: 6
+    // IVector::get_Size: 7
+    Vector_GetSize_t getSize =
+        reinterpret_cast<Vector_GetSize_t>(
+            vtable[7]
+        );
+
+    unsigned int localSize =
+        0;
+
+    const HRESULT sizeHr =
+        getSize(
+            vectorAbi,
+            &localSize
+        );
+
+    if (sizeResult) {
+        *sizeResult =
+            sizeHr;
+    }
+
+    reinterpret_cast<IUnknown*>(
+        vectorAbi
+    )->Release();
+
+    if (FAILED(sizeHr)) {
+        return false;
+    }
+
+    if (size) {
+        *size =
+            localSize;
+    }
+
+    return true;
+}
+
+void CacheTaskbarModel6(
+    void* taskbarModel6
+) {
+    if (!taskbarModel6) {
+        return;
+    }
+
+    reinterpret_cast<IUnknown*>(
+        taskbarModel6
+    )->AddRef();
+
+    void* previous =
+        g_taskbarModel6.exchange(
+            taskbarModel6,
+            std::memory_order_acq_rel
+        );
+
+    if (previous) {
+        reinterpret_cast<IUnknown*>(
+            previous
+        )->Release();
+    }
+}
+
+bool ReadCurrentOverflowSize(
+    unsigned int* size,
+    HRESULT* getterResult,
+    HRESULT* queryResult,
+    HRESULT* sizeResult
+) {
+    if (size) {
+        *size =
+            0;
+    }
+
+    if (getterResult) {
+        *getterResult =
+            HRESULT_FROM_WIN32(
+                ERROR_NOT_READY
+            );
+    }
+
+    if (queryResult) {
+        *queryResult =
+            E_FAIL;
+    }
+
+    if (sizeResult) {
+        *sizeResult =
+            E_FAIL;
+    }
+
+    void* taskbarModel6 =
+        g_taskbarModel6.load(
+            std::memory_order_acquire
+        );
+
+    if (!taskbarModel6) {
+        return false;
+    }
+
+    reinterpret_cast<IUnknown*>(
+        taskbarModel6
+    )->AddRef();
+
+    void* collectionAbi =
+        nullptr;
+
+    const HRESULT getterHr =
+        TaskbarModel_GetOverflowIcons_Original(
+            taskbarModel6,
+            &collectionAbi
+        );
+
+    if (getterResult) {
+        *getterResult =
+            getterHr;
+    }
+
+    bool success =
+        false;
+
+    if (
+        SUCCEEDED(getterHr) &&
+        collectionAbi
+    ) {
+        success =
+            QueryVectorSize(
+                collectionAbi,
+                size,
+                queryResult,
+                sizeResult
+            );
+
+        reinterpret_cast<IUnknown*>(
+            collectionAbi
+        )->Release();
+    }
+
+    reinterpret_cast<IUnknown*>(
+        taskbarModel6
+    )->Release();
+
+    return success;
+}
+
+int __cdecl
+TaskbarModel_GetOverflowIcons_Hook(
+    void* pThis,
+    void** result
+) {
+    const unsigned long long callNumber =
+        g_overflowGetterCalls.fetch_add(
+            1,
+            std::memory_order_relaxed
+        ) +
+        1;
+
+    const HRESULT getterResult =
+        TaskbarModel_GetOverflowIcons_Original(
+            pThis,
+            result
         );
 
     if (
-        iterator ==
-        snapshot.entries.end()
+        SUCCEEDED(getterResult) &&
+        result &&
+        *result
     ) {
-        return 0;
+        CacheTaskbarModel6(
+            pThis
+        );
     }
 
-    return
-        static_cast<unsigned long long>(
-            std::distance(
-                snapshot.entries.begin(),
-                iterator
-            )
-        ) +
-        1;
+    unsigned int size =
+        0;
+
+    HRESULT queryResult =
+        E_FAIL;
+
+    HRESULT sizeResult =
+        E_FAIL;
+
+    const bool sizeValid =
+        SUCCEEDED(getterResult) &&
+        result &&
+        *result &&
+        QueryVectorSize(
+            *result,
+            &size,
+            &queryResult,
+            &sizeResult
+        );
+
+    Wh_Log(
+        L"OVERFLOW_GETTER "
+        L"call=%llu "
+        L"thread=%lu "
+        L"taskbarModel6=%p "
+        L"result=0x%08X "
+        L"collection=%p "
+        L"vectorQueryResult=0x%08X "
+        L"sizeResult=0x%08X "
+        L"sizeValid=%d "
+        L"size=%u",
+        callNumber,
+        GetCurrentThreadId(),
+        pThis,
+        static_cast<unsigned int>(
+            getterResult
+        ),
+        result
+            ? *result
+            : nullptr,
+        static_cast<unsigned int>(
+            queryResult
+        ),
+        static_cast<unsigned int>(
+            sizeResult
+        ),
+        sizeValid
+            ? 1
+            : 0,
+        size
+    );
+
+    return getterResult;
 }
 
-void TryDynamicEndMove(
-    void* manager,
-    void* iconImplementation,
-    unsigned long long visibleAddCall
+void __cdecl
+NotificationAreaIconManager_AddIcon_Hook(
+    void* pThis,
+    void* trayNotifyData
 ) {
-    UIOrderSnapshot currentSnapshot =
+    const unsigned long long callNumber =
+        g_addIconCalls.fetch_add(
+            1,
+            std::memory_order_relaxed
+        ) +
+        1;
+
+    AddIconContext previousContext =
+        std::move(
+            g_addIconContext
+        );
+
+    g_addIconContext.active =
+        true;
+
+    g_addIconContext.callNumber =
+        callNumber;
+
+    g_addIconContext.before =
         CaptureUIOrderSnapshot();
 
-    if (
-        !currentSnapshot.valid ||
-        currentSnapshot.entries.empty()
-    ) {
+    Wh_Log(
+        L"ADD_ICON_BEGIN "
+        L"call=%llu "
+        L"thread=%lu "
+        L"manager=%p "
+        L"trayNotifyData=%p "
+        L"beforeValid=%d "
+        L"beforeStatus=%ld "
+        L"beforeCount=%llu",
+        callNumber,
+        GetCurrentThreadId(),
+        pThis,
+        trayNotifyData,
+        g_addIconContext.before.valid
+            ? 1
+            : 0,
+        g_addIconContext.before.status,
+        static_cast<unsigned long long>(
+            g_addIconContext.before.entries.size()
+        )
+    );
+
+    NotificationAreaIconManager_AddIcon_Original(
+        pThis,
+        trayNotifyData
+    );
+
+    Wh_Log(
+        L"ADD_ICON_END "
+        L"call=%llu "
+        L"thread=%lu "
+        L"manager=%p",
+        callNumber,
+        GetCurrentThreadId(),
+        pThis
+    );
+
+    g_addIconContext =
+        std::move(
+            previousContext
+        );
+}
+
+void __cdecl
+NotificationAreaIconManager_AddVisible_Hook(
+    void* pThis,
+    void* iconImplementation
+) {
+    const unsigned long long callNumber =
+        g_visibleAddCalls.fetch_add(
+            1,
+            std::memory_order_relaxed
+        ) +
+        1;
+
+    Wh_Log(
+        L"VISIBLE_ADD_BEGIN "
+        L"call=%llu "
+        L"thread=%lu "
+        L"manager=%p "
+        L"implementation=%p "
+        L"duringAddIcon=%d "
+        L"parentAddCall=%llu",
+        callNumber,
+        GetCurrentThreadId(),
+        pThis,
+        iconImplementation,
+        g_addIconContext.active
+            ? 1
+            : 0,
+        g_addIconContext.active
+            ? g_addIconContext.callNumber
+            : 0
+    );
+
+    NotificationAreaIconManager_AddVisible_Original(
+        pThis,
+        iconImplementation
+    );
+
+    if (!g_addIconContext.active) {
         Wh_Log(
-            L"DYNAMIC_END_SKIPPED "
-            L"reason=invalid-order-snapshot "
-            L"visibleAddCall=%llu "
-            L"status=%ld",
-            visibleAddCall,
-            currentSnapshot.status
+            L"VISIBLE_ADD_WITHOUT_ADD_CONTEXT "
+            L"call=%llu",
+            callNumber
         );
 
         return;
     }
 
-    const std::uint64_t candidateIdentity =
-        currentSnapshot.entries.front();
+    const UIOrderSnapshot after =
+        CaptureUIOrderSnapshot();
 
-    const std::wstring executablePath =
-        QueryStringValue(
-            MakeTrayEntrySubkey(
-                candidateIdentity
-            ),
-            L"ExecutablePath"
+    const std::vector<std::uint64_t> addedIdentities =
+        FindAddedIdentities(
+            g_addIconContext.before,
+            after
         );
 
-    if (
-        !EndsWithOrdinalIgnoreCase(
-            executablePath,
-            kTargetExecutableName
+    Wh_Log(
+        L"VISIBLE_ADD_ORDER_DELTA "
+        L"call=%llu "
+        L"parentAddCall=%llu "
+        L"beforeValid=%d "
+        L"afterValid=%d "
+        L"beforeCount=%llu "
+        L"afterCount=%llu "
+        L"addedCount=%llu",
+        callNumber,
+        g_addIconContext.callNumber,
+        g_addIconContext.before.valid
+            ? 1
+            : 0,
+        after.valid
+            ? 1
+            : 0,
+        static_cast<unsigned long long>(
+            g_addIconContext.before.entries.size()
+        ),
+        static_cast<unsigned long long>(
+            after.entries.size()
+        ),
+        static_cast<unsigned long long>(
+            addedIdentities.size()
         )
+    );
+
+    std::uint64_t targetIdentity =
+        0;
+
+    unsigned int targetMatches =
+        0;
+
+    for (
+        std::uint64_t identity :
+        addedIdentities
     ) {
+        const std::wstring executablePath =
+            QueryStringValue(
+                MakeTrayEntrySubkey(
+                    identity
+                ),
+                L"ExecutablePath"
+            );
+
         Wh_Log(
-            L"VISIBLE_ADD_IGNORED "
+            L"ADDED_IDENTITY "
             L"call=%llu "
             L"id=%llu "
             L"path=\"%s\"",
-            visibleAddCall,
+            callNumber,
             static_cast<unsigned long long>(
-                candidateIdentity
+                identity
             ),
             executablePath.c_str()
+        );
+
+        if (
+            EndsWithOrdinalIgnoreCase(
+                executablePath,
+                kTargetExecutableName
+            )
+        ) {
+            targetIdentity =
+                identity;
+
+            targetMatches++;
+        }
+    }
+
+    if (targetMatches != 1) {
+        Wh_Log(
+            L"TARGET_NOT_OBSERVED "
+            L"call=%llu "
+            L"targetMatches=%u",
+            callNumber,
+            targetMatches
+        );
+
+        return;
+    }
+
+    unsigned int overflowSize =
+        0;
+
+    HRESULT getterResult =
+        E_FAIL;
+
+    HRESULT queryResult =
+        E_FAIL;
+
+    HRESULT sizeResult =
+        E_FAIL;
+
+    const bool overflowSizeValid =
+        ReadCurrentOverflowSize(
+            &overflowSize,
+            &getterResult,
+            &queryResult,
+            &sizeResult
+        );
+
+    if (!overflowSizeValid) {
+        Wh_Log(
+            L"TARGET_OVERFLOW_SIZE_UNAVAILABLE "
+            L"call=%llu "
+            L"id=%llu "
+            L"getterResult=0x%08X "
+            L"vectorQueryResult=0x%08X "
+            L"sizeResult=0x%08X "
+            L"cachedTaskbarModel6=%p",
+            callNumber,
+            static_cast<unsigned long long>(
+                targetIdentity
+            ),
+            static_cast<unsigned int>(
+                getterResult
+            ),
+            static_cast<unsigned int>(
+                queryResult
+            ),
+            static_cast<unsigned int>(
+                sizeResult
+            ),
+            g_taskbarModel6.load(
+                std::memory_order_acquire
+            )
         );
 
         return;
@@ -675,311 +1054,45 @@ void TryDynamicEndMove(
         )
     ) {
         Wh_Log(
-            L"DYNAMIC_END_SKIPPED "
-            L"reason=test-already-consumed "
-            L"visibleAddCall=%llu",
-            visibleAddCall
-        );
-
-        return;
-    }
-
-    void* queriedAbi =
-        nullptr;
-
-    const int queryResult =
-        NotificationAreaIcon_QueryInterface(
-            iconImplementation,
-            *g_notificationAreaIconInterfaceId,
-            &queriedAbi
-        );
-
-    Wh_Log(
-        L"DYNAMIC_END_QUERY "
-        L"visibleAddCall=%llu "
-        L"implementation=%p "
-        L"result=0x%08X "
-        L"queriedAbi=%p",
-        visibleAddCall,
-        iconImplementation,
-        static_cast<unsigned int>(
-            queryResult
-        ),
-        queriedAbi
-    );
-
-    if (
-        FAILED(queryResult) ||
-        !queriedAbi
-    ) {
-        return;
-    }
-
-    void* iconArgumentStorage =
-        queriedAbi;
-
-    unsigned int completedSteps =
-        0;
-
-    bool reachedEnd =
-        false;
-
-    const unsigned long long initialPosition =
-        FindOneBasedPosition(
-            currentSnapshot,
-            candidateIdentity
-        );
-
-    Wh_Log(
-        L"DYNAMIC_END_BEGIN "
-        L"visibleAddCall=%llu "
-        L"thread=%lu "
-        L"manager=%p "
-        L"implementation=%p "
-        L"iconAbi=%p "
-        L"id=%llu "
-        L"initialPosition=%llu "
-        L"entryCount=%llu",
-        visibleAddCall,
-        GetCurrentThreadId(),
-        manager,
-        iconImplementation,
-        queriedAbi,
-        static_cast<unsigned long long>(
-            candidateIdentity
-        ),
-        initialPosition,
-        static_cast<unsigned long long>(
-            currentSnapshot.entries.size()
-        )
-    );
-
-    if (
-        initialPosition ==
-        currentSnapshot.entries.size()
-    ) {
-        reachedEnd =
-            true;
-    }
-
-    for (
-        unsigned int targetIndex = 1;
-        !reachedEnd &&
-        targetIndex <= kMaximumMoveSteps;
-        targetIndex++
-    ) {
-        const unsigned long long beforePosition =
-            FindOneBasedPosition(
-                currentSnapshot,
-                candidateIdentity
-            );
-
-        const unsigned long long beforeCount =
+            L"TARGET_ALREADY_CONSUMED "
+            L"call=%llu "
+            L"id=%llu",
+            callNumber,
             static_cast<unsigned long long>(
-                currentSnapshot.entries.size()
-            );
-
-        g_internalMoveDepth++;
-
-        NotificationAreaIconManager_MoveIcon(
-            manager,
-            &iconArgumentStorage,
-            kOverflowLocation,
-            targetIndex
+                targetIdentity
+            )
         );
 
-        g_internalMoveDepth--;
-
-        completedSteps++;
-
-        g_moveStepCount.fetch_add(
-            1,
-            std::memory_order_relaxed
-        );
-
-        UIOrderSnapshot afterSnapshot =
-            CaptureUIOrderSnapshot();
-
-        const unsigned long long afterPosition =
-            afterSnapshot.valid
-                ? FindOneBasedPosition(
-                      afterSnapshot,
-                      candidateIdentity
-                  )
-                : 0;
-
-        const unsigned long long afterCount =
-            afterSnapshot.valid
-                ? static_cast<unsigned long long>(
-                      afterSnapshot.entries.size()
-                  )
-                : 0;
-
-        const bool orderChanged =
-            currentSnapshot.valid &&
-            afterSnapshot.valid &&
-            currentSnapshot.entries !=
-                afterSnapshot.entries;
-
-        Wh_Log(
-            L"DYNAMIC_END_STEP "
-            L"step=%u "
-            L"targetIndex=%u "
-            L"beforePosition=%llu "
-            L"beforeCount=%llu "
-            L"afterSnapshotValid=%d "
-            L"afterStatus=%ld "
-            L"afterPosition=%llu "
-            L"afterCount=%llu "
-            L"orderChanged=%d",
-            completedSteps,
-            targetIndex,
-            beforePosition,
-            beforeCount,
-            afterSnapshot.valid
-                ? 1
-                : 0,
-            afterSnapshot.status,
-            afterPosition,
-            afterCount,
-            orderChanged
-                ? 1
-                : 0
-        );
-
-        if (!afterSnapshot.valid) {
-            break;
-        }
-
-        if (
-            afterPosition != 0 &&
-            afterPosition ==
-                afterSnapshot.entries.size()
-        ) {
-            reachedEnd =
-                true;
-
-            currentSnapshot =
-                std::move(
-                    afterSnapshot
-                );
-
-            break;
-        }
-
-        if (
-            !orderChanged ||
-            afterPosition == 0 ||
-            afterPosition <= beforePosition
-        ) {
-            currentSnapshot =
-                std::move(
-                    afterSnapshot
-                );
-
-            break;
-        }
-
-        currentSnapshot =
-            std::move(
-                afterSnapshot
-            );
+        return;
     }
 
-    const unsigned long long finalPosition =
-        currentSnapshot.valid
-            ? FindOneBasedPosition(
-                  currentSnapshot,
-                  candidateIdentity
-              )
-            : 0;
-
-    Wh_Log(
-        L"DYNAMIC_END_COMPLETE "
-        L"visibleAddCall=%llu "
-        L"id=%llu "
-        L"completedSteps=%u "
-        L"reachedEnd=%d "
-        L"finalSnapshotValid=%d "
-        L"finalStatus=%ld "
-        L"finalPosition=%llu "
-        L"finalCount=%llu",
-        visibleAddCall,
-        static_cast<unsigned long long>(
-            candidateIdentity
-        ),
-        completedSteps,
-        reachedEnd
-            ? 1
-            : 0,
-        currentSnapshot.valid
-            ? 1
-            : 0,
-        currentSnapshot.status,
-        finalPosition,
-        static_cast<unsigned long long>(
-            currentSnapshot.entries.size()
-        )
-    );
-
-    reinterpret_cast<IUnknown*>(
-        queriedAbi
-    )->Release();
-}
-
-void __cdecl
-NotificationAreaIconManager_AddVisible_Hook(
-    void* pThis,
-    void* iconImplementation
-) {
-    const unsigned long long callNumber =
-        g_visibleAddCallCount.fetch_add(
+    const unsigned long long observationNumber =
+        g_targetObservations.fetch_add(
             1,
             std::memory_order_relaxed
         ) +
         1;
 
     Wh_Log(
-        L"VISIBLE_ADD_BEGIN "
+        L"TARGET_OVERFLOW_OBSERVATION "
+        L"observation=%llu "
         L"call=%llu "
-        L"thread=%lu "
-        L"manager=%p "
+        L"parentAddCall=%llu "
+        L"id=%llu "
         L"implementation=%p "
-        L"internalMoveDepth=%u",
+        L"overflowSize=%u "
+        L"finalZeroBasedIndex=%u",
+        observationNumber,
         callNumber,
-        GetCurrentThreadId(),
-        pThis,
+        g_addIconContext.callNumber,
+        static_cast<unsigned long long>(
+            targetIdentity
+        ),
         iconImplementation,
-        g_internalMoveDepth
-    );
-
-    NotificationAreaIconManager_AddVisible_Original(
-        pThis,
-        iconImplementation
-    );
-
-    if (g_internalMoveDepth != 0) {
-        Wh_Log(
-            L"VISIBLE_ADD_INTERNAL_MOVE "
-            L"call=%llu "
-            L"thread=%lu "
-            L"manager=%p "
-            L"implementation=%p "
-            L"internalMoveDepth=%u",
-            callNumber,
-            GetCurrentThreadId(),
-            pThis,
-            iconImplementation,
-            g_internalMoveDepth
-        );
-
-        return;
-    }
-
-    TryDynamicEndMove(
-        pThis,
-        iconImplementation,
-        callNumber
+        overflowSize,
+        overflowSize == 0
+            ? 0
+            : overflowSize - 1
     );
 
     Wh_Log(
@@ -1001,10 +1114,24 @@ bool HookTaskbarSymbols(
     WindhawkUtils::SYMBOL_HOOK symbolHooks[] = {
         {
             {
+                LR"(private: void __cdecl NotificationAreaIconManager2::AddIcon(struct _TRAYNOTIFYDATAW * const))"
+            },
+            &NotificationAreaIconManager_AddIcon_Original,
+            NotificationAreaIconManager_AddIcon_Hook,
+        },
+        {
+            {
                 LR"(private: void __cdecl NotificationAreaIconManager2::AddIconToVisibleCollection(struct winrt::WindowsUdk::UI::Shell::implementation::NotificationAreaIcon2 *))"
             },
             &NotificationAreaIconManager_AddVisible_Original,
             NotificationAreaIconManager_AddVisible_Hook,
+        },
+        {
+            {
+                LR"(public: virtual int __cdecl winrt::impl::produce<struct winrt::WindowsUdk::UI::Shell::implementation::TaskbarModel,struct winrt::WindowsUdk::UI::Shell::ITaskbarModel6>::get_NotificationAreaOverflowIcons(void * *))"
+            },
+            &TaskbarModel_GetOverflowIcons_Original,
+            TaskbarModel_GetOverflowIcons_Hook,
         },
     };
 
@@ -1018,15 +1145,16 @@ bool HookTaskbarSymbols(
         )
     ) {
         Wh_Log(
-            L"Failed to hook "
-            L"AddIconToVisibleCollection"
+            L"Failed to hook one or more "
+            L"taskbar.dll symbols"
         );
 
         return false;
     }
 
     Wh_Log(
-        L"Dynamic end-move hook installed"
+        L"Tray identity and overflow-size "
+        L"hooks installed"
     );
 
     return true;
@@ -1037,7 +1165,7 @@ bool HookTaskbarSymbols(
 BOOL Wh_ModInit() {
     Wh_Log(
         L"Tray Add Path Analyzer "
-        L"0.5.0 initializing"
+        L"0.6.0 initializing"
     );
 
     HMODULE taskbarModule =
@@ -1090,15 +1218,35 @@ BOOL Wh_ModInit() {
 }
 
 void Wh_ModUninit() {
+    void* taskbarModel6 =
+        g_taskbarModel6.exchange(
+            nullptr,
+            std::memory_order_acq_rel
+        );
+
+    if (taskbarModel6) {
+        reinterpret_cast<IUnknown*>(
+            taskbarModel6
+        )->Release();
+    }
+
     Wh_Log(
         L"Tray Add Path Analyzer stopped; "
+        L"addIconCalls=%llu "
         L"visibleAddCalls=%llu "
-        L"moveSteps=%llu "
+        L"overflowGetterCalls=%llu "
+        L"targetObservations=%llu "
         L"testConsumed=%d",
-        g_visibleAddCallCount.load(
+        g_addIconCalls.load(
             std::memory_order_relaxed
         ),
-        g_moveStepCount.load(
+        g_visibleAddCalls.load(
+            std::memory_order_relaxed
+        ),
+        g_overflowGetterCalls.load(
+            std::memory_order_relaxed
+        ),
+        g_targetObservations.load(
             std::memory_order_relaxed
         ),
         g_testConsumed.load(
