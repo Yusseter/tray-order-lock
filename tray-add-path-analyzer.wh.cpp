@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              tray-add-path-analyzer
 // @name            Tray Add Path Analyzer
-// @description     Tests one safe dynamic move of a newly added tray icon to the overflow end.
-// @version         0.7.0
+// @description     Correlates returning tray icons with their existing registry identity.
+// @version         0.8.0
 // @author          Yusseter
 // @github          https://github.com/Yusseter
 // @homepage        https://github.com/Yusseter/tray-order-lock
@@ -16,28 +16,31 @@
 /*
 # Tray Add Path Analyzer
 
-A temporary one-shot diagnostic mod.
+A temporary read-only diagnostic mod.
 
-Version 0.7.0:
+Version 0.8.0 runs the same dedicated tray executable twice from the same
+unchanged path.
 
-- Captures UIOrderList before AddIcon.
-- Identifies the exact registry identity created by that AddIcon call.
-- Reads the live overflow collection size.
-- Converts the live NotificationAreaIcon2 implementation object to the
-  INotificationAreaIcon ABI pointer through the verified query-interface path.
-- Performs exactly one NotificationAreaIconManager2::MoveIcon call using
-  location=1 and index=overflowSize-1.
-- Prevents recursive processing of the visible-collection update caused by the
-  internal move.
+The analyzer:
 
-The test applies only to a newly created executable named:
+- Captures UIOrderList before and after every AddIcon call.
+- Records every NotifyIconSettingsDatabase::GetUIOrderForIcon identity queried
+  during that AddIcon call.
+- Detects the registry identity created during the first application run.
+- Checks whether the second application run queries and reuses that exact same
+  identity.
+- Correlates the visible NotificationAreaIcon2 implementation object with the
+  active AddIcon call.
 
-TraySingleEndMoveTest.exe
+No MoveIcon function is called and no tray order is modified.
+
+The dedicated test executable is:
+
+TrayExistingIdentityProbeV080.exe
 */
 // ==/WindhawkModReadme==
 
 #include <windows.h>
-#include <unknwn.h>
 #include <windhawk_utils.h>
 
 #include <algorithm>
@@ -60,10 +63,7 @@ constexpr wchar_t kUIOrderListValueName[] =
     L"UIOrderList";
 
 constexpr wchar_t kTargetExecutableName[] =
-    L"traysingleendmovetest.exe";
-
-constexpr int kOverflowLocation =
-    1;
+    L"trayexistingidentityprobev080.exe";
 
 using NotificationAreaIconManager_AddIcon_t =
     void(__cdecl*)(
@@ -77,31 +77,10 @@ using NotificationAreaIconManager_AddVisible_t =
         void* iconImplementation
     );
 
-using NotificationAreaIconManager_MoveIcon_t =
-    void(__cdecl*)(
+using NotifyIconSettingsDatabase_GetUIOrderForIcon_t =
+    unsigned int(__cdecl*)(
         void* pThis,
-        void* iconArgumentStorage,
-        int location,
-        unsigned int index
-    );
-
-using NotificationAreaIcon_QueryInterface_t =
-    int(__cdecl*)(
-        void* iconImplementation,
-        const GUID& interfaceId,
-        void** result
-    );
-
-using TaskbarModel_GetOverflowIcons_t =
-    int(__cdecl*)(
-        void* pThis,
-        void** result
-    );
-
-using Vector_GetSize_t =
-    HRESULT(STDMETHODCALLTYPE*)(
-        void* pThis,
-        unsigned int* size
+        std::uint64_t identity
     );
 
 NotificationAreaIconManager_AddIcon_t
@@ -112,26 +91,9 @@ NotificationAreaIconManager_AddVisible_t
     NotificationAreaIconManager_AddVisible_Original =
         nullptr;
 
-NotificationAreaIconManager_MoveIcon_t
-    NotificationAreaIconManager_MoveIcon =
+NotifyIconSettingsDatabase_GetUIOrderForIcon_t
+    NotifyIconSettingsDatabase_GetUIOrderForIcon_Original =
         nullptr;
-
-NotificationAreaIcon_QueryInterface_t
-    NotificationAreaIcon_QueryInterface =
-        nullptr;
-
-TaskbarModel_GetOverflowIcons_t
-    TaskbarModel_GetOverflowIcons_Original =
-        nullptr;
-
-const GUID* g_notificationAreaIconInterfaceId =
-    nullptr;
-
-const GUID* g_notificationAreaIconVectorId =
-    nullptr;
-
-std::atomic<void*> g_taskbarModel6 =
-    nullptr;
 
 std::atomic<unsigned long long> g_addIconCalls =
     0;
@@ -139,16 +101,13 @@ std::atomic<unsigned long long> g_addIconCalls =
 std::atomic<unsigned long long> g_visibleAddCalls =
     0;
 
-std::atomic<unsigned long long> g_overflowGetterCalls =
+std::atomic<unsigned long long> g_orderQueries =
     0;
 
-std::atomic<unsigned long long> g_moveAttempts =
+std::atomic<unsigned long long> g_targetResults =
     0;
 
-std::atomic<bool> g_testConsumed =
-    false;
-
-thread_local unsigned int g_internalMoveDepth =
+std::atomic<std::uint64_t> g_firstTargetIdentity =
     0;
 
 struct UIOrderSnapshot {
@@ -161,6 +120,14 @@ struct UIOrderSnapshot {
     std::vector<std::uint64_t> entries;
 };
 
+struct OrderQueryObservation {
+    std::uint64_t identity =
+        0;
+
+    unsigned int returnedOrder =
+        0;
+};
+
 struct AddIconContext {
     bool active =
         false;
@@ -168,295 +135,20 @@ struct AddIconContext {
     unsigned long long callNumber =
         0;
 
+    void* manager =
+        nullptr;
+
+    void* trayNotifyData =
+        nullptr;
+
     UIOrderSnapshot before;
+
+    std::vector<OrderQueryObservation> orderQueries;
+
+    std::vector<void*> visibleImplementations;
 };
 
 thread_local AddIconContext g_addIconContext;
-
-bool ContainsText(
-    const wchar_t* text,
-    const wchar_t* expected
-) {
-    return
-        text &&
-        expected &&
-        std::wcsstr(
-            text,
-            expected
-        ) !=
-        nullptr;
-}
-
-bool IsNotificationAreaIconQueryInterfaceSymbol(
-    const wchar_t* symbol
-) {
-    return
-        ContainsText(
-            symbol,
-            L"root_implements<"
-        ) &&
-        ContainsText(
-            symbol,
-            L"NotificationAreaIcon2"
-        ) &&
-        ContainsText(
-            symbol,
-            L">::query_interface("
-        ) &&
-        ContainsText(
-            symbol,
-            L"winrt::guid const &"
-        ) &&
-        ContainsText(
-            symbol,
-            L"void * *"
-        ) &&
-        !ContainsText(
-            symbol,
-            L"query_interface_common"
-        ) &&
-        !ContainsText(
-            symbol,
-            L"query_interface_tearoff"
-        );
-}
-
-bool IsNotificationAreaIconIidSymbol(
-    const wchar_t* symbol
-) {
-    constexpr wchar_t kExpectedSymbol[] =
-        L"struct guid::guid const "
-        L"winrt::impl::guid_v<struct "
-        L"winrt::WindowsUdk::UI::Shell::"
-        L"INotificationAreaIcon>";
-
-    return
-        symbol &&
-        std::wcscmp(
-            symbol,
-            kExpectedSymbol
-        ) ==
-        0;
-}
-
-bool IsNotificationAreaIconVectorIidSymbol(
-    const wchar_t* symbol
-) {
-    constexpr wchar_t kExpectedSymbol[] =
-        L"struct guid::guid const "
-        L"winrt::impl::guid_v<struct "
-        L"winrt::Windows::Foundation::Collections::"
-        L"IVector<struct "
-        L"winrt::WindowsUdk::UI::Shell::"
-        L"NotificationAreaIcon> >";
-
-    return
-        symbol &&
-        std::wcscmp(
-            symbol,
-            kExpectedSymbol
-        ) ==
-        0;
-}
-
-bool IsMoveIconSymbol(
-    const wchar_t* symbol
-) {
-    constexpr wchar_t kExpectedSymbol[] =
-        L"public: void __cdecl "
-        L"NotificationAreaIconManager2::MoveIcon("
-        L"struct winrt::WindowsUdk::UI::Shell::"
-        L"NotificationAreaIcon,"
-        L"enum winrt::WindowsUdk::UI::Shell::"
-        L"NotificationAreaIconLocation,"
-        L"unsigned int)";
-
-    return
-        symbol &&
-        std::wcscmp(
-            symbol,
-            kExpectedSymbol
-        ) ==
-        0;
-}
-
-bool ResolveRequiredSymbols(
-    HMODULE taskbarModule
-) {
-    WH_FIND_SYMBOL_OPTIONS options{};
-
-    options.optionsSize =
-        sizeof(options);
-
-    options.symbolServer =
-        nullptr;
-
-    options.noUndecoratedSymbols =
-        FALSE;
-
-    WH_FIND_SYMBOL symbol{};
-
-    HANDLE symbolSearch =
-        Wh_FindFirstSymbol(
-            taskbarModule,
-            &options,
-            &symbol
-        );
-
-    if (!symbolSearch) {
-        Wh_Log(
-            L"Wh_FindFirstSymbol failed"
-        );
-
-        return false;
-    }
-
-    do {
-        if (
-            !NotificationAreaIcon_QueryInterface &&
-            IsNotificationAreaIconQueryInterfaceSymbol(
-                symbol.symbol
-            )
-        ) {
-            NotificationAreaIcon_QueryInterface =
-                reinterpret_cast<
-                    NotificationAreaIcon_QueryInterface_t
-                >(
-                    symbol.address
-                );
-
-            Wh_Log(
-                L"QUERY_INTERFACE_SYMBOL "
-                L"address=%p",
-                symbol.address
-            );
-        }
-
-        if (
-            !g_notificationAreaIconInterfaceId &&
-            IsNotificationAreaIconIidSymbol(
-                symbol.symbol
-            )
-        ) {
-            g_notificationAreaIconInterfaceId =
-                reinterpret_cast<const GUID*>(
-                    symbol.address
-                );
-
-            Wh_Log(
-                L"ICON_INTERFACE_ID_SYMBOL "
-                L"address=%p",
-                symbol.address
-            );
-        }
-
-        if (
-            !g_notificationAreaIconVectorId &&
-            IsNotificationAreaIconVectorIidSymbol(
-                symbol.symbol
-            )
-        ) {
-            g_notificationAreaIconVectorId =
-                reinterpret_cast<const GUID*>(
-                    symbol.address
-                );
-
-            Wh_Log(
-                L"VECTOR_INTERFACE_ID_SYMBOL "
-                L"address=%p",
-                symbol.address
-            );
-        }
-
-        if (
-            !NotificationAreaIconManager_MoveIcon &&
-            IsMoveIconSymbol(
-                symbol.symbol
-            )
-        ) {
-            NotificationAreaIconManager_MoveIcon =
-                reinterpret_cast<
-                    NotificationAreaIconManager_MoveIcon_t
-                >(
-                    symbol.address
-                );
-
-            Wh_Log(
-                L"MOVE_ICON_SYMBOL "
-                L"address=%p",
-                symbol.address
-            );
-        }
-
-        if (
-            NotificationAreaIcon_QueryInterface &&
-            g_notificationAreaIconInterfaceId &&
-            g_notificationAreaIconVectorId &&
-            NotificationAreaIconManager_MoveIcon
-        ) {
-            break;
-        }
-    } while (
-        Wh_FindNextSymbol(
-            symbolSearch,
-            &symbol
-        )
-    );
-
-    Wh_FindCloseSymbol(
-        symbolSearch
-    );
-
-    if (!NotificationAreaIcon_QueryInterface) {
-        Wh_Log(
-            L"NotificationAreaIcon2 "
-            L"query_interface symbol not found"
-        );
-
-        return false;
-    }
-
-    if (!g_notificationAreaIconInterfaceId) {
-        Wh_Log(
-            L"INotificationAreaIcon IID "
-            L"symbol not found"
-        );
-
-        return false;
-    }
-
-    if (!g_notificationAreaIconVectorId) {
-        Wh_Log(
-            L"IVector<NotificationAreaIcon> "
-            L"IID symbol not found"
-        );
-
-        return false;
-    }
-
-    if (!NotificationAreaIconManager_MoveIcon) {
-        Wh_Log(
-            L"NotificationAreaIconManager2::"
-            L"MoveIcon symbol not found"
-        );
-
-        return false;
-    }
-
-    Wh_Log(
-        L"SINGLE_END_MOVE_SUPPORT_READY "
-        L"queryFunction=%p "
-        L"iconInterfaceId=%p "
-        L"vectorInterfaceId=%p "
-        L"moveFunction=%p",
-        NotificationAreaIcon_QueryInterface,
-        g_notificationAreaIconInterfaceId,
-        g_notificationAreaIconVectorId,
-        NotificationAreaIconManager_MoveIcon
-    );
-
-    return true;
-}
 
 UIOrderSnapshot CaptureUIOrderSnapshot() {
     UIOrderSnapshot snapshot;
@@ -555,68 +247,6 @@ UIOrderSnapshot CaptureUIOrderSnapshot() {
         ERROR_MORE_DATA;
 
     return snapshot;
-}
-
-std::vector<std::uint64_t> FindAddedIdentities(
-    const UIOrderSnapshot& before,
-    const UIOrderSnapshot& after
-) {
-    std::vector<std::uint64_t> added;
-
-    if (
-        !before.valid ||
-        !after.valid
-    ) {
-        return added;
-    }
-
-    for (
-        std::uint64_t identity :
-        after.entries
-    ) {
-        if (
-            std::find(
-                before.entries.begin(),
-                before.entries.end(),
-                identity
-            ) ==
-            before.entries.end()
-        ) {
-            added.push_back(
-                identity
-            );
-        }
-    }
-
-    return added;
-}
-
-unsigned long long FindOneBasedPosition(
-    const UIOrderSnapshot& snapshot,
-    std::uint64_t identity
-) {
-    const auto iterator =
-        std::find(
-            snapshot.entries.begin(),
-            snapshot.entries.end(),
-            identity
-        );
-
-    if (
-        iterator ==
-        snapshot.entries.end()
-    ) {
-        return 0;
-    }
-
-    return
-        static_cast<unsigned long long>(
-            std::distance(
-                snapshot.entries.begin(),
-                iterator
-            )
-        ) +
-        1;
 }
 
 std::wstring MakeTrayEntrySubkey(
@@ -740,366 +370,460 @@ bool EndsWithOrdinalIgnoreCase(
     return true;
 }
 
-bool QueryVectorSize(
-    void* collectionAbi,
-    unsigned int* size,
-    HRESULT* queryResult,
-    HRESULT* sizeResult
+std::vector<std::uint64_t> FindAddedIdentities(
+    const UIOrderSnapshot& before,
+    const UIOrderSnapshot& after
 ) {
-    if (size) {
-        *size =
-            0;
-    }
-
-    if (queryResult) {
-        *queryResult =
-            E_FAIL;
-    }
-
-    if (sizeResult) {
-        *sizeResult =
-            E_FAIL;
-    }
+    std::vector<std::uint64_t> added;
 
     if (
-        !collectionAbi ||
-        !g_notificationAreaIconVectorId
+        !before.valid ||
+        !after.valid
     ) {
-        return false;
+        return added;
     }
 
-    void* vectorAbi =
-        nullptr;
-
-    const HRESULT queryHr =
-        reinterpret_cast<IUnknown*>(
-            collectionAbi
-        )->QueryInterface(
-            *g_notificationAreaIconVectorId,
-            &vectorAbi
-        );
-
-    if (queryResult) {
-        *queryResult =
-            queryHr;
-    }
-
-    if (
-        FAILED(queryHr) ||
-        !vectorAbi
+    for (
+        std::uint64_t identity :
+        after.entries
     ) {
-        return false;
-    }
-
-    void*** objectPointer =
-        reinterpret_cast<void***>(
-            vectorAbi
-        );
-
-    void** vtable =
-        objectPointer
-            ? *objectPointer
-            : nullptr;
-
-    if (!vtable) {
-        reinterpret_cast<IUnknown*>(
-            vectorAbi
-        )->Release();
-
-        return false;
-    }
-
-    Vector_GetSize_t getSize =
-        reinterpret_cast<Vector_GetSize_t>(
-            vtable[7]
-        );
-
-    unsigned int localSize =
-        0;
-
-    const HRESULT sizeHr =
-        getSize(
-            vectorAbi,
-            &localSize
-        );
-
-    if (sizeResult) {
-        *sizeResult =
-            sizeHr;
-    }
-
-    reinterpret_cast<IUnknown*>(
-        vectorAbi
-    )->Release();
-
-    if (FAILED(sizeHr)) {
-        return false;
-    }
-
-    if (size) {
-        *size =
-            localSize;
-    }
-
-    return true;
-}
-
-void CacheTaskbarModel6(
-    void* taskbarModel6
-) {
-    if (!taskbarModel6) {
-        return;
-    }
-
-    reinterpret_cast<IUnknown*>(
-        taskbarModel6
-    )->AddRef();
-
-    void* previous =
-        g_taskbarModel6.exchange(
-            taskbarModel6,
-            std::memory_order_acq_rel
-        );
-
-    if (previous) {
-        reinterpret_cast<IUnknown*>(
-            previous
-        )->Release();
-    }
-}
-
-bool ReadCurrentOverflowSize(
-    unsigned int* size,
-    HRESULT* getterResult,
-    HRESULT* queryResult,
-    HRESULT* sizeResult
-) {
-    if (size) {
-        *size =
-            0;
-    }
-
-    if (getterResult) {
-        *getterResult =
-            HRESULT_FROM_WIN32(
-                ERROR_NOT_READY
+        if (
+            std::find(
+                before.entries.begin(),
+                before.entries.end(),
+                identity
+            ) ==
+            before.entries.end()
+        ) {
+            added.push_back(
+                identity
             );
+        }
     }
 
-    if (queryResult) {
-        *queryResult =
-            E_FAIL;
+    return added;
+}
+
+std::vector<std::uint64_t>
+FindTargetIdentities(
+    const UIOrderSnapshot& snapshot
+) {
+    std::vector<std::uint64_t> matches;
+
+    if (!snapshot.valid) {
+        return matches;
     }
 
-    if (sizeResult) {
-        *sizeResult =
-            E_FAIL;
-    }
-
-    void* taskbarModel6 =
-        g_taskbarModel6.load(
-            std::memory_order_acquire
-        );
-
-    if (!taskbarModel6) {
-        return false;
-    }
-
-    reinterpret_cast<IUnknown*>(
-        taskbarModel6
-    )->AddRef();
-
-    void* collectionAbi =
-        nullptr;
-
-    const HRESULT getterHr =
-        TaskbarModel_GetOverflowIcons_Original(
-            taskbarModel6,
-            &collectionAbi
-        );
-
-    if (getterResult) {
-        *getterResult =
-            getterHr;
-    }
-
-    bool success =
-        false;
-
-    if (
-        SUCCEEDED(getterHr) &&
-        collectionAbi
+    for (
+        std::uint64_t identity :
+        snapshot.entries
     ) {
-        success =
-            QueryVectorSize(
-                collectionAbi,
-                size,
-                queryResult,
-                sizeResult
+        const std::wstring executablePath =
+            QueryStringValue(
+                MakeTrayEntrySubkey(
+                    identity
+                ),
+                L"ExecutablePath"
             );
 
-        reinterpret_cast<IUnknown*>(
-            collectionAbi
-        )->Release();
+        if (
+            EndsWithOrdinalIgnoreCase(
+                executablePath,
+                kTargetExecutableName
+            )
+        ) {
+            matches.push_back(
+                identity
+            );
+        }
     }
 
-    reinterpret_cast<IUnknown*>(
-        taskbarModel6
-    )->Release();
-
-    return success;
+    return matches;
 }
 
-int __cdecl
-TaskbarModel_GetOverflowIcons_Hook(
-    void* pThis,
-    void** result
+unsigned long long FindOneBasedPosition(
+    const UIOrderSnapshot& snapshot,
+    std::uint64_t identity
 ) {
-    const unsigned long long callNumber =
-        g_overflowGetterCalls.fetch_add(
-            1,
-            std::memory_order_relaxed
-        ) +
-        1;
-
-    const HRESULT getterResult =
-        TaskbarModel_GetOverflowIcons_Original(
-            pThis,
-            result
+    const auto iterator =
+        std::find(
+            snapshot.entries.begin(),
+            snapshot.entries.end(),
+            identity
         );
 
     if (
-        SUCCEEDED(getterResult) &&
-        result &&
-        *result
+        iterator ==
+        snapshot.entries.end()
     ) {
-        CacheTaskbarModel6(
-            pThis
-        );
+        return 0;
     }
 
-    unsigned int size =
-        0;
-
-    HRESULT queryResult =
-        E_FAIL;
-
-    HRESULT sizeResult =
-        E_FAIL;
-
-    const bool sizeValid =
-        SUCCEEDED(getterResult) &&
-        result &&
-        *result &&
-        QueryVectorSize(
-            *result,
-            &size,
-            &queryResult,
-            &sizeResult
-        );
-
-    Wh_Log(
-        L"OVERFLOW_GETTER "
-        L"call=%llu "
-        L"thread=%lu "
-        L"taskbarModel6=%p "
-        L"result=0x%08X "
-        L"collection=%p "
-        L"vectorQueryResult=0x%08X "
-        L"sizeResult=0x%08X "
-        L"sizeValid=%d "
-        L"size=%u",
-        callNumber,
-        GetCurrentThreadId(),
-        pThis,
-        static_cast<unsigned int>(
-            getterResult
-        ),
-        result
-            ? *result
-            : nullptr,
-        static_cast<unsigned int>(
-            queryResult
-        ),
-        static_cast<unsigned int>(
-            sizeResult
-        ),
-        sizeValid
-            ? 1
-            : 0,
-        size
-    );
-
-    return getterResult;
-}
-
-void __cdecl
-NotificationAreaIconManager_AddIcon_Hook(
-    void* pThis,
-    void* trayNotifyData
-) {
-    const unsigned long long callNumber =
-        g_addIconCalls.fetch_add(
-            1,
-            std::memory_order_relaxed
-        ) +
-        1;
-
-    AddIconContext previousContext =
-        std::move(
-            g_addIconContext
-        );
-
-    g_addIconContext.active =
-        true;
-
-    g_addIconContext.callNumber =
-        callNumber;
-
-    g_addIconContext.before =
-        CaptureUIOrderSnapshot();
-
-    Wh_Log(
-        L"ADD_ICON_BEGIN "
-        L"call=%llu "
-        L"thread=%lu "
-        L"manager=%p "
-        L"trayNotifyData=%p "
-        L"beforeValid=%d "
-        L"beforeStatus=%ld "
-        L"beforeCount=%llu",
-        callNumber,
-        GetCurrentThreadId(),
-        pThis,
-        trayNotifyData,
-        g_addIconContext.before.valid
-            ? 1
-            : 0,
-        g_addIconContext.before.status,
+    return
         static_cast<unsigned long long>(
-            g_addIconContext.before.entries.size()
+            std::distance(
+                snapshot.entries.begin(),
+                iterator
+            )
+        ) +
+        1;
+}
+
+unsigned int CountObservedIdentity(
+    const std::vector<OrderQueryObservation>& observations,
+    std::uint64_t identity
+) {
+    unsigned int count =
+        0;
+
+    for (
+        const OrderQueryObservation& observation :
+        observations
+    ) {
+        if (
+            observation.identity ==
+            identity
+        ) {
+            count++;
+        }
+    }
+
+    return count;
+}
+
+bool ContainsIdentity(
+    const std::vector<std::uint64_t>& identities,
+    std::uint64_t identity
+) {
+    return
+        std::find(
+            identities.begin(),
+            identities.end(),
+            identity
+        ) !=
+        identities.end();
+}
+
+void LogIdentitySet(
+    const wchar_t* label,
+    unsigned long long addCall,
+    const std::vector<std::uint64_t>& identities,
+    const UIOrderSnapshot& snapshot
+) {
+    Wh_Log(
+        L"%s "
+        L"addCall=%llu "
+        L"count=%llu",
+        label,
+        addCall,
+        static_cast<unsigned long long>(
+            identities.size()
         )
     );
 
-    NotificationAreaIconManager_AddIcon_Original(
-        pThis,
-        trayNotifyData
+    for (
+        std::size_t index = 0;
+        index < identities.size();
+        index++
+    ) {
+        const std::uint64_t identity =
+            identities[index];
+
+        const std::wstring executablePath =
+            QueryStringValue(
+                MakeTrayEntrySubkey(
+                    identity
+                ),
+                L"ExecutablePath"
+            );
+
+        Wh_Log(
+            L"%s_ITEM "
+            L"addCall=%llu "
+            L"item=%llu "
+            L"id=%llu "
+            L"position=%llu "
+            L"path=\"%s\"",
+            label,
+            addCall,
+            static_cast<unsigned long long>(
+                index +
+                1
+            ),
+            static_cast<unsigned long long>(
+                identity
+            ),
+            snapshot.valid
+                ? FindOneBasedPosition(
+                      snapshot,
+                      identity
+                  )
+                : 0,
+            executablePath.c_str()
+        );
+    }
+}
+
+void AnalyzeCompletedAddIcon(
+    const AddIconContext& context,
+    const UIOrderSnapshot& after
+) {
+    const std::vector<std::uint64_t> addedIdentities =
+        FindAddedIdentities(
+            context.before,
+            after
+        );
+
+    const std::vector<std::uint64_t> targetBefore =
+        FindTargetIdentities(
+            context.before
+        );
+
+    const std::vector<std::uint64_t> targetAfter =
+        FindTargetIdentities(
+            after
+        );
+
+    std::vector<std::uint64_t> targetAdded;
+
+    for (
+        std::uint64_t identity :
+        addedIdentities
+    ) {
+        if (
+            ContainsIdentity(
+                targetAfter,
+                identity
+            )
+        ) {
+            targetAdded.push_back(
+                identity
+            );
+        }
+    }
+
+    LogIdentitySet(
+        L"ADDED_IDENTITIES",
+        context.callNumber,
+        addedIdentities,
+        after
     );
+
+    LogIdentitySet(
+        L"TARGET_BEFORE",
+        context.callNumber,
+        targetBefore,
+        context.before
+    );
+
+    LogIdentitySet(
+        L"TARGET_AFTER",
+        context.callNumber,
+        targetAfter,
+        after
+    );
+
+    LogIdentitySet(
+        L"TARGET_ADDED",
+        context.callNumber,
+        targetAdded,
+        after
+    );
+
+    std::uint64_t targetIdentity =
+        0;
+
+    const wchar_t* resultKind =
+        L"unrelated";
+
+    if (
+        targetAdded.size() ==
+        1
+    ) {
+        targetIdentity =
+            targetAdded.front();
+
+        resultKind =
+            L"new";
+
+        std::uint64_t expected =
+            0;
+
+        g_firstTargetIdentity.compare_exchange_strong(
+            expected,
+            targetIdentity,
+            std::memory_order_acq_rel
+        );
+    } else if (
+        targetAdded.empty() &&
+        targetBefore.size() ==
+            1 &&
+        targetAfter.size() ==
+            1 &&
+        targetBefore.front() ==
+            targetAfter.front()
+    ) {
+        targetIdentity =
+            targetBefore.front();
+
+        if (
+            CountObservedIdentity(
+                context.orderQueries,
+                targetIdentity
+            ) !=
+            0
+        ) {
+            resultKind =
+                L"existing-reused";
+        } else {
+            resultKind =
+                L"existing-not-correlated";
+        }
+    } else if (
+        !targetAdded.empty() ||
+        !targetBefore.empty() ||
+        !targetAfter.empty()
+    ) {
+        resultKind =
+            L"ambiguous";
+    }
+
+    unsigned int matchingOrderQueries =
+        0;
+
+    if (targetIdentity != 0) {
+        matchingOrderQueries =
+            CountObservedIdentity(
+                context.orderQueries,
+                targetIdentity
+            );
+    }
+
+    const std::uint64_t firstTargetIdentity =
+        g_firstTargetIdentity.load(
+            std::memory_order_acquire
+        );
+
+    const bool matchesFirstIdentity =
+        targetIdentity != 0 &&
+        firstTargetIdentity != 0 &&
+        targetIdentity ==
+            firstTargetIdentity;
+
+    const unsigned long long resultNumber =
+        g_targetResults.fetch_add(
+            1,
+            std::memory_order_relaxed
+        ) +
+        1;
 
     Wh_Log(
-        L"ADD_ICON_END "
-        L"call=%llu "
+        L"TARGET_IDENTITY_RESULT "
+        L"result=%llu "
+        L"addCall=%llu "
+        L"kind=\"%s\" "
+        L"targetIdentity=%llu "
+        L"firstTargetIdentity=%llu "
+        L"matchesFirstIdentity=%d "
+        L"matchingOrderQueries=%u "
+        L"totalOrderQueries=%llu "
+        L"visibleImplementations=%llu "
+        L"beforeCount=%llu "
+        L"afterCount=%llu "
+        L"beforePosition=%llu "
+        L"afterPosition=%llu",
+        resultNumber,
+        context.callNumber,
+        resultKind,
+        static_cast<unsigned long long>(
+            targetIdentity
+        ),
+        static_cast<unsigned long long>(
+            firstTargetIdentity
+        ),
+        matchesFirstIdentity
+            ? 1
+            : 0,
+        matchingOrderQueries,
+        static_cast<unsigned long long>(
+            context.orderQueries.size()
+        ),
+        static_cast<unsigned long long>(
+            context.visibleImplementations.size()
+        ),
+        static_cast<unsigned long long>(
+            context.before.entries.size()
+        ),
+        static_cast<unsigned long long>(
+            after.entries.size()
+        ),
+        targetIdentity != 0
+            ? FindOneBasedPosition(
+                  context.before,
+                  targetIdentity
+              )
+            : 0,
+        targetIdentity != 0
+            ? FindOneBasedPosition(
+                  after,
+                  targetIdentity
+              )
+            : 0
+    );
+}
+
+unsigned int __cdecl
+NotifyIconSettingsDatabase_GetUIOrderForIcon_Hook(
+    void* pThis,
+    std::uint64_t identity
+) {
+    const unsigned long long queryNumber =
+        g_orderQueries.fetch_add(
+            1,
+            std::memory_order_relaxed
+        ) +
+        1;
+
+    const unsigned int returnedOrder =
+        NotifyIconSettingsDatabase_GetUIOrderForIcon_Original(
+            pThis,
+            identity
+        );
+
+    if (g_addIconContext.active) {
+        g_addIconContext.orderQueries.push_back(
+            {
+                identity,
+                returnedOrder
+            }
+        );
+    }
+
+    Wh_Log(
+        L"UI_ORDER_QUERY "
+        L"query=%llu "
         L"thread=%lu "
-        L"manager=%p",
-        callNumber,
+        L"database=%p "
+        L"id=%llu "
+        L"returnedOrder=%u "
+        L"duringAddIcon=%d "
+        L"parentAddCall=%llu",
+        queryNumber,
         GetCurrentThreadId(),
-        pThis
+        pThis,
+        static_cast<unsigned long long>(
+            identity
+        ),
+        returnedOrder,
+        g_addIconContext.active
+            ? 1
+            : 0,
+        g_addIconContext.active
+            ? g_addIconContext.callNumber
+            : 0
     );
 
-    g_addIconContext =
-        std::move(
-            previousContext
-        );
+    return returnedOrder;
 }
 
 void __cdecl
@@ -1121,8 +845,7 @@ NotificationAreaIconManager_AddVisible_Hook(
         L"manager=%p "
         L"implementation=%p "
         L"duringAddIcon=%d "
-        L"parentAddCall=%llu "
-        L"internalMoveDepth=%u",
+        L"parentAddCall=%llu",
         callNumber,
         GetCurrentThreadId(),
         pThis,
@@ -1132,8 +855,7 @@ NotificationAreaIconManager_AddVisible_Hook(
             : 0,
         g_addIconContext.active
             ? g_addIconContext.callNumber
-            : 0,
-        g_internalMoveDepth
+            : 0
     );
 
     NotificationAreaIconManager_AddVisible_Original(
@@ -1141,376 +863,154 @@ NotificationAreaIconManager_AddVisible_Hook(
         iconImplementation
     );
 
-    if (g_internalMoveDepth != 0) {
-        Wh_Log(
-            L"VISIBLE_ADD_INTERNAL_MOVE "
-            L"call=%llu "
-            L"thread=%lu "
-            L"manager=%p "
-            L"implementation=%p "
-            L"internalMoveDepth=%u",
-            callNumber,
-            GetCurrentThreadId(),
-            pThis,
-            iconImplementation,
-            g_internalMoveDepth
+    if (g_addIconContext.active) {
+        g_addIconContext.visibleImplementations.push_back(
+            iconImplementation
         );
-
-        return;
     }
-
-    if (!g_addIconContext.active) {
-        Wh_Log(
-            L"VISIBLE_ADD_WITHOUT_ADD_CONTEXT "
-            L"call=%llu",
-            callNumber
-        );
-
-        return;
-    }
-
-    const UIOrderSnapshot beforeMove =
-        CaptureUIOrderSnapshot();
-
-    const std::vector<std::uint64_t> addedIdentities =
-        FindAddedIdentities(
-            g_addIconContext.before,
-            beforeMove
-        );
-
-    Wh_Log(
-        L"VISIBLE_ADD_ORDER_DELTA "
-        L"call=%llu "
-        L"parentAddCall=%llu "
-        L"beforeValid=%d "
-        L"afterValid=%d "
-        L"beforeCount=%llu "
-        L"afterCount=%llu "
-        L"addedCount=%llu",
-        callNumber,
-        g_addIconContext.callNumber,
-        g_addIconContext.before.valid
-            ? 1
-            : 0,
-        beforeMove.valid
-            ? 1
-            : 0,
-        static_cast<unsigned long long>(
-            g_addIconContext.before.entries.size()
-        ),
-        static_cast<unsigned long long>(
-            beforeMove.entries.size()
-        ),
-        static_cast<unsigned long long>(
-            addedIdentities.size()
-        )
-    );
-
-    std::uint64_t targetIdentity =
-        0;
-
-    unsigned int targetMatches =
-        0;
-
-    for (
-        std::uint64_t identity :
-        addedIdentities
-    ) {
-        const std::wstring executablePath =
-            QueryStringValue(
-                MakeTrayEntrySubkey(
-                    identity
-                ),
-                L"ExecutablePath"
-            );
-
-        Wh_Log(
-            L"ADDED_IDENTITY "
-            L"call=%llu "
-            L"id=%llu "
-            L"path=\"%s\"",
-            callNumber,
-            static_cast<unsigned long long>(
-                identity
-            ),
-            executablePath.c_str()
-        );
-
-        if (
-            EndsWithOrdinalIgnoreCase(
-                executablePath,
-                kTargetExecutableName
-            )
-        ) {
-            targetIdentity =
-                identity;
-
-            targetMatches++;
-        }
-    }
-
-    if (targetMatches != 1) {
-        Wh_Log(
-            L"TARGET_NOT_OBSERVED "
-            L"call=%llu "
-            L"targetMatches=%u",
-            callNumber,
-            targetMatches
-        );
-
-        return;
-    }
-
-    unsigned int overflowSize =
-        0;
-
-    HRESULT getterResult =
-        E_FAIL;
-
-    HRESULT vectorQueryResult =
-        E_FAIL;
-
-    HRESULT sizeResult =
-        E_FAIL;
-
-    const bool overflowSizeValid =
-        ReadCurrentOverflowSize(
-            &overflowSize,
-            &getterResult,
-            &vectorQueryResult,
-            &sizeResult
-        );
-
-    if (
-        !overflowSizeValid ||
-        overflowSize == 0
-    ) {
-        Wh_Log(
-            L"TARGET_OVERFLOW_SIZE_UNAVAILABLE "
-            L"call=%llu "
-            L"id=%llu "
-            L"getterResult=0x%08X "
-            L"vectorQueryResult=0x%08X "
-            L"sizeResult=0x%08X "
-            L"overflowSize=%u "
-            L"cachedTaskbarModel6=%p",
-            callNumber,
-            static_cast<unsigned long long>(
-                targetIdentity
-            ),
-            static_cast<unsigned int>(
-                getterResult
-            ),
-            static_cast<unsigned int>(
-                vectorQueryResult
-            ),
-            static_cast<unsigned int>(
-                sizeResult
-            ),
-            overflowSize,
-            g_taskbarModel6.load(
-                std::memory_order_acquire
-            )
-        );
-
-        return;
-    }
-
-    void* queriedAbi =
-        nullptr;
-
-    const HRESULT iconQueryResult =
-        NotificationAreaIcon_QueryInterface(
-            iconImplementation,
-            *g_notificationAreaIconInterfaceId,
-            &queriedAbi
-        );
-
-    Wh_Log(
-        L"TARGET_ICON_QUERY "
-        L"call=%llu "
-        L"implementation=%p "
-        L"result=0x%08X "
-        L"queriedAbi=%p",
-        callNumber,
-        iconImplementation,
-        static_cast<unsigned int>(
-            iconQueryResult
-        ),
-        queriedAbi
-    );
-
-    if (
-        FAILED(iconQueryResult) ||
-        !queriedAbi
-    ) {
-        return;
-    }
-
-    bool expected =
-        false;
-
-    if (
-        !g_testConsumed.compare_exchange_strong(
-            expected,
-            true,
-            std::memory_order_acq_rel
-        )
-    ) {
-        Wh_Log(
-            L"TARGET_ALREADY_CONSUMED "
-            L"call=%llu "
-            L"id=%llu",
-            callNumber,
-            static_cast<unsigned long long>(
-                targetIdentity
-            )
-        );
-
-        reinterpret_cast<IUnknown*>(
-            queriedAbi
-        )->Release();
-
-        return;
-    }
-
-    const unsigned int targetIndex =
-        overflowSize -
-        1;
-
-    const unsigned long long moveNumber =
-        g_moveAttempts.fetch_add(
-            1,
-            std::memory_order_relaxed
-        ) +
-        1;
-
-    const unsigned long long beforePosition =
-        FindOneBasedPosition(
-            beforeMove,
-            targetIdentity
-        );
-
-    void* iconArgumentStorage =
-        queriedAbi;
-
-    Wh_Log(
-        L"SINGLE_END_MOVE_BEGIN "
-        L"move=%llu "
-        L"call=%llu "
-        L"parentAddCall=%llu "
-        L"thread=%lu "
-        L"manager=%p "
-        L"implementation=%p "
-        L"iconAbi=%p "
-        L"id=%llu "
-        L"beforePosition=%llu "
-        L"beforeCount=%llu "
-        L"overflowSize=%u "
-        L"location=%d "
-        L"targetIndex=%u",
-        moveNumber,
-        callNumber,
-        g_addIconContext.callNumber,
-        GetCurrentThreadId(),
-        pThis,
-        iconImplementation,
-        queriedAbi,
-        static_cast<unsigned long long>(
-            targetIdentity
-        ),
-        beforePosition,
-        static_cast<unsigned long long>(
-            beforeMove.entries.size()
-        ),
-        overflowSize,
-        kOverflowLocation,
-        targetIndex
-    );
-
-    g_internalMoveDepth++;
-
-    NotificationAreaIconManager_MoveIcon(
-        pThis,
-        &iconArgumentStorage,
-        kOverflowLocation,
-        targetIndex
-    );
-
-    g_internalMoveDepth--;
-
-    const UIOrderSnapshot afterMove =
-        CaptureUIOrderSnapshot();
-
-    const unsigned long long afterPosition =
-        afterMove.valid
-            ? FindOneBasedPosition(
-                  afterMove,
-                  targetIdentity
-              )
-            : 0;
-
-    const bool orderChanged =
-        beforeMove.valid &&
-        afterMove.valid &&
-        beforeMove.entries !=
-            afterMove.entries;
-
-    const bool reachedRegistryEnd =
-        afterMove.valid &&
-        afterPosition != 0 &&
-        afterPosition ==
-            static_cast<unsigned long long>(
-                afterMove.entries.size()
-            );
-
-    Wh_Log(
-        L"SINGLE_END_MOVE_COMPLETE "
-        L"move=%llu "
-        L"call=%llu "
-        L"id=%llu "
-        L"afterSnapshotValid=%d "
-        L"afterStatus=%ld "
-        L"afterPosition=%llu "
-        L"afterCount=%llu "
-        L"orderChanged=%d "
-        L"reachedRegistryEnd=%d",
-        moveNumber,
-        callNumber,
-        static_cast<unsigned long long>(
-            targetIdentity
-        ),
-        afterMove.valid
-            ? 1
-            : 0,
-        afterMove.status,
-        afterPosition,
-        static_cast<unsigned long long>(
-            afterMove.entries.size()
-        ),
-        orderChanged
-            ? 1
-            : 0,
-        reachedRegistryEnd
-            ? 1
-            : 0
-    );
-
-    reinterpret_cast<IUnknown*>(
-        queriedAbi
-    )->Release();
 
     Wh_Log(
         L"VISIBLE_ADD_END "
         L"call=%llu "
         L"thread=%lu "
         L"manager=%p "
-        L"implementation=%p",
+        L"implementation=%p "
+        L"duringAddIcon=%d "
+        L"parentAddCall=%llu",
         callNumber,
         GetCurrentThreadId(),
         pThis,
-        iconImplementation
+        iconImplementation,
+        g_addIconContext.active
+            ? 1
+            : 0,
+        g_addIconContext.active
+            ? g_addIconContext.callNumber
+            : 0
     );
+}
+
+void __cdecl
+NotificationAreaIconManager_AddIcon_Hook(
+    void* pThis,
+    void* trayNotifyData
+) {
+    const unsigned long long callNumber =
+        g_addIconCalls.fetch_add(
+            1,
+            std::memory_order_relaxed
+        ) +
+        1;
+
+    AddIconContext previousContext =
+        std::move(
+            g_addIconContext
+        );
+
+    g_addIconContext =
+        {};
+
+    g_addIconContext.active =
+        true;
+
+    g_addIconContext.callNumber =
+        callNumber;
+
+    g_addIconContext.manager =
+        pThis;
+
+    g_addIconContext.trayNotifyData =
+        trayNotifyData;
+
+    g_addIconContext.before =
+        CaptureUIOrderSnapshot();
+
+    const std::vector<std::uint64_t> targetBefore =
+        FindTargetIdentities(
+            g_addIconContext.before
+        );
+
+    Wh_Log(
+        L"ADD_ICON_BEGIN "
+        L"call=%llu "
+        L"thread=%lu "
+        L"manager=%p "
+        L"trayNotifyData=%p "
+        L"beforeValid=%d "
+        L"beforeStatus=%ld "
+        L"beforeCount=%llu "
+        L"targetBeforeCount=%llu",
+        callNumber,
+        GetCurrentThreadId(),
+        pThis,
+        trayNotifyData,
+        g_addIconContext.before.valid
+            ? 1
+            : 0,
+        g_addIconContext.before.status,
+        static_cast<unsigned long long>(
+            g_addIconContext.before.entries.size()
+        ),
+        static_cast<unsigned long long>(
+            targetBefore.size()
+        )
+    );
+
+    NotificationAreaIconManager_AddIcon_Original(
+        pThis,
+        trayNotifyData
+    );
+
+    const UIOrderSnapshot after =
+        CaptureUIOrderSnapshot();
+
+    Wh_Log(
+        L"ADD_ICON_ORIGINAL_RETURNED "
+        L"call=%llu "
+        L"thread=%lu "
+        L"manager=%p "
+        L"afterValid=%d "
+        L"afterStatus=%ld "
+        L"afterCount=%llu "
+        L"orderQueries=%llu "
+        L"visibleImplementations=%llu",
+        callNumber,
+        GetCurrentThreadId(),
+        pThis,
+        after.valid
+            ? 1
+            : 0,
+        after.status,
+        static_cast<unsigned long long>(
+            after.entries.size()
+        ),
+        static_cast<unsigned long long>(
+            g_addIconContext.orderQueries.size()
+        ),
+        static_cast<unsigned long long>(
+            g_addIconContext.visibleImplementations.size()
+        )
+    );
+
+    AnalyzeCompletedAddIcon(
+        g_addIconContext,
+        after
+    );
+
+    Wh_Log(
+        L"ADD_ICON_END "
+        L"call=%llu "
+        L"thread=%lu "
+        L"manager=%p",
+        callNumber,
+        GetCurrentThreadId(),
+        pThis
+    );
+
+    g_addIconContext =
+        std::move(
+            previousContext
+        );
 }
 
 bool HookTaskbarSymbols(
@@ -1533,10 +1033,10 @@ bool HookTaskbarSymbols(
         },
         {
             {
-                LR"(public: virtual int __cdecl winrt::impl::produce<struct winrt::WindowsUdk::UI::Shell::implementation::TaskbarModel,struct winrt::WindowsUdk::UI::Shell::ITaskbarModel6>::get_NotificationAreaOverflowIcons(void * *))"
+                LR"(public: unsigned int __cdecl NotifyIconSettingsDatabase::GetUIOrderForIcon(unsigned __int64))"
             },
-            &TaskbarModel_GetOverflowIcons_Original,
-            TaskbarModel_GetOverflowIcons_Hook,
+            &NotifyIconSettingsDatabase_GetUIOrderForIcon_Original,
+            NotifyIconSettingsDatabase_GetUIOrderForIcon_Hook,
         },
     };
 
@@ -1558,7 +1058,7 @@ bool HookTaskbarSymbols(
     }
 
     Wh_Log(
-        L"Single dynamic end-move hooks installed"
+        L"Returning-icon identity hooks installed"
     );
 
     return true;
@@ -1569,7 +1069,7 @@ bool HookTaskbarSymbols(
 BOOL Wh_ModInit() {
     Wh_Log(
         L"Tray Add Path Analyzer "
-        L"0.7.0 initializing"
+        L"0.8.0 initializing"
     );
 
     HMODULE taskbarModule =
@@ -1605,14 +1105,6 @@ BOOL Wh_ModInit() {
         modulePath
     );
 
-    if (
-        !ResolveRequiredSymbols(
-            taskbarModule
-        )
-    ) {
-        return FALSE;
-    }
-
     return
         HookTaskbarSymbols(
             taskbarModule
@@ -1622,41 +1114,29 @@ BOOL Wh_ModInit() {
 }
 
 void Wh_ModUninit() {
-    void* taskbarModel6 =
-        g_taskbarModel6.exchange(
-            nullptr,
-            std::memory_order_acq_rel
-        );
-
-    if (taskbarModel6) {
-        reinterpret_cast<IUnknown*>(
-            taskbarModel6
-        )->Release();
-    }
-
     Wh_Log(
         L"Tray Add Path Analyzer stopped; "
         L"addIconCalls=%llu "
         L"visibleAddCalls=%llu "
-        L"overflowGetterCalls=%llu "
-        L"moveAttempts=%llu "
-        L"testConsumed=%d",
+        L"orderQueries=%llu "
+        L"targetResults=%llu "
+        L"firstTargetIdentity=%llu",
         g_addIconCalls.load(
             std::memory_order_relaxed
         ),
         g_visibleAddCalls.load(
             std::memory_order_relaxed
         ),
-        g_overflowGetterCalls.load(
+        g_orderQueries.load(
             std::memory_order_relaxed
         ),
-        g_moveAttempts.load(
+        g_targetResults.load(
             std::memory_order_relaxed
         ),
-        g_testConsumed.load(
-            std::memory_order_relaxed
+        static_cast<unsigned long long>(
+            g_firstTargetIdentity.load(
+                std::memory_order_relaxed
+            )
         )
-            ? 1
-            : 0
     );
 }
