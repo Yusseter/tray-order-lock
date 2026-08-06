@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              tray-add-path-analyzer
 // @name            Tray Add Path Analyzer
-// @description     Tests a one-shot automatic move for a newly added tray icon.
-// @version         0.4.0
+// @description     Tests dynamic automatic movement of a new tray icon to the final position.
+// @version         0.5.0
 // @author          Yusseter
 // @github          https://github.com/Yusseter
 // @homepage        https://github.com/Yusseter/tray-order-lock
@@ -18,19 +18,19 @@
 
 A temporary one-shot diagnostic mod.
 
-Version 0.4.0 tests whether a newly added tray icon can be moved automatically,
-without a user drag, through `NotificationAreaIconManager2::MoveIcon`.
+Version 0.5.0 moves a dedicated newly added test icon to the actual final tray
+position without using a fixed target index.
 
-The test applies only to a new executable named:
+It repeatedly uses the verified `NotificationAreaIconManager2::MoveIcon` path
+with valid consecutive indexes. After every move, it reads `UIOrderList` and
+stops as soon as the test icon reaches the final persistent position.
 
-`TrayAutomaticMoveTest.exe`
+The test applies only to an executable named:
 
-It safely obtains the `INotificationAreaIcon` ABI pointer through the verified
-`NotificationAreaIcon2` query-interface path, then requests a move to the fixed
-test target `location=1, index=16`.
+`TrayDynamicEndTest.exe`
 
-The fixed target is only for validating the automatic live-move path. It is not
-the final dynamic "place at end" implementation.
+The mod prevents recursive processing of visible-collection updates triggered
+by its own moves.
 */
 // ==/WindhawkModReadme==
 
@@ -44,7 +44,9 @@ the final dynamic "place at end" implementation.
 #include <cstring>
 #include <cwchar>
 #include <cwctype>
+#include <iterator>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -56,13 +58,13 @@ constexpr wchar_t kUIOrderListValueName[] =
     L"UIOrderList";
 
 constexpr wchar_t kTargetExecutableName[] =
-    L"trayautomaticmovetest.exe";
+    L"traydynamicendtest.exe";
 
-constexpr int kTestLocation =
+constexpr int kOverflowLocation =
     1;
 
-constexpr unsigned int kTestIndex =
-    16;
+constexpr unsigned int kMaximumMoveSteps =
+    128;
 
 using NotificationAreaIconManager_AddVisible_t =
     void(__cdecl*)(
@@ -103,7 +105,7 @@ const GUID* g_notificationAreaIconInterfaceId =
 std::atomic<unsigned long long> g_visibleAddCallCount =
     0;
 
-std::atomic<unsigned long long> g_automaticMoveCount =
+std::atomic<unsigned long long> g_moveStepCount =
     0;
 
 std::atomic<bool> g_testConsumed =
@@ -346,7 +348,7 @@ bool ResolveRequiredSymbols(
     }
 
     Wh_Log(
-        L"AUTOMATIC_MOVE_SUPPORT_READY "
+        L"DYNAMIC_END_SUPPORT_READY "
         L"queryFunction=%p "
         L"interfaceId=%p "
         L"moveFunction=%p",
@@ -361,83 +363,98 @@ bool ResolveRequiredSymbols(
 UIOrderSnapshot CaptureUIOrderSnapshot() {
     UIOrderSnapshot snapshot;
 
-    DWORD registryType =
-        REG_NONE;
-
-    DWORD requiredBytes =
-        0;
-
-    LONG status =
-        RegGetValueW(
-            HKEY_CURRENT_USER,
-            kNotifyIconSettingsPath,
-            kUIOrderListValueName,
-            RRF_RT_REG_BINARY,
-            &registryType,
-            nullptr,
-            &requiredBytes
-        );
-
-    snapshot.status =
-        status;
-
-    if (status != ERROR_SUCCESS) {
-        return snapshot;
-    }
-
-    std::vector<BYTE> data(
-        requiredBytes
-    );
-
-    DWORD actualBytes =
-        requiredBytes;
-
-    status =
-        RegGetValueW(
-            HKEY_CURRENT_USER,
-            kNotifyIconSettingsPath,
-            kUIOrderListValueName,
-            RRF_RT_REG_BINARY,
-            &registryType,
-            data.empty()
-                ? nullptr
-                : data.data(),
-            &actualBytes
-        );
-
-    snapshot.status =
-        status;
-
-    if (status != ERROR_SUCCESS) {
-        return snapshot;
-    }
-
-    if (
-        actualBytes %
-            sizeof(std::uint64_t) !=
-        0
+    for (
+        int attempt = 0;
+        attempt < 3;
+        attempt++
     ) {
+        DWORD registryType =
+            REG_NONE;
+
+        DWORD requiredBytes =
+            0;
+
+        LONG status =
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                kNotifyIconSettingsPath,
+                kUIOrderListValueName,
+                RRF_RT_REG_BINARY,
+                &registryType,
+                nullptr,
+                &requiredBytes
+            );
+
         snapshot.status =
-            ERROR_INVALID_DATA;
+            status;
+
+        if (status != ERROR_SUCCESS) {
+            return snapshot;
+        }
+
+        std::vector<BYTE> data(
+            requiredBytes
+        );
+
+        DWORD actualBytes =
+            requiredBytes;
+
+        status =
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                kNotifyIconSettingsPath,
+                kUIOrderListValueName,
+                RRF_RT_REG_BINARY,
+                &registryType,
+                data.empty()
+                    ? nullptr
+                    : data.data(),
+                &actualBytes
+            );
+
+        if (status == ERROR_MORE_DATA) {
+            continue;
+        }
+
+        snapshot.status =
+            status;
+
+        if (status != ERROR_SUCCESS) {
+            return snapshot;
+        }
+
+        if (
+            actualBytes %
+                sizeof(std::uint64_t) !=
+            0
+        ) {
+            snapshot.status =
+                ERROR_INVALID_DATA;
+
+            return snapshot;
+        }
+
+        snapshot.entries.resize(
+            actualBytes /
+            sizeof(std::uint64_t)
+        );
+
+        if (actualBytes != 0) {
+            std::memcpy(
+                snapshot.entries.data(),
+                data.data(),
+                actualBytes
+            );
+        }
+
+        snapshot.valid =
+            true;
 
         return snapshot;
     }
 
-    snapshot.entries.resize(
-        actualBytes /
-        sizeof(std::uint64_t)
-    );
-
-    if (actualBytes != 0) {
-        std::memcpy(
-            snapshot.entries.data(),
-            data.data(),
-            actualBytes
-        );
-    }
-
-    snapshot.valid =
-        true;
+    snapshot.status =
+        ERROR_MORE_DATA;
 
     return snapshot;
 }
@@ -591,32 +608,32 @@ unsigned long long FindOneBasedPosition(
         1;
 }
 
-void TryAutomaticMove(
+void TryDynamicEndMove(
     void* manager,
     void* iconImplementation,
     unsigned long long visibleAddCall
 ) {
-    const UIOrderSnapshot beforeMove =
+    UIOrderSnapshot currentSnapshot =
         CaptureUIOrderSnapshot();
 
     if (
-        !beforeMove.valid ||
-        beforeMove.entries.empty()
+        !currentSnapshot.valid ||
+        currentSnapshot.entries.empty()
     ) {
         Wh_Log(
-            L"AUTOMATIC_MOVE_SKIPPED "
+            L"DYNAMIC_END_SKIPPED "
             L"reason=invalid-order-snapshot "
             L"visibleAddCall=%llu "
             L"status=%ld",
             visibleAddCall,
-            beforeMove.status
+            currentSnapshot.status
         );
 
         return;
     }
 
     const std::uint64_t candidateIdentity =
-        beforeMove.entries.front();
+        currentSnapshot.entries.front();
 
     const std::wstring executablePath =
         QueryStringValue(
@@ -658,7 +675,7 @@ void TryAutomaticMove(
         )
     ) {
         Wh_Log(
-            L"AUTOMATIC_MOVE_SKIPPED "
+            L"DYNAMIC_END_SKIPPED "
             L"reason=test-already-consumed "
             L"visibleAddCall=%llu",
             visibleAddCall
@@ -678,7 +695,7 @@ void TryAutomaticMove(
         );
 
     Wh_Log(
-        L"AUTOMATIC_MOVE_QUERY "
+        L"DYNAMIC_END_QUERY "
         L"visibleAddCall=%llu "
         L"implementation=%p "
         L"result=0x%08X "
@@ -701,26 +718,28 @@ void TryAutomaticMove(
     void* iconArgumentStorage =
         queriedAbi;
 
-    const unsigned long long moveNumber =
-        g_automaticMoveCount.fetch_add(
-            1,
-            std::memory_order_relaxed
-        ) +
-        1;
+    unsigned int completedSteps =
+        0;
+
+    bool reachedEnd =
+        false;
+
+    const unsigned long long initialPosition =
+        FindOneBasedPosition(
+            currentSnapshot,
+            candidateIdentity
+        );
 
     Wh_Log(
-        L"AUTOMATIC_MOVE_BEGIN "
-        L"move=%llu "
+        L"DYNAMIC_END_BEGIN "
         L"visibleAddCall=%llu "
         L"thread=%lu "
         L"manager=%p "
         L"implementation=%p "
         L"iconAbi=%p "
         L"id=%llu "
-        L"beforePosition=%llu "
-        L"location=%d "
-        L"index=%u",
-        moveNumber,
+        L"initialPosition=%llu "
+        L"entryCount=%llu",
         visibleAddCall,
         GetCurrentThreadId(),
         manager,
@@ -729,61 +748,178 @@ void TryAutomaticMove(
         static_cast<unsigned long long>(
             candidateIdentity
         ),
-        FindOneBasedPosition(
-            beforeMove,
-            candidateIdentity
-        ),
-        kTestLocation,
-        kTestIndex
+        initialPosition,
+        static_cast<unsigned long long>(
+            currentSnapshot.entries.size()
+        )
     );
 
-    g_internalMoveDepth++;
+    if (
+        initialPosition ==
+        currentSnapshot.entries.size()
+    ) {
+        reachedEnd =
+            true;
+    }
 
-    NotificationAreaIconManager_MoveIcon(
-        manager,
-        &iconArgumentStorage,
-        kTestLocation,
-        kTestIndex
-    );
+    for (
+        unsigned int targetIndex = 1;
+        !reachedEnd &&
+        targetIndex <= kMaximumMoveSteps;
+        targetIndex++
+    ) {
+        const unsigned long long beforePosition =
+            FindOneBasedPosition(
+                currentSnapshot,
+                candidateIdentity
+            );
 
-    g_internalMoveDepth--;
+        const unsigned long long beforeCount =
+            static_cast<unsigned long long>(
+                currentSnapshot.entries.size()
+            );
 
-    const UIOrderSnapshot afterMove =
-        CaptureUIOrderSnapshot();
+        g_internalMoveDepth++;
 
-    const unsigned long long afterPosition =
-        afterMove.valid
+        NotificationAreaIconManager_MoveIcon(
+            manager,
+            &iconArgumentStorage,
+            kOverflowLocation,
+            targetIndex
+        );
+
+        g_internalMoveDepth--;
+
+        completedSteps++;
+
+        g_moveStepCount.fetch_add(
+            1,
+            std::memory_order_relaxed
+        );
+
+        UIOrderSnapshot afterSnapshot =
+            CaptureUIOrderSnapshot();
+
+        const unsigned long long afterPosition =
+            afterSnapshot.valid
+                ? FindOneBasedPosition(
+                      afterSnapshot,
+                      candidateIdentity
+                  )
+                : 0;
+
+        const unsigned long long afterCount =
+            afterSnapshot.valid
+                ? static_cast<unsigned long long>(
+                      afterSnapshot.entries.size()
+                  )
+                : 0;
+
+        const bool orderChanged =
+            currentSnapshot.valid &&
+            afterSnapshot.valid &&
+            currentSnapshot.entries !=
+                afterSnapshot.entries;
+
+        Wh_Log(
+            L"DYNAMIC_END_STEP "
+            L"step=%u "
+            L"targetIndex=%u "
+            L"beforePosition=%llu "
+            L"beforeCount=%llu "
+            L"afterSnapshotValid=%d "
+            L"afterStatus=%ld "
+            L"afterPosition=%llu "
+            L"afterCount=%llu "
+            L"orderChanged=%d",
+            completedSteps,
+            targetIndex,
+            beforePosition,
+            beforeCount,
+            afterSnapshot.valid
+                ? 1
+                : 0,
+            afterSnapshot.status,
+            afterPosition,
+            afterCount,
+            orderChanged
+                ? 1
+                : 0
+        );
+
+        if (!afterSnapshot.valid) {
+            break;
+        }
+
+        if (
+            afterPosition != 0 &&
+            afterPosition ==
+                afterSnapshot.entries.size()
+        ) {
+            reachedEnd =
+                true;
+
+            currentSnapshot =
+                std::move(
+                    afterSnapshot
+                );
+
+            break;
+        }
+
+        if (
+            !orderChanged ||
+            afterPosition == 0 ||
+            afterPosition <= beforePosition
+        ) {
+            currentSnapshot =
+                std::move(
+                    afterSnapshot
+                );
+
+            break;
+        }
+
+        currentSnapshot =
+            std::move(
+                afterSnapshot
+            );
+    }
+
+    const unsigned long long finalPosition =
+        currentSnapshot.valid
             ? FindOneBasedPosition(
-                  afterMove,
+                  currentSnapshot,
                   candidateIdentity
               )
             : 0;
 
     Wh_Log(
-        L"AUTOMATIC_MOVE_END "
-        L"move=%llu "
-        L"thread=%lu "
+        L"DYNAMIC_END_COMPLETE "
+        L"visibleAddCall=%llu "
         L"id=%llu "
-        L"afterSnapshotValid=%d "
-        L"afterStatus=%ld "
-        L"afterPosition=%llu "
-        L"orderChanged=%d",
-        moveNumber,
-        GetCurrentThreadId(),
+        L"completedSteps=%u "
+        L"reachedEnd=%d "
+        L"finalSnapshotValid=%d "
+        L"finalStatus=%ld "
+        L"finalPosition=%llu "
+        L"finalCount=%llu",
+        visibleAddCall,
         static_cast<unsigned long long>(
             candidateIdentity
         ),
-        afterMove.valid
+        completedSteps,
+        reachedEnd
             ? 1
             : 0,
-        afterMove.status,
-        afterPosition,
-        beforeMove.valid &&
-                afterMove.valid &&
-                beforeMove.entries !=
-                    afterMove.entries
+        currentSnapshot.valid
             ? 1
-            : 0
+            : 0,
+        currentSnapshot.status,
+        finalPosition,
+        static_cast<unsigned long long>(
+            currentSnapshot.entries.size()
+        )
     );
 
     reinterpret_cast<IUnknown*>(
@@ -840,7 +976,7 @@ NotificationAreaIconManager_AddVisible_Hook(
         return;
     }
 
-    TryAutomaticMove(
+    TryDynamicEndMove(
         pThis,
         iconImplementation,
         callNumber
@@ -890,7 +1026,7 @@ bool HookTaskbarSymbols(
     }
 
     Wh_Log(
-        L"One-shot automatic-move hook installed"
+        L"Dynamic end-move hook installed"
     );
 
     return true;
@@ -901,7 +1037,7 @@ bool HookTaskbarSymbols(
 BOOL Wh_ModInit() {
     Wh_Log(
         L"Tray Add Path Analyzer "
-        L"0.4.0 initializing"
+        L"0.5.0 initializing"
     );
 
     HMODULE taskbarModule =
@@ -957,12 +1093,12 @@ void Wh_ModUninit() {
     Wh_Log(
         L"Tray Add Path Analyzer stopped; "
         L"visibleAddCalls=%llu "
-        L"automaticMoves=%llu "
+        L"moveSteps=%llu "
         L"testConsumed=%d",
         g_visibleAddCallCount.load(
             std::memory_order_relaxed
         ),
-        g_automaticMoveCount.load(
+        g_moveStepCount.load(
             std::memory_order_relaxed
         ),
         g_testConsumed.load(
