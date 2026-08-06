@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              tray-add-path-analyzer
 // @name            Tray Add Path Analyzer
-// @description     Tests tray GUID identity reuse across executable path changes.
-// @version         0.9.0
+// @description     Tests UID-based tray identity behavior across executable path changes.
+// @version         0.10.0
 // @author          Yusseter
 // @github          https://github.com/Yusseter
 // @homepage        https://github.com/Yusseter/tray-order-lock
@@ -18,22 +18,27 @@
 
 A temporary read-only diagnostic mod.
 
-Version 0.9.0 runs the same tray application binary from two different
-directories while both copies use the same generated tray icon GUID.
+Version 0.10.0 runs the same UID-based tray application binary from two
+different directories.
+
+Both copies use:
+
+- The same executable file name.
+- The same fixed notification icon UID.
+- No notification icon GUID.
 
 The analyzer:
 
-- Captures UIOrderList before and after AddIcon.
-- Detects whether the second executable path reuses the first registry identity
-  or creates a new one.
-- Records GetUIOrderForIcon calls for the involved identities.
-- Hooks IsAttemptedGuidHijack and records whether Windows rejects the same GUID
-  from the changed executable path.
-- Performs no MoveIcon operation and does not intentionally change tray order.
+- Captures UIOrderList before and after every AddIcon call.
+- Detects the registry identity created for the first executable path.
+- Checks whether the second executable path reuses the first identity or
+  creates another identity.
+- Records GetUIOrderForIcon calls for the involved registry identities.
+- Performs no MoveIcon operation and does not intentionally modify tray order.
 
 The dedicated test executable is:
 
-TrayGuidIdentityProbeV090.exe
+TrayUidIdentityProbeV100.exe
 */
 // ==/WindhawkModReadme==
 
@@ -60,7 +65,7 @@ constexpr wchar_t kUIOrderListValueName[] =
     L"UIOrderList";
 
 constexpr wchar_t kTargetExecutableName[] =
-    L"trayguididentityprobev090.exe";
+    L"trayuididentityprobev100.exe";
 
 using NotificationAreaIconManager_AddIcon_t =
     void(__cdecl*)(
@@ -80,13 +85,6 @@ using NotifyIconSettingsDatabase_GetUIOrderForIcon_t =
         std::uint64_t identity
     );
 
-using NotifyIconSettingsDatabase_IsAttemptedGuidHijack_t =
-    bool(__cdecl*)(
-        void* pThis,
-        const GUID& guid,
-        const wchar_t* executablePath
-    );
-
 NotificationAreaIconManager_AddIcon_t
     NotificationAreaIconManager_AddIcon_Original =
         nullptr;
@@ -99,10 +97,6 @@ NotifyIconSettingsDatabase_GetUIOrderForIcon_t
     NotifyIconSettingsDatabase_GetUIOrderForIcon_Original =
         nullptr;
 
-NotifyIconSettingsDatabase_IsAttemptedGuidHijack_t
-    NotifyIconSettingsDatabase_IsAttemptedGuidHijack_Original =
-        nullptr;
-
 std::atomic<unsigned long long> g_addIconCalls =
     0;
 
@@ -110,9 +104,6 @@ std::atomic<unsigned long long> g_visibleAddCalls =
     0;
 
 std::atomic<unsigned long long> g_orderQueries =
-    0;
-
-std::atomic<unsigned long long> g_guidHijackChecks =
     0;
 
 std::atomic<unsigned long long> g_targetResults =
@@ -139,15 +130,6 @@ struct OrderQueryObservation {
         0;
 };
 
-struct GuidHijackObservation {
-    GUID guid{};
-
-    std::wstring executablePath;
-
-    bool blocked =
-        false;
-};
-
 struct AddIconContext {
     bool active =
         false;
@@ -164,8 +146,6 @@ struct AddIconContext {
     UIOrderSnapshot before;
 
     std::vector<OrderQueryObservation> orderQueries;
-
-    std::vector<GuidHijackObservation> guidHijackChecks;
 
     std::vector<void*> visibleImplementations;
 };
@@ -525,52 +505,6 @@ unsigned int CountObservedIdentity(
     return count;
 }
 
-void LogGuid(
-    const wchar_t* label,
-    const GUID& guid
-) {
-    Wh_Log(
-        L"%s "
-        L"guid={%08X-%04X-%04X-"
-        L"%02X%02X-"
-        L"%02X%02X%02X%02X%02X%02X}",
-        label,
-        static_cast<unsigned int>(
-            guid.Data1
-        ),
-        static_cast<unsigned int>(
-            guid.Data2
-        ),
-        static_cast<unsigned int>(
-            guid.Data3
-        ),
-        static_cast<unsigned int>(
-            guid.Data4[0]
-        ),
-        static_cast<unsigned int>(
-            guid.Data4[1]
-        ),
-        static_cast<unsigned int>(
-            guid.Data4[2]
-        ),
-        static_cast<unsigned int>(
-            guid.Data4[3]
-        ),
-        static_cast<unsigned int>(
-            guid.Data4[4]
-        ),
-        static_cast<unsigned int>(
-            guid.Data4[5]
-        ),
-        static_cast<unsigned int>(
-            guid.Data4[6]
-        ),
-        static_cast<unsigned int>(
-            guid.Data4[7]
-        )
-    );
-}
-
 void LogIdentitySet(
     const wchar_t* label,
     unsigned long long addCall,
@@ -723,6 +657,16 @@ void AnalyzeCompletedAddIcon(
             std::memory_order_acq_rel
         );
     } else if (
+        !targetBefore.empty() &&
+        targetAdded.size() ==
+            1
+    ) {
+        selectedIdentity =
+            targetAdded.front();
+
+        resultKind =
+            L"changed-path-created-new-identity";
+    } else if (
         targetAdded.empty() &&
         targetBefore.size() ==
             1 &&
@@ -736,16 +680,6 @@ void AnalyzeCompletedAddIcon(
 
         resultKind =
             L"changed-path-reused-identity";
-    } else if (
-        !targetBefore.empty() &&
-        targetAdded.size() ==
-            1
-    ) {
-        selectedIdentity =
-            targetAdded.front();
-
-        resultKind =
-            L"changed-path-created-new-identity";
     } else if (
         !targetBefore.empty() ||
         !targetAfter.empty() ||
@@ -766,6 +700,13 @@ void AnalyzeCompletedAddIcon(
         selectedIdentity ==
             firstTargetIdentity;
 
+    const bool firstIdentityStillPresent =
+        firstTargetIdentity != 0 &&
+        ContainsIdentity(
+            targetAfter,
+            firstTargetIdentity
+        );
+
     unsigned int matchingOrderQueries =
         0;
 
@@ -777,18 +718,6 @@ void AnalyzeCompletedAddIcon(
             );
     }
 
-    unsigned int blockedHijackChecks =
-        0;
-
-    for (
-        const GuidHijackObservation& observation :
-        context.guidHijackChecks
-    ) {
-        if (observation.blocked) {
-            blockedHijackChecks++;
-        }
-    }
-
     const unsigned long long resultNumber =
         g_targetResults.fetch_add(
             1,
@@ -797,18 +726,20 @@ void AnalyzeCompletedAddIcon(
         1;
 
     Wh_Log(
-        L"GUID_PATH_RESULT "
+        L"UID_PATH_RESULT "
         L"result=%llu "
         L"addCall=%llu "
         L"kind=\"%s\" "
         L"selectedIdentity=%llu "
         L"firstTargetIdentity=%llu "
         L"matchesFirstIdentity=%d "
+        L"firstIdentityStillPresent=%d "
         L"matchingOrderQueries=%u "
         L"totalOrderQueries=%llu "
-        L"guidHijackChecks=%llu "
-        L"blockedHijackChecks=%u "
         L"visibleImplementations=%llu "
+        L"targetBeforeCount=%llu "
+        L"targetAfterCount=%llu "
+        L"targetAddedCount=%llu "
         L"beforeCount=%llu "
         L"afterCount=%llu "
         L"beforePosition=%llu "
@@ -825,16 +756,24 @@ void AnalyzeCompletedAddIcon(
         matchesFirstIdentity
             ? 1
             : 0,
+        firstIdentityStillPresent
+            ? 1
+            : 0,
         matchingOrderQueries,
         static_cast<unsigned long long>(
             context.orderQueries.size()
         ),
         static_cast<unsigned long long>(
-            context.guidHijackChecks.size()
-        ),
-        blockedHijackChecks,
-        static_cast<unsigned long long>(
             context.visibleImplementations.size()
+        ),
+        static_cast<unsigned long long>(
+            targetBefore.size()
+        ),
+        static_cast<unsigned long long>(
+            targetAfter.size()
+        ),
+        static_cast<unsigned long long>(
+            targetAdded.size()
         ),
         static_cast<unsigned long long>(
             context.before.entries.size()
@@ -909,81 +848,6 @@ NotifyIconSettingsDatabase_GetUIOrderForIcon_Hook(
     );
 
     return returnedOrder;
-}
-
-bool __cdecl
-NotifyIconSettingsDatabase_IsAttemptedGuidHijack_Hook(
-    void* pThis,
-    const GUID& guid,
-    const wchar_t* executablePath
-) {
-    const unsigned long long checkNumber =
-        g_guidHijackChecks.fetch_add(
-            1,
-            std::memory_order_relaxed
-        ) +
-        1;
-
-    const bool blocked =
-        NotifyIconSettingsDatabase_IsAttemptedGuidHijack_Original(
-            pThis,
-            guid,
-            executablePath
-        );
-
-    if (g_addIconContext.active) {
-        GuidHijackObservation observation;
-
-        observation.guid =
-            guid;
-
-        observation.executablePath =
-            executablePath
-                ? executablePath
-                : L"";
-
-        observation.blocked =
-            blocked;
-
-        g_addIconContext.guidHijackChecks.push_back(
-            std::move(
-                observation
-            )
-        );
-    }
-
-    Wh_Log(
-        L"GUID_HIJACK_CHECK "
-        L"check=%llu "
-        L"thread=%lu "
-        L"database=%p "
-        L"path=\"%s\" "
-        L"blocked=%d "
-        L"duringAddIcon=%d "
-        L"parentAddCall=%llu",
-        checkNumber,
-        GetCurrentThreadId(),
-        pThis,
-        executablePath
-            ? executablePath
-            : L"",
-        blocked
-            ? 1
-            : 0,
-        g_addIconContext.active
-            ? 1
-            : 0,
-        g_addIconContext.active
-            ? g_addIconContext.callNumber
-            : 0
-    );
-
-    LogGuid(
-        L"GUID_HIJACK_CHECK_ID",
-        guid
-    );
-
-    return blocked;
 }
 
 void __cdecl
@@ -1133,7 +997,6 @@ NotificationAreaIconManager_AddIcon_Hook(
         L"afterStatus=%ld "
         L"afterCount=%llu "
         L"orderQueries=%llu "
-        L"guidHijackChecks=%llu "
         L"visibleImplementations=%llu",
         callNumber,
         GetCurrentThreadId(),
@@ -1147,9 +1010,6 @@ NotificationAreaIconManager_AddIcon_Hook(
         ),
         static_cast<unsigned long long>(
             g_addIconContext.orderQueries.size()
-        ),
-        static_cast<unsigned long long>(
-            g_addIconContext.guidHijackChecks.size()
         ),
         static_cast<unsigned long long>(
             g_addIconContext.visibleImplementations.size()
@@ -1202,13 +1062,6 @@ bool HookTaskbarSymbols(
             &NotifyIconSettingsDatabase_GetUIOrderForIcon_Original,
             NotifyIconSettingsDatabase_GetUIOrderForIcon_Hook,
         },
-        {
-            {
-                LR"(public: bool __cdecl NotifyIconSettingsDatabase::IsAttemptedGuidHijack(struct winrt::guid const &,unsigned short const *))"
-            },
-            &NotifyIconSettingsDatabase_IsAttemptedGuidHijack_Original,
-            NotifyIconSettingsDatabase_IsAttemptedGuidHijack_Hook,
-        },
     };
 
     if (
@@ -1229,7 +1082,7 @@ bool HookTaskbarSymbols(
     }
 
     Wh_Log(
-        L"GUID path identity hooks installed"
+        L"UID path identity hooks installed"
     );
 
     return true;
@@ -1240,7 +1093,7 @@ bool HookTaskbarSymbols(
 BOOL Wh_ModInit() {
     Wh_Log(
         L"Tray Add Path Analyzer "
-        L"0.9.0 initializing"
+        L"0.10.0 initializing"
     );
 
     HMODULE taskbarModule =
@@ -1290,7 +1143,6 @@ void Wh_ModUninit() {
         L"addIconCalls=%llu "
         L"visibleAddCalls=%llu "
         L"orderQueries=%llu "
-        L"guidHijackChecks=%llu "
         L"targetResults=%llu "
         L"firstTargetIdentity=%llu",
         g_addIconCalls.load(
@@ -1300,9 +1152,6 @@ void Wh_ModUninit() {
             std::memory_order_relaxed
         ),
         g_orderQueries.load(
-            std::memory_order_relaxed
-        ),
-        g_guidHijackChecks.load(
             std::memory_order_relaxed
         ),
         g_targetResults.load(
