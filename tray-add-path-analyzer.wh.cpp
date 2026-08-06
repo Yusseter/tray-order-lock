@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              tray-add-path-analyzer
 // @name            Tray Add Path Analyzer
-// @description     Tests UID-based tray identity behavior across executable path changes.
-// @version         0.10.0
+// @description     Audits candidate logical identities for packaged tray icons.
+// @version         0.11.0
 // @author          Yusseter
 // @github          https://github.com/Yusseter
 // @homepage        https://github.com/Yusseter/tray-order-lock
@@ -18,27 +18,28 @@
 
 A temporary read-only diagnostic mod.
 
-Version 0.10.0 runs the same UID-based tray application binary from two
-different directories.
+Version 0.11.0 audits existing notification-area registry records whose
+ExecutablePath is located under WindowsApps.
 
-Both copies use:
+For each packaged record, it derives a candidate logical identity from:
 
-- The same executable file name.
-- The same fixed notification icon UID.
-- No notification icon GUID.
+- Package family name.
+- Executable path relative to the package directory.
+- IconGuid when present, otherwise UID.
 
-The analyzer:
+Package full names contain version, architecture, and resource information.
+The candidate key intentionally excludes those changing fields while retaining
+the stable package name and publisher ID.
 
-- Captures UIOrderList before and after every AddIcon call.
-- Detects the registry identity created for the first executable path.
-- Checks whether the second executable path reuses the first identity or
-  creates another identity.
-- Records GetUIOrderForIcon calls for the involved registry identities.
-- Performs no MoveIcon operation and does not intentionally modify tray order.
+The analyzer reports only duplicate candidate groups, allowing records from
+different installed package versions to be compared.
 
-The dedicated test executable is:
+This version:
 
-TrayUidIdentityProbeV100.exe
+- Installs no taskbar hooks.
+- Calls no MoveIcon function.
+- Writes nothing to the registry.
+- Does not change tray order.
 */
 // ==/WindhawkModReadme==
 
@@ -49,11 +50,10 @@ TrayUidIdentityProbeV100.exe
 #include <atomic>
 #include <cstdint>
 #include <cstring>
-#include <cwchar>
 #include <cwctype>
-#include <iterator>
+#include <map>
+#include <set>
 #include <string>
-#include <utility>
 #include <vector>
 
 namespace {
@@ -64,53 +64,11 @@ constexpr wchar_t kNotifyIconSettingsPath[] =
 constexpr wchar_t kUIOrderListValueName[] =
     L"UIOrderList";
 
-constexpr wchar_t kTargetExecutableName[] =
-    L"trayuididentityprobev100.exe";
+constexpr wchar_t kWindowsAppsMarker[] =
+    L"\\windowsapps\\";
 
-using NotificationAreaIconManager_AddIcon_t =
-    void(__cdecl*)(
-        void* pThis,
-        void* trayNotifyData
-    );
-
-using NotificationAreaIconManager_AddVisible_t =
-    void(__cdecl*)(
-        void* pThis,
-        void* iconImplementation
-    );
-
-using NotifyIconSettingsDatabase_GetUIOrderForIcon_t =
-    unsigned int(__cdecl*)(
-        void* pThis,
-        std::uint64_t identity
-    );
-
-NotificationAreaIconManager_AddIcon_t
-    NotificationAreaIconManager_AddIcon_Original =
-        nullptr;
-
-NotificationAreaIconManager_AddVisible_t
-    NotificationAreaIconManager_AddVisible_Original =
-        nullptr;
-
-NotifyIconSettingsDatabase_GetUIOrderForIcon_t
-    NotifyIconSettingsDatabase_GetUIOrderForIcon_Original =
-        nullptr;
-
-std::atomic<unsigned long long> g_addIconCalls =
-    0;
-
-std::atomic<unsigned long long> g_visibleAddCalls =
-    0;
-
-std::atomic<unsigned long long> g_orderQueries =
-    0;
-
-std::atomic<unsigned long long> g_targetResults =
-    0;
-
-std::atomic<std::uint64_t> g_firstTargetIdentity =
-    0;
+std::atomic<bool> g_auditCompleted =
+    false;
 
 struct UIOrderSnapshot {
     bool valid =
@@ -122,35 +80,329 @@ struct UIOrderSnapshot {
     std::vector<std::uint64_t> entries;
 };
 
-struct OrderQueryObservation {
+struct PackagePathInfo {
+    bool valid =
+        false;
+
+    std::wstring packageFullName;
+    std::wstring packageName;
+    std::wstring packageVersion;
+    std::wstring architecture;
+    std::wstring resourceId;
+    std::wstring publisherId;
+    std::wstring packageFamilyName;
+    std::wstring relativeExecutablePath;
+};
+
+struct RegistryRecord {
     std::uint64_t identity =
         0;
 
-    unsigned int returnedOrder =
+    unsigned long long oneBasedPosition =
         0;
-};
 
-struct AddIconContext {
-    bool active =
+    std::wstring executablePath;
+    std::wstring publisher;
+    std::wstring initialTooltip;
+
+    bool uidValid =
         false;
 
-    unsigned long long callNumber =
+    DWORD uid =
         0;
 
-    void* manager =
-        nullptr;
+    bool iconGuidValid =
+        false;
 
-    void* trayNotifyData =
-        nullptr;
+    GUID iconGuid{};
 
-    UIOrderSnapshot before;
-
-    std::vector<OrderQueryObservation> orderQueries;
-
-    std::vector<void*> visibleImplementations;
+    PackagePathInfo package;
+    std::wstring discriminator;
+    std::wstring logicalKey;
 };
 
-thread_local AddIconContext g_addIconContext;
+std::wstring ToLower(
+    std::wstring value
+) {
+    std::transform(
+        value.begin(),
+        value.end(),
+        value.begin(),
+        [](
+            wchar_t character
+        ) {
+            return
+                static_cast<wchar_t>(
+                    std::towlower(
+                        character
+                    )
+                );
+        }
+    );
+
+    return value;
+}
+
+std::wstring NormalizePath(
+    std::wstring path
+) {
+    std::replace(
+        path.begin(),
+        path.end(),
+        L'/',
+        L'\\'
+    );
+
+    constexpr wchar_t kExtendedPrefix[] =
+        L"\\\\?\\";
+
+    if (
+        path.size() >=
+            4 &&
+        path.compare(
+            0,
+            4,
+            kExtendedPrefix
+        ) ==
+            0
+    ) {
+        path.erase(
+            0,
+            4
+        );
+    }
+
+    return path;
+}
+
+std::wstring MakeTrayEntrySubkey(
+    std::uint64_t identity
+) {
+    return
+        std::wstring(
+            kNotifyIconSettingsPath
+        ) +
+        L"\\" +
+        std::to_wstring(
+            identity
+        );
+}
+
+std::wstring QueryStringValue(
+    const std::wstring& subkey,
+    const wchar_t* valueName
+) {
+    DWORD registryType =
+        REG_NONE;
+
+    DWORD requiredBytes =
+        0;
+
+    LONG status =
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            subkey.c_str(),
+            valueName,
+            RRF_RT_REG_SZ |
+                RRF_RT_REG_EXPAND_SZ,
+            &registryType,
+            nullptr,
+            &requiredBytes
+        );
+
+    if (
+        status != ERROR_SUCCESS ||
+        requiredBytes == 0
+    ) {
+        return L"";
+    }
+
+    std::vector<wchar_t> buffer(
+        requiredBytes /
+            sizeof(wchar_t) +
+        1,
+        L'\0'
+    );
+
+    DWORD actualBytes =
+        requiredBytes;
+
+    status =
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            subkey.c_str(),
+            valueName,
+            RRF_RT_REG_SZ |
+                RRF_RT_REG_EXPAND_SZ,
+            &registryType,
+            buffer.data(),
+            &actualBytes
+        );
+
+    if (status != ERROR_SUCCESS) {
+        return L"";
+    }
+
+    buffer.back() =
+        L'\0';
+
+    return
+        std::wstring(
+            buffer.data()
+        );
+}
+
+bool QueryDwordValue(
+    const std::wstring& subkey,
+    const wchar_t* valueName,
+    DWORD* value
+) {
+    if (!value) {
+        return false;
+    }
+
+    DWORD registryType =
+        REG_NONE;
+
+    DWORD result =
+        0;
+
+    DWORD resultBytes =
+        sizeof(result);
+
+    const LONG status =
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            subkey.c_str(),
+            valueName,
+            RRF_RT_REG_DWORD,
+            &registryType,
+            &result,
+            &resultBytes
+        );
+
+    if (
+        status != ERROR_SUCCESS ||
+        resultBytes !=
+            sizeof(result)
+    ) {
+        return false;
+    }
+
+    *value =
+        result;
+
+    return true;
+}
+
+bool QueryGuidValue(
+    const std::wstring& subkey,
+    const wchar_t* valueName,
+    GUID* value
+) {
+    if (!value) {
+        return false;
+    }
+
+    DWORD registryType =
+        REG_NONE;
+
+    GUID result{};
+
+    DWORD resultBytes =
+        sizeof(result);
+
+    const LONG status =
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            subkey.c_str(),
+            valueName,
+            RRF_RT_REG_BINARY,
+            &registryType,
+            &result,
+            &resultBytes
+        );
+
+    if (
+        status != ERROR_SUCCESS ||
+        resultBytes !=
+            sizeof(result)
+    ) {
+        return false;
+    }
+
+    *value =
+        result;
+
+    return true;
+}
+
+bool IsZeroGuid(
+    const GUID& value
+) {
+    const GUID zero{};
+
+    return
+        std::memcmp(
+            &value,
+            &zero,
+            sizeof(GUID)
+        ) ==
+        0;
+}
+
+std::wstring FormatGuid(
+    const GUID& guid
+) {
+    wchar_t buffer[
+        64
+    ]{};
+
+    swprintf_s(
+        buffer,
+        L"{%08X-%04X-%04X-"
+        L"%02X%02X-"
+        L"%02X%02X%02X%02X%02X%02X}",
+        static_cast<unsigned int>(
+            guid.Data1
+        ),
+        static_cast<unsigned int>(
+            guid.Data2
+        ),
+        static_cast<unsigned int>(
+            guid.Data3
+        ),
+        static_cast<unsigned int>(
+            guid.Data4[0]
+        ),
+        static_cast<unsigned int>(
+            guid.Data4[1]
+        ),
+        static_cast<unsigned int>(
+            guid.Data4[2]
+        ),
+        static_cast<unsigned int>(
+            guid.Data4[3]
+        ),
+        static_cast<unsigned int>(
+            guid.Data4[4]
+        ),
+        static_cast<unsigned int>(
+            guid.Data4[5]
+        ),
+        static_cast<unsigned int>(
+            guid.Data4[6]
+        ),
+        static_cast<unsigned int>(
+            guid.Data4[7]
+        )
+    );
+
+    return
+        std::wstring(
+            buffer
+        );
+}
 
 UIOrderSnapshot CaptureUIOrderSnapshot() {
     UIOrderSnapshot snapshot;
@@ -251,841 +503,680 @@ UIOrderSnapshot CaptureUIOrderSnapshot() {
     return snapshot;
 }
 
-std::wstring MakeTrayEntrySubkey(
-    std::uint64_t identity
+bool ParsePackageFullName(
+    const std::wstring& packageFullName,
+    PackagePathInfo* package
 ) {
-    return
-        std::wstring(
-            kNotifyIconSettingsPath
-        ) +
-        L"\\" +
-        std::to_wstring(
-            identity
-        );
-}
+    if (!package) {
+        return false;
+    }
 
-std::wstring QueryStringValue(
-    const std::wstring& subkey,
-    const wchar_t* valueName
-) {
-    DWORD registryType =
-        REG_NONE;
-
-    DWORD requiredBytes =
-        0;
-
-    LONG status =
-        RegGetValueW(
-            HKEY_CURRENT_USER,
-            subkey.c_str(),
-            valueName,
-            RRF_RT_REG_SZ |
-                RRF_RT_REG_EXPAND_SZ,
-            &registryType,
-            nullptr,
-            &requiredBytes
+    const std::size_t separator4 =
+        packageFullName.rfind(
+            L'_'
         );
 
     if (
-        status != ERROR_SUCCESS ||
-        requiredBytes == 0
-    ) {
-        return L"";
-    }
-
-    std::vector<wchar_t> buffer(
-        requiredBytes /
-            sizeof(wchar_t) +
-        1
-    );
-
-    DWORD actualBytes =
-        requiredBytes;
-
-    status =
-        RegGetValueW(
-            HKEY_CURRENT_USER,
-            subkey.c_str(),
-            valueName,
-            RRF_RT_REG_SZ |
-                RRF_RT_REG_EXPAND_SZ,
-            &registryType,
-            buffer.data(),
-            &actualBytes
-        );
-
-    if (status != ERROR_SUCCESS) {
-        return L"";
-    }
-
-    buffer.back() =
-        L'\0';
-
-    return
-        std::wstring(
-            buffer.data()
-        );
-}
-
-bool EndsWithOrdinalIgnoreCase(
-    const std::wstring& value,
-    const std::wstring& suffix
-) {
-    if (
-        value.size() <
-        suffix.size()
+        separator4 ==
+            std::wstring::npos ||
+        separator4 ==
+            0 ||
+        separator4 +
+            1 >=
+            packageFullName.size()
     ) {
         return false;
     }
 
-    const std::size_t offset =
-        value.size() -
-        suffix.size();
+    const std::size_t separator3 =
+        packageFullName.rfind(
+            L'_',
+            separator4 -
+                1
+        );
 
-    for (
-        std::size_t index = 0;
-        index < suffix.size();
-        index++
+    if (
+        separator3 ==
+        std::wstring::npos
     ) {
-        const wchar_t left =
-            static_cast<wchar_t>(
-                std::towlower(
-                    value[
-                        offset +
-                        index
-                    ]
-                )
-            );
-
-        const wchar_t right =
-            static_cast<wchar_t>(
-                std::towlower(
-                    suffix[index]
-                )
-            );
-
-        if (left != right) {
-            return false;
-        }
+        return false;
     }
+
+    const std::size_t separator2 =
+        packageFullName.rfind(
+            L'_',
+            separator3 -
+                1
+        );
+
+    if (
+        separator2 ==
+        std::wstring::npos
+    ) {
+        return false;
+    }
+
+    const std::size_t separator1 =
+        packageFullName.rfind(
+            L'_',
+            separator2 -
+                1
+        );
+
+    if (
+        separator1 ==
+            std::wstring::npos ||
+        separator1 ==
+            0
+    ) {
+        return false;
+    }
+
+    package->packageName =
+        packageFullName.substr(
+            0,
+            separator1
+        );
+
+    package->packageVersion =
+        packageFullName.substr(
+            separator1 +
+                1,
+            separator2 -
+                separator1 -
+                1
+        );
+
+    package->architecture =
+        packageFullName.substr(
+            separator2 +
+                1,
+            separator3 -
+                separator2 -
+                1
+        );
+
+    package->resourceId =
+        packageFullName.substr(
+            separator3 +
+                1,
+            separator4 -
+                separator3 -
+                1
+        );
+
+    package->publisherId =
+        packageFullName.substr(
+            separator4 +
+                1
+        );
+
+    if (
+        package->packageName.empty() ||
+        package->packageVersion.empty() ||
+        package->architecture.empty() ||
+        package->publisherId.empty()
+    ) {
+        return false;
+    }
+
+    package->packageFamilyName =
+        package->packageName +
+        L"_" +
+        package->publisherId;
 
     return true;
 }
 
-std::vector<std::uint64_t> FindAddedIdentities(
-    const UIOrderSnapshot& before,
-    const UIOrderSnapshot& after
+bool ExtractPackagePathInfo(
+    const std::wstring& executablePath,
+    PackagePathInfo* package
 ) {
-    std::vector<std::uint64_t> added;
-
-    if (
-        !before.valid ||
-        !after.valid
-    ) {
-        return added;
+    if (!package) {
+        return false;
     }
 
-    for (
-        std::uint64_t identity :
-        after.entries
-    ) {
-        if (
-            std::find(
-                before.entries.begin(),
-                before.entries.end(),
-                identity
-            ) ==
-            before.entries.end()
-        ) {
-            added.push_back(
-                identity
-            );
-        }
-    }
+    *package =
+        {};
 
-    return added;
-}
+    const std::wstring normalizedPath =
+        NormalizePath(
+            executablePath
+        );
 
-std::vector<std::uint64_t> FindTargetIdentities(
-    const UIOrderSnapshot& snapshot
-) {
-    std::vector<std::uint64_t> matches;
+    const std::wstring lowerPath =
+        ToLower(
+            normalizedPath
+        );
 
-    if (!snapshot.valid) {
-        return matches;
-    }
-
-    for (
-        std::uint64_t identity :
-        snapshot.entries
-    ) {
-        const std::wstring executablePath =
-            QueryStringValue(
-                MakeTrayEntrySubkey(
-                    identity
-                ),
-                L"ExecutablePath"
-            );
-
-        if (
-            EndsWithOrdinalIgnoreCase(
-                executablePath,
-                kTargetExecutableName
-            )
-        ) {
-            matches.push_back(
-                identity
-            );
-        }
-    }
-
-    return matches;
-}
-
-bool ContainsIdentity(
-    const std::vector<std::uint64_t>& identities,
-    std::uint64_t identity
-) {
-    return
-        std::find(
-            identities.begin(),
-            identities.end(),
-            identity
-        ) !=
-        identities.end();
-}
-
-unsigned long long FindOneBasedPosition(
-    const UIOrderSnapshot& snapshot,
-    std::uint64_t identity
-) {
-    const auto iterator =
-        std::find(
-            snapshot.entries.begin(),
-            snapshot.entries.end(),
-            identity
+    const std::size_t markerPosition =
+        lowerPath.find(
+            kWindowsAppsMarker
         );
 
     if (
-        iterator ==
-        snapshot.entries.end()
+        markerPosition ==
+        std::wstring::npos
     ) {
-        return 0;
+        return false;
+    }
+
+    const std::size_t packageStart =
+        markerPosition +
+        std::wcslen(
+            kWindowsAppsMarker
+        );
+
+    const std::size_t packageEnd =
+        normalizedPath.find(
+            L'\\',
+            packageStart
+        );
+
+    if (
+        packageEnd ==
+            std::wstring::npos ||
+        packageEnd ==
+            packageStart ||
+        packageEnd +
+            1 >=
+            normalizedPath.size()
+    ) {
+        return false;
+    }
+
+    package->packageFullName =
+        normalizedPath.substr(
+            packageStart,
+            packageEnd -
+                packageStart
+        );
+
+    package->relativeExecutablePath =
+        normalizedPath.substr(
+            packageEnd +
+                1
+        );
+
+    if (
+        !ParsePackageFullName(
+            package->packageFullName,
+            package
+        )
+    ) {
+        return false;
+    }
+
+    package->valid =
+        true;
+
+    return true;
+}
+
+std::wstring BuildDiscriminator(
+    const RegistryRecord& record
+) {
+    if (
+        record.iconGuidValid &&
+        !IsZeroGuid(
+            record.iconGuid
+        )
+    ) {
+        return
+            L"guid:" +
+            ToLower(
+                FormatGuid(
+                    record.iconGuid
+                )
+            );
+    }
+
+    if (record.uidValid) {
+        return
+            L"uid:" +
+            std::to_wstring(
+                record.uid
+            );
+    }
+
+    return L"";
+}
+
+std::wstring BuildLogicalKey(
+    const RegistryRecord& record
+) {
+    if (
+        !record.package.valid ||
+        record.discriminator.empty()
+    ) {
+        return L"";
     }
 
     return
-        static_cast<unsigned long long>(
-            std::distance(
-                snapshot.entries.begin(),
-                iterator
+        ToLower(
+            record.package.packageFamilyName
+        ) +
+        L"|" +
+        ToLower(
+            NormalizePath(
+                record.package.relativeExecutablePath
             )
         ) +
-        1;
+        L"|" +
+        record.discriminator;
 }
 
-unsigned int CountObservedIdentity(
-    const std::vector<OrderQueryObservation>& observations,
-    std::uint64_t identity
+bool IsPrimaryShellProcess() {
+    const HWND shellWindow =
+        GetShellWindow();
+
+    if (!shellWindow) {
+        return false;
+    }
+
+    DWORD shellProcessId =
+        0;
+
+    GetWindowThreadProcessId(
+        shellWindow,
+        &shellProcessId
+    );
+
+    return
+        shellProcessId ==
+        GetCurrentProcessId();
+}
+
+RegistryRecord ReadRegistryRecord(
+    std::uint64_t identity,
+    unsigned long long oneBasedPosition
 ) {
-    unsigned int count =
+    RegistryRecord record;
+
+    record.identity =
+        identity;
+
+    record.oneBasedPosition =
+        oneBasedPosition;
+
+    const std::wstring subkey =
+        MakeTrayEntrySubkey(
+            identity
+        );
+
+    record.executablePath =
+        QueryStringValue(
+            subkey,
+            L"ExecutablePath"
+        );
+
+    record.publisher =
+        QueryStringValue(
+            subkey,
+            L"Publisher"
+        );
+
+    record.initialTooltip =
+        QueryStringValue(
+            subkey,
+            L"InitialTooltip"
+        );
+
+    record.uidValid =
+        QueryDwordValue(
+            subkey,
+            L"UID",
+            &record.uid
+        );
+
+    record.iconGuidValid =
+        QueryGuidValue(
+            subkey,
+            L"IconGuid",
+            &record.iconGuid
+        );
+
+    ExtractPackagePathInfo(
+        record.executablePath,
+        &record.package
+    );
+
+    record.discriminator =
+        BuildDiscriminator(
+            record
+        );
+
+    record.logicalKey =
+        BuildLogicalKey(
+            record
+        );
+
+    return record;
+}
+
+void RunPackageIdentityAudit() {
+    const UIOrderSnapshot snapshot =
+        CaptureUIOrderSnapshot();
+
+    if (!snapshot.valid) {
+        Wh_Log(
+            L"PACKAGE_IDENTITY_AUDIT_FAILED "
+            L"registryStatus=%ld",
+            snapshot.status
+        );
+
+        return;
+    }
+
+    std::map<
+        std::wstring,
+        std::vector<RegistryRecord>
+    > groups;
+
+    unsigned long long windowsAppsEntries =
+        0;
+
+    unsigned long long parsedPackageEntries =
+        0;
+
+    unsigned long long packageParseFailures =
+        0;
+
+    unsigned long long guidPackageEntries =
+        0;
+
+    unsigned long long uidPackageEntries =
+        0;
+
+    unsigned long long unkeyedPackageEntries =
         0;
 
     for (
-        const OrderQueryObservation& observation :
-        observations
-    ) {
-        if (
-            observation.identity ==
-            identity
-        ) {
-            count++;
-        }
-    }
-
-    return count;
-}
-
-void LogIdentitySet(
-    const wchar_t* label,
-    unsigned long long addCall,
-    const std::vector<std::uint64_t>& identities,
-    const UIOrderSnapshot& snapshot
-) {
-    Wh_Log(
-        L"%s "
-        L"addCall=%llu "
-        L"count=%llu",
-        label,
-        addCall,
-        static_cast<unsigned long long>(
-            identities.size()
-        )
-    );
-
-    for (
         std::size_t index = 0;
-        index < identities.size();
+        index < snapshot.entries.size();
         index++
     ) {
         const std::uint64_t identity =
-            identities[index];
+            snapshot.entries[index];
 
-        const std::wstring executablePath =
-            QueryStringValue(
-                MakeTrayEntrySubkey(
-                    identity
-                ),
-                L"ExecutablePath"
+        RegistryRecord record =
+            ReadRegistryRecord(
+                identity,
+                static_cast<unsigned long long>(
+                    index +
+                    1
+                )
             );
 
-        Wh_Log(
-            L"%s_ITEM "
-            L"addCall=%llu "
-            L"item=%llu "
-            L"id=%llu "
-            L"position=%llu "
-            L"path=\"%s\"",
-            label,
-            addCall,
-            static_cast<unsigned long long>(
-                index +
-                1
-            ),
-            static_cast<unsigned long long>(
-                identity
-            ),
-            snapshot.valid
-                ? FindOneBasedPosition(
-                      snapshot,
-                      identity
-                  )
-                : 0,
-            executablePath.c_str()
-        );
-    }
-}
+        const std::wstring normalizedPath =
+            NormalizePath(
+                record.executablePath
+            );
 
-void AnalyzeCompletedAddIcon(
-    const AddIconContext& context,
-    const UIOrderSnapshot& after
-) {
-    const std::vector<std::uint64_t> addedIdentities =
-        FindAddedIdentities(
-            context.before,
-            after
-        );
+        const std::wstring lowerPath =
+            ToLower(
+                normalizedPath
+            );
 
-    const std::vector<std::uint64_t> targetBefore =
-        FindTargetIdentities(
-            context.before
-        );
-
-    const std::vector<std::uint64_t> targetAfter =
-        FindTargetIdentities(
-            after
-        );
-
-    std::vector<std::uint64_t> targetAdded;
-
-    for (
-        std::uint64_t identity :
-        addedIdentities
-    ) {
         if (
-            ContainsIdentity(
-                targetAfter,
-                identity
+            lowerPath.find(
+                kWindowsAppsMarker
+            ) ==
+            std::wstring::npos
+        ) {
+            continue;
+        }
+
+        windowsAppsEntries++;
+
+        if (!record.package.valid) {
+            packageParseFailures++;
+
+            Wh_Log(
+                L"PACKAGE_PARSE_FAILURE "
+                L"id=%llu "
+                L"position=%llu "
+                L"path=\"%s\"",
+                static_cast<unsigned long long>(
+                    record.identity
+                ),
+                record.oneBasedPosition,
+                record.executablePath.c_str()
+            );
+
+            continue;
+        }
+
+        parsedPackageEntries++;
+
+        if (
+            record.iconGuidValid &&
+            !IsZeroGuid(
+                record.iconGuid
             )
         ) {
-            targetAdded.push_back(
-                identity
+            guidPackageEntries++;
+        } else if (record.uidValid) {
+            uidPackageEntries++;
+        }
+
+        if (record.logicalKey.empty()) {
+            unkeyedPackageEntries++;
+
+            Wh_Log(
+                L"PACKAGE_UNKEYED_RECORD "
+                L"id=%llu "
+                L"position=%llu "
+                L"packageFullName=\"%s\" "
+                L"relativePath=\"%s\" "
+                L"uidValid=%d "
+                L"uid=%u "
+                L"guidValid=%d "
+                L"guid=\"%s\"",
+                static_cast<unsigned long long>(
+                    record.identity
+                ),
+                record.oneBasedPosition,
+                record.package.packageFullName.c_str(),
+                record.package.relativeExecutablePath.c_str(),
+                record.uidValid
+                    ? 1
+                    : 0,
+                record.uid,
+                record.iconGuidValid
+                    ? 1
+                    : 0,
+                record.iconGuidValid
+                    ? FormatGuid(
+                          record.iconGuid
+                      ).c_str()
+                    : L""
+            );
+
+            continue;
+        }
+
+        groups[
+            record.logicalKey
+        ].push_back(
+            std::move(
+                record
+            )
+        );
+    }
+
+    unsigned long long logicalGroupCount =
+        0;
+
+    unsigned long long duplicateGroupCount =
+        0;
+
+    unsigned long long duplicateMemberCount =
+        0;
+
+    unsigned long long versionSpanningGroupCount =
+        0;
+
+    unsigned long long sameFullNameDuplicateGroupCount =
+        0;
+
+    for (
+        const auto& groupPair :
+        groups
+    ) {
+        logicalGroupCount++;
+
+        const std::wstring& logicalKey =
+            groupPair.first;
+
+        const std::vector<RegistryRecord>& members =
+            groupPair.second;
+
+        if (members.size() < 2) {
+            continue;
+        }
+
+        duplicateGroupCount++;
+
+        duplicateMemberCount +=
+            static_cast<unsigned long long>(
+                members.size()
+            );
+
+        std::set<std::wstring> packageFullNames;
+
+        for (
+            const RegistryRecord& member :
+            members
+        ) {
+            packageFullNames.insert(
+                ToLower(
+                    member.package.packageFullName
+                )
+            );
+        }
+
+        const bool spansVersions =
+            packageFullNames.size() >
+            1;
+
+        const bool sameFullNameDuplicate =
+            packageFullNames.size() <
+            members.size();
+
+        if (spansVersions) {
+            versionSpanningGroupCount++;
+        }
+
+        if (sameFullNameDuplicate) {
+            sameFullNameDuplicateGroupCount++;
+        }
+
+        Wh_Log(
+            L"PACKAGE_LOGICAL_GROUP "
+            L"group=%llu "
+            L"memberCount=%llu "
+            L"uniquePackageFullNames=%llu "
+            L"spansVersions=%d "
+            L"sameFullNameDuplicate=%d "
+            L"key=\"%s\"",
+            duplicateGroupCount,
+            static_cast<unsigned long long>(
+                members.size()
+            ),
+            static_cast<unsigned long long>(
+                packageFullNames.size()
+            ),
+            spansVersions
+                ? 1
+                : 0,
+            sameFullNameDuplicate
+                ? 1
+                : 0,
+            logicalKey.c_str()
+        );
+
+        for (
+            std::size_t memberIndex = 0;
+            memberIndex < members.size();
+            memberIndex++
+        ) {
+            const RegistryRecord& member =
+                members[memberIndex];
+
+            Wh_Log(
+                L"PACKAGE_LOGICAL_GROUP_MEMBER "
+                L"group=%llu "
+                L"member=%llu "
+                L"id=%llu "
+                L"position=%llu "
+                L"packageFamily=\"%s\" "
+                L"packageFullName=\"%s\" "
+                L"version=\"%s\" "
+                L"architecture=\"%s\" "
+                L"resourceId=\"%s\" "
+                L"relativePath=\"%s\" "
+                L"discriminator=\"%s\" "
+                L"publisher=\"%s\" "
+                L"tooltip=\"%s\" "
+                L"fullPath=\"%s\"",
+                duplicateGroupCount,
+                static_cast<unsigned long long>(
+                    memberIndex +
+                    1
+                ),
+                static_cast<unsigned long long>(
+                    member.identity
+                ),
+                member.oneBasedPosition,
+                member.package.packageFamilyName.c_str(),
+                member.package.packageFullName.c_str(),
+                member.package.packageVersion.c_str(),
+                member.package.architecture.c_str(),
+                member.package.resourceId.c_str(),
+                member.package.relativeExecutablePath.c_str(),
+                member.discriminator.c_str(),
+                member.publisher.c_str(),
+                member.initialTooltip.c_str(),
+                member.executablePath.c_str()
             );
         }
     }
 
-    LogIdentitySet(
-        L"ADDED_IDENTITIES",
-        context.callNumber,
-        addedIdentities,
-        after
-    );
-
-    LogIdentitySet(
-        L"TARGET_BEFORE",
-        context.callNumber,
-        targetBefore,
-        context.before
-    );
-
-    LogIdentitySet(
-        L"TARGET_AFTER",
-        context.callNumber,
-        targetAfter,
-        after
-    );
-
-    LogIdentitySet(
-        L"TARGET_ADDED",
-        context.callNumber,
-        targetAdded,
-        after
-    );
-
-    std::uint64_t selectedIdentity =
-        0;
-
-    const wchar_t* resultKind =
-        L"unrelated";
-
-    if (
-        targetBefore.empty() &&
-        targetAdded.size() ==
-            1
-    ) {
-        selectedIdentity =
-            targetAdded.front();
-
-        resultKind =
-            L"first-path-new-identity";
-
-        std::uint64_t expected =
-            0;
-
-        g_firstTargetIdentity.compare_exchange_strong(
-            expected,
-            selectedIdentity,
-            std::memory_order_acq_rel
-        );
-    } else if (
-        !targetBefore.empty() &&
-        targetAdded.size() ==
-            1
-    ) {
-        selectedIdentity =
-            targetAdded.front();
-
-        resultKind =
-            L"changed-path-created-new-identity";
-    } else if (
-        targetAdded.empty() &&
-        targetBefore.size() ==
-            1 &&
-        targetAfter.size() ==
-            1 &&
-        targetBefore.front() ==
-            targetAfter.front()
-    ) {
-        selectedIdentity =
-            targetAfter.front();
-
-        resultKind =
-            L"changed-path-reused-identity";
-    } else if (
-        !targetBefore.empty() ||
-        !targetAfter.empty() ||
-        !targetAdded.empty()
-    ) {
-        resultKind =
-            L"ambiguous";
-    }
-
-    const std::uint64_t firstTargetIdentity =
-        g_firstTargetIdentity.load(
-            std::memory_order_acquire
-        );
-
-    const bool matchesFirstIdentity =
-        selectedIdentity != 0 &&
-        firstTargetIdentity != 0 &&
-        selectedIdentity ==
-            firstTargetIdentity;
-
-    const bool firstIdentityStillPresent =
-        firstTargetIdentity != 0 &&
-        ContainsIdentity(
-            targetAfter,
-            firstTargetIdentity
-        );
-
-    unsigned int matchingOrderQueries =
-        0;
-
-    if (selectedIdentity != 0) {
-        matchingOrderQueries =
-            CountObservedIdentity(
-                context.orderQueries,
-                selectedIdentity
-            );
-    }
-
-    const unsigned long long resultNumber =
-        g_targetResults.fetch_add(
-            1,
-            std::memory_order_relaxed
-        ) +
-        1;
-
     Wh_Log(
-        L"UID_PATH_RESULT "
-        L"result=%llu "
-        L"addCall=%llu "
-        L"kind=\"%s\" "
-        L"selectedIdentity=%llu "
-        L"firstTargetIdentity=%llu "
-        L"matchesFirstIdentity=%d "
-        L"firstIdentityStillPresent=%d "
-        L"matchingOrderQueries=%u "
-        L"totalOrderQueries=%llu "
-        L"visibleImplementations=%llu "
-        L"targetBeforeCount=%llu "
-        L"targetAfterCount=%llu "
-        L"targetAddedCount=%llu "
-        L"beforeCount=%llu "
-        L"afterCount=%llu "
-        L"beforePosition=%llu "
-        L"afterPosition=%llu",
-        resultNumber,
-        context.callNumber,
-        resultKind,
+        L"PACKAGE_IDENTITY_AUDIT_SUMMARY "
+        L"uiOrderEntries=%llu "
+        L"windowsAppsEntries=%llu "
+        L"parsedPackageEntries=%llu "
+        L"packageParseFailures=%llu "
+        L"guidPackageEntries=%llu "
+        L"uidPackageEntries=%llu "
+        L"unkeyedPackageEntries=%llu "
+        L"logicalGroups=%llu "
+        L"duplicateGroups=%llu "
+        L"duplicateMembers=%llu "
+        L"versionSpanningGroups=%llu "
+        L"sameFullNameDuplicateGroups=%llu",
         static_cast<unsigned long long>(
-            selectedIdentity
+            snapshot.entries.size()
         ),
-        static_cast<unsigned long long>(
-            firstTargetIdentity
-        ),
-        matchesFirstIdentity
-            ? 1
-            : 0,
-        firstIdentityStillPresent
-            ? 1
-            : 0,
-        matchingOrderQueries,
-        static_cast<unsigned long long>(
-            context.orderQueries.size()
-        ),
-        static_cast<unsigned long long>(
-            context.visibleImplementations.size()
-        ),
-        static_cast<unsigned long long>(
-            targetBefore.size()
-        ),
-        static_cast<unsigned long long>(
-            targetAfter.size()
-        ),
-        static_cast<unsigned long long>(
-            targetAdded.size()
-        ),
-        static_cast<unsigned long long>(
-            context.before.entries.size()
-        ),
-        static_cast<unsigned long long>(
-            after.entries.size()
-        ),
-        selectedIdentity != 0
-            ? FindOneBasedPosition(
-                  context.before,
-                  selectedIdentity
-              )
-            : 0,
-        selectedIdentity != 0
-            ? FindOneBasedPosition(
-                  after,
-                  selectedIdentity
-              )
-            : 0
-    );
-}
-
-unsigned int __cdecl
-NotifyIconSettingsDatabase_GetUIOrderForIcon_Hook(
-    void* pThis,
-    std::uint64_t identity
-) {
-    const unsigned long long queryNumber =
-        g_orderQueries.fetch_add(
-            1,
-            std::memory_order_relaxed
-        ) +
-        1;
-
-    const unsigned int returnedOrder =
-        NotifyIconSettingsDatabase_GetUIOrderForIcon_Original(
-            pThis,
-            identity
-        );
-
-    if (g_addIconContext.active) {
-        g_addIconContext.orderQueries.push_back(
-            {
-                identity,
-                returnedOrder
-            }
-        );
-    }
-
-    Wh_Log(
-        L"UI_ORDER_QUERY "
-        L"query=%llu "
-        L"thread=%lu "
-        L"database=%p "
-        L"id=%llu "
-        L"returnedOrder=%u "
-        L"duringAddIcon=%d "
-        L"parentAddCall=%llu",
-        queryNumber,
-        GetCurrentThreadId(),
-        pThis,
-        static_cast<unsigned long long>(
-            identity
-        ),
-        returnedOrder,
-        g_addIconContext.active
-            ? 1
-            : 0,
-        g_addIconContext.active
-            ? g_addIconContext.callNumber
-            : 0
+        windowsAppsEntries,
+        parsedPackageEntries,
+        packageParseFailures,
+        guidPackageEntries,
+        uidPackageEntries,
+        unkeyedPackageEntries,
+        logicalGroupCount,
+        duplicateGroupCount,
+        duplicateMemberCount,
+        versionSpanningGroupCount,
+        sameFullNameDuplicateGroupCount
     );
 
-    return returnedOrder;
-}
-
-void __cdecl
-NotificationAreaIconManager_AddVisible_Hook(
-    void* pThis,
-    void* iconImplementation
-) {
-    const unsigned long long callNumber =
-        g_visibleAddCalls.fetch_add(
-            1,
-            std::memory_order_relaxed
-        ) +
-        1;
-
-    Wh_Log(
-        L"VISIBLE_ADD_BEGIN "
-        L"call=%llu "
-        L"thread=%lu "
-        L"manager=%p "
-        L"implementation=%p "
-        L"duringAddIcon=%d "
-        L"parentAddCall=%llu",
-        callNumber,
-        GetCurrentThreadId(),
-        pThis,
-        iconImplementation,
-        g_addIconContext.active
-            ? 1
-            : 0,
-        g_addIconContext.active
-            ? g_addIconContext.callNumber
-            : 0
+    g_auditCompleted.store(
+        true,
+        std::memory_order_release
     );
-
-    NotificationAreaIconManager_AddVisible_Original(
-        pThis,
-        iconImplementation
-    );
-
-    if (g_addIconContext.active) {
-        g_addIconContext.visibleImplementations.push_back(
-            iconImplementation
-        );
-    }
-
-    Wh_Log(
-        L"VISIBLE_ADD_END "
-        L"call=%llu "
-        L"thread=%lu "
-        L"manager=%p "
-        L"implementation=%p "
-        L"duringAddIcon=%d "
-        L"parentAddCall=%llu",
-        callNumber,
-        GetCurrentThreadId(),
-        pThis,
-        iconImplementation,
-        g_addIconContext.active
-            ? 1
-            : 0,
-        g_addIconContext.active
-            ? g_addIconContext.callNumber
-            : 0
-    );
-}
-
-void __cdecl
-NotificationAreaIconManager_AddIcon_Hook(
-    void* pThis,
-    void* trayNotifyData
-) {
-    const unsigned long long callNumber =
-        g_addIconCalls.fetch_add(
-            1,
-            std::memory_order_relaxed
-        ) +
-        1;
-
-    AddIconContext previousContext =
-        std::move(
-            g_addIconContext
-        );
-
-    g_addIconContext =
-        {};
-
-    g_addIconContext.active =
-        true;
-
-    g_addIconContext.callNumber =
-        callNumber;
-
-    g_addIconContext.manager =
-        pThis;
-
-    g_addIconContext.trayNotifyData =
-        trayNotifyData;
-
-    g_addIconContext.before =
-        CaptureUIOrderSnapshot();
-
-    const std::vector<std::uint64_t> targetBefore =
-        FindTargetIdentities(
-            g_addIconContext.before
-        );
-
-    Wh_Log(
-        L"ADD_ICON_BEGIN "
-        L"call=%llu "
-        L"thread=%lu "
-        L"manager=%p "
-        L"trayNotifyData=%p "
-        L"beforeValid=%d "
-        L"beforeStatus=%ld "
-        L"beforeCount=%llu "
-        L"targetBeforeCount=%llu",
-        callNumber,
-        GetCurrentThreadId(),
-        pThis,
-        trayNotifyData,
-        g_addIconContext.before.valid
-            ? 1
-            : 0,
-        g_addIconContext.before.status,
-        static_cast<unsigned long long>(
-            g_addIconContext.before.entries.size()
-        ),
-        static_cast<unsigned long long>(
-            targetBefore.size()
-        )
-    );
-
-    NotificationAreaIconManager_AddIcon_Original(
-        pThis,
-        trayNotifyData
-    );
-
-    const UIOrderSnapshot after =
-        CaptureUIOrderSnapshot();
-
-    Wh_Log(
-        L"ADD_ICON_ORIGINAL_RETURNED "
-        L"call=%llu "
-        L"thread=%lu "
-        L"manager=%p "
-        L"afterValid=%d "
-        L"afterStatus=%ld "
-        L"afterCount=%llu "
-        L"orderQueries=%llu "
-        L"visibleImplementations=%llu",
-        callNumber,
-        GetCurrentThreadId(),
-        pThis,
-        after.valid
-            ? 1
-            : 0,
-        after.status,
-        static_cast<unsigned long long>(
-            after.entries.size()
-        ),
-        static_cast<unsigned long long>(
-            g_addIconContext.orderQueries.size()
-        ),
-        static_cast<unsigned long long>(
-            g_addIconContext.visibleImplementations.size()
-        )
-    );
-
-    AnalyzeCompletedAddIcon(
-        g_addIconContext,
-        after
-    );
-
-    Wh_Log(
-        L"ADD_ICON_END "
-        L"call=%llu "
-        L"thread=%lu "
-        L"manager=%p",
-        callNumber,
-        GetCurrentThreadId(),
-        pThis
-    );
-
-    g_addIconContext =
-        std::move(
-            previousContext
-        );
-}
-
-bool HookTaskbarSymbols(
-    HMODULE taskbarModule
-) {
-    WindhawkUtils::SYMBOL_HOOK symbolHooks[] = {
-        {
-            {
-                LR"(private: void __cdecl NotificationAreaIconManager2::AddIcon(struct _TRAYNOTIFYDATAW * const))"
-            },
-            &NotificationAreaIconManager_AddIcon_Original,
-            NotificationAreaIconManager_AddIcon_Hook,
-        },
-        {
-            {
-                LR"(private: void __cdecl NotificationAreaIconManager2::AddIconToVisibleCollection(struct winrt::WindowsUdk::UI::Shell::implementation::NotificationAreaIcon2 *))"
-            },
-            &NotificationAreaIconManager_AddVisible_Original,
-            NotificationAreaIconManager_AddVisible_Hook,
-        },
-        {
-            {
-                LR"(public: unsigned int __cdecl NotifyIconSettingsDatabase::GetUIOrderForIcon(unsigned __int64))"
-            },
-            &NotifyIconSettingsDatabase_GetUIOrderForIcon_Original,
-            NotifyIconSettingsDatabase_GetUIOrderForIcon_Hook,
-        },
-    };
-
-    if (
-        !WindhawkUtils::HookSymbols(
-            taskbarModule,
-            symbolHooks,
-            ARRAYSIZE(
-                symbolHooks
-            )
-        )
-    ) {
-        Wh_Log(
-            L"Failed to hook one or more "
-            L"taskbar.dll symbols"
-        );
-
-        return false;
-    }
-
-    Wh_Log(
-        L"UID path identity hooks installed"
-    );
-
-    return true;
 }
 
 }  // namespace
@@ -1093,74 +1184,39 @@ bool HookTaskbarSymbols(
 BOOL Wh_ModInit() {
     Wh_Log(
         L"Tray Add Path Analyzer "
-        L"0.10.0 initializing"
+        L"0.11.0 initializing"
     );
 
-    HMODULE taskbarModule =
-        GetModuleHandleW(
-            L"taskbar.dll"
-        );
-
-    if (!taskbarModule) {
+    if (!IsPrimaryShellProcess()) {
         Wh_Log(
-            L"taskbar.dll is not loaded"
+            L"PACKAGE_IDENTITY_AUDIT_SKIPPED "
+            L"reason=\"non-primary Explorer process\" "
+            L"processId=%lu",
+            GetCurrentProcessId()
         );
 
-        return FALSE;
+        return TRUE;
     }
 
-    wchar_t modulePath[
-        32768
-    ]{};
-
-    GetModuleFileNameW(
-        taskbarModule,
-        modulePath,
-        ARRAYSIZE(
-            modulePath
-        )
-    );
-
     Wh_Log(
-        L"TASKBAR_MODULE "
-        L"address=%p "
-        L"path=\"%s\"",
-        taskbarModule,
-        modulePath
+        L"PACKAGE_IDENTITY_AUDIT_BEGIN "
+        L"processId=%lu",
+        GetCurrentProcessId()
     );
 
-    return
-        HookTaskbarSymbols(
-            taskbarModule
-        )
-            ? TRUE
-            : FALSE;
+    RunPackageIdentityAudit();
+
+    return TRUE;
 }
 
 void Wh_ModUninit() {
     Wh_Log(
         L"Tray Add Path Analyzer stopped; "
-        L"addIconCalls=%llu "
-        L"visibleAddCalls=%llu "
-        L"orderQueries=%llu "
-        L"targetResults=%llu "
-        L"firstTargetIdentity=%llu",
-        g_addIconCalls.load(
-            std::memory_order_relaxed
-        ),
-        g_visibleAddCalls.load(
-            std::memory_order_relaxed
-        ),
-        g_orderQueries.load(
-            std::memory_order_relaxed
-        ),
-        g_targetResults.load(
-            std::memory_order_relaxed
-        ),
-        static_cast<unsigned long long>(
-            g_firstTargetIdentity.load(
-                std::memory_order_relaxed
-            )
+        L"auditCompleted=%d",
+        g_auditCompleted.load(
+            std::memory_order_acquire
         )
+            ? 1
+            : 0
     );
 }
