@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              tray-add-path-analyzer
 // @name            Tray Add Path Analyzer
-// @description     Correlates newly added tray icon objects with manual move arguments.
-// @version         0.2.0
+// @description     Validates safe conversion from live tray icon objects to ABI icon pointers.
+// @version         0.3.0
 // @author          Yusseter
 // @github          https://github.com/Yusseter
 // @homepage        https://github.com/Yusseter/tray-order-lock
@@ -17,34 +17,33 @@
 
 A temporary diagnostic mod.
 
-Version 0.2.0 correlates:
+Version 0.3.0 validates a safe conversion from a live
+`NotificationAreaIcon2` implementation object to the
+`INotificationAreaIcon` ABI pointer used by
+`ITaskbarModel5::MoveNotificationAreaIcon`.
 
-- `NotificationAreaIconManager2::AddIcon`
-- `NotificationAreaIconManager2::AddIconToVisibleCollection`
-- ABI-facing `ITaskbarModel5::MoveNotificationAreaIcon`
-- `NotificationAreaIconManager2::MoveIcon`
+The mod resolves these public Microsoft symbols:
 
-The goal is to determine how the live `NotificationAreaIcon2` implementation
-pointer relates to the ABI/projected icon value used by the normal move path.
+- The internal `root_implements::query_interface` method for
+  `NotificationAreaIcon2`
+- The IID data symbol for `INotificationAreaIcon`
 
-All original functions are called normally. The mod does not block, create,
-remove or move tray icons and does not write to the registry.
+It compares the queried ABI pointer with the pointer received by the normal
+manual move path.
+
+All original functions are called normally. The mod does not create, remove,
+block or move tray icons and does not write to the registry.
 */
 // ==/WindhawkModReadme==
 
 #include <windows.h>
+#include <unknwn.h>
 #include <windhawk_utils.h>
 
 #include <atomic>
-#include <cstring>
+#include <cwchar>
 
 namespace {
-
-using NotificationAreaIconManager_AddIcon_t =
-    void(__cdecl*)(
-        void* pThis,
-        void* trayNotifyData
-    );
 
 using NotificationAreaIconManager_AddVisible_t =
     void(__cdecl*)(
@@ -60,17 +59,12 @@ using TaskbarModel_MoveNotificationAreaIcon_t =
         unsigned int index
     );
 
-using NotificationAreaIconManager_MoveIcon_t =
-    void(__cdecl*)(
-        void* pThis,
-        void* iconArgumentStorage,
-        int location,
-        unsigned int index
+using NotificationAreaIcon_QueryInterface_t =
+    int(__cdecl*)(
+        void* iconImplementation,
+        const GUID& interfaceId,
+        void** result
     );
-
-NotificationAreaIconManager_AddIcon_t
-    NotificationAreaIconManager_AddIcon_Original =
-        nullptr;
 
 NotificationAreaIconManager_AddVisible_t
     NotificationAreaIconManager_AddVisible_Original =
@@ -80,110 +74,316 @@ TaskbarModel_MoveNotificationAreaIcon_t
     TaskbarModel_MoveNotificationAreaIcon_Original =
         nullptr;
 
-NotificationAreaIconManager_MoveIcon_t
-    NotificationAreaIconManager_MoveIcon_Original =
+NotificationAreaIcon_QueryInterface_t
+    NotificationAreaIcon_QueryInterface =
         nullptr;
 
-std::atomic<unsigned long long> g_addIconCalls =
-    0;
-
-std::atomic<unsigned long long> g_visibleAddCalls =
-    0;
-
-std::atomic<unsigned long long> g_taskbarMoveCalls =
-    0;
-
-std::atomic<unsigned long long> g_managerMoveCalls =
-    0;
-
-thread_local unsigned int g_addIconDepth =
-    0;
-
-thread_local unsigned long long g_activeAddIconCall =
-    0;
-
-thread_local unsigned long long g_activeTaskbarMoveCall =
-    0;
-
-std::atomic<void*> g_latestVisibleImplementation =
+const GUID* g_notificationAreaIconInterfaceId =
     nullptr;
 
-std::atomic<unsigned long long> g_latestVisibleCall =
+std::atomic<unsigned long long> g_visibleAddCallCount =
     0;
 
-void* ReadFirstPointer(
-    void* address
+std::atomic<unsigned long long> g_moveCallCount =
+    0;
+
+std::atomic<unsigned long long> g_queryCallCount =
+    0;
+
+std::atomic<void*> g_latestImplementation =
+    nullptr;
+
+std::atomic<void*> g_latestQueriedAbi =
+    nullptr;
+
+std::atomic<unsigned long long> g_latestQueryCall =
+    0;
+
+bool ContainsText(
+    const wchar_t* text,
+    const wchar_t* expected
 ) {
-    if (!address) {
-        return nullptr;
-    }
-
-    void* value =
+    return
+        text &&
+        expected &&
+        std::wcsstr(
+            text,
+            expected
+        ) !=
         nullptr;
-
-    std::memcpy(
-        &value,
-        address,
-        sizeof(value)
-    );
-
-    return value;
 }
 
-void __cdecl NotificationAreaIconManager_AddIcon_Hook(
-    void* pThis,
-    void* trayNotifyData
+bool IsNotificationAreaIconQueryInterfaceSymbol(
+    const wchar_t* symbol
 ) {
-    const unsigned long long callNumber =
-        g_addIconCalls.fetch_add(
+    return
+        ContainsText(
+            symbol,
+            L"root_implements<"
+        ) &&
+        ContainsText(
+            symbol,
+            L"NotificationAreaIcon2"
+        ) &&
+        ContainsText(
+            symbol,
+            L">::query_interface("
+        ) &&
+        ContainsText(
+            symbol,
+            L"winrt::guid const &"
+        ) &&
+        ContainsText(
+            symbol,
+            L"void * *"
+        ) &&
+        !ContainsText(
+            symbol,
+            L"query_interface_common"
+        ) &&
+        !ContainsText(
+            symbol,
+            L"query_interface_tearoff"
+        );
+}
+
+bool IsNotificationAreaIconIidSymbol(
+    const wchar_t* symbol
+) {
+    constexpr wchar_t kExpectedSymbol[] =
+        L"struct guid::guid const "
+        L"winrt::impl::guid_v<struct "
+        L"winrt::WindowsUdk::UI::Shell::"
+        L"INotificationAreaIcon>";
+
+    return
+        symbol &&
+        std::wcscmp(
+            symbol,
+            kExpectedSymbol
+        ) ==
+        0;
+}
+
+bool ResolveQueryInterfaceSymbols(
+    HMODULE taskbarModule
+) {
+    WH_FIND_SYMBOL_OPTIONS options{};
+
+    options.optionsSize =
+        sizeof(options);
+
+    options.symbolServer =
+        nullptr;
+
+    options.noUndecoratedSymbols =
+        FALSE;
+
+    WH_FIND_SYMBOL symbol{};
+
+    HANDLE symbolSearch =
+        Wh_FindFirstSymbol(
+            taskbarModule,
+            &options,
+            &symbol
+        );
+
+    if (!symbolSearch) {
+        Wh_Log(
+            L"Wh_FindFirstSymbol failed"
+        );
+
+        return false;
+    }
+
+    do {
+        if (
+            !NotificationAreaIcon_QueryInterface &&
+            IsNotificationAreaIconQueryInterfaceSymbol(
+                symbol.symbol
+            )
+        ) {
+            NotificationAreaIcon_QueryInterface =
+                reinterpret_cast<
+                    NotificationAreaIcon_QueryInterface_t
+                >(
+                    symbol.address
+                );
+
+            Wh_Log(
+                L"QUERY_INTERFACE_SYMBOL "
+                L"address=%p "
+                L"symbol=\"%s\"",
+                symbol.address,
+                symbol.symbol
+            );
+        }
+
+        if (
+            !g_notificationAreaIconInterfaceId &&
+            IsNotificationAreaIconIidSymbol(
+                symbol.symbol
+            )
+        ) {
+            g_notificationAreaIconInterfaceId =
+                reinterpret_cast<
+                    const GUID*
+                >(
+                    symbol.address
+                );
+
+            Wh_Log(
+                L"INTERFACE_ID_SYMBOL "
+                L"address=%p "
+                L"symbol=\"%s\"",
+                symbol.address,
+                symbol.symbol
+            );
+        }
+
+        if (
+            NotificationAreaIcon_QueryInterface &&
+            g_notificationAreaIconInterfaceId
+        ) {
+            break;
+        }
+    } while (
+        Wh_FindNextSymbol(
+            symbolSearch,
+            &symbol
+        )
+    );
+
+    Wh_FindCloseSymbol(
+        symbolSearch
+    );
+
+    if (!NotificationAreaIcon_QueryInterface) {
+        Wh_Log(
+            L"NotificationAreaIcon2 "
+            L"query_interface symbol not found"
+        );
+
+        return false;
+    }
+
+    if (!g_notificationAreaIconInterfaceId) {
+        Wh_Log(
+            L"INotificationAreaIcon IID symbol not found"
+        );
+
+        return false;
+    }
+
+    Wh_Log(
+        L"QUERY_INTERFACE_SUPPORT_READY "
+        L"queryFunction=%p "
+        L"interfaceId=%p "
+        L"iid={%08lX-%04hX-%04hX-"
+        L"%02hhX%"
+        L"%02hhX%02hhX-"
+        L"%02hhX%02hhX%02hhX%02hhX%02hhX%02hhX}",
+        NotificationAreaIcon_QueryInterface,
+        g_notificationAreaIconInterfaceId,
+        g_notificationAreaIconInterfaceId->Data1,
+        g_notificationAreaIconInterfaceId->Data2,
+        g_notificationAreaIconInterfaceId->Data3,
+        g_notificationAreaIconInterfaceId->Data4[0],
+        g_notificationAreaIconInterfaceId->Data4[1],
+        g_notificationAreaIconInterfaceId->Data4[2],
+        g_notificationAreaIconInterfaceId->Data4[3],
+        g_notificationAreaIconInterfaceId->Data4[4],
+        g_notificationAreaIconInterfaceId->Data4[5],
+        g_notificationAreaIconInterfaceId->Data4[6],
+        g_notificationAreaIconInterfaceId->Data4[7]
+    );
+
+    return true;
+}
+
+void QueryAndLogAbiPointer(
+    void* iconImplementation,
+    unsigned long long visibleAddCall
+) {
+    const unsigned long long queryCall =
+        g_queryCallCount.fetch_add(
             1,
             std::memory_order_relaxed
         ) +
         1;
 
-    const unsigned long long previousActiveCall =
-        g_activeAddIconCall;
+    void* queriedAbi =
+        nullptr;
 
-    g_activeAddIconCall =
-        callNumber;
+    const int result =
+        NotificationAreaIcon_QueryInterface(
+            iconImplementation,
+            *g_notificationAreaIconInterfaceId,
+            &queriedAbi
+        );
 
-    g_addIconDepth++;
+    void* observedOffsetAbi =
+        iconImplementation
+            ? static_cast<void*>(
+                  static_cast<BYTE*>(
+                      iconImplementation
+                  ) +
+                  0x10
+              )
+            : nullptr;
 
-    Wh_Log(
-        L"ADD_ICON_BEGIN "
-        L"call=%llu "
-        L"thread=%lu "
-        L"manager=%p "
-        L"trayNotifyData=%p "
-        L"depth=%u",
-        callNumber,
-        GetCurrentThreadId(),
-        pThis,
-        trayNotifyData,
-        g_addIconDepth
-    );
-
-    NotificationAreaIconManager_AddIcon_Original(
-        pThis,
-        trayNotifyData
-    );
+    const bool matchesObservedOffset =
+        queriedAbi &&
+        queriedAbi ==
+            observedOffsetAbi;
 
     Wh_Log(
-        L"ADD_ICON_END "
+        L"QUERY_INTERFACE_RESULT "
         L"call=%llu "
+        L"visibleAddCall=%llu "
         L"thread=%lu "
-        L"manager=%p "
-        L"depth=%u",
-        callNumber,
+        L"implementation=%p "
+        L"result=0x%08X "
+        L"queriedAbi=%p "
+        L"observedOffsetAbi=%p "
+        L"matchesObservedOffset=%d",
+        queryCall,
+        visibleAddCall,
         GetCurrentThreadId(),
-        pThis,
-        g_addIconDepth
+        iconImplementation,
+        static_cast<unsigned int>(
+            result
+        ),
+        queriedAbi,
+        observedOffsetAbi,
+        matchesObservedOffset
+            ? 1
+            : 0
     );
 
-    g_addIconDepth--;
+    if (
+        SUCCEEDED(result) &&
+        queriedAbi
+    ) {
+        g_latestImplementation.store(
+            iconImplementation,
+            std::memory_order_release
+        );
 
-    g_activeAddIconCall =
-        previousActiveCall;
+        g_latestQueriedAbi.store(
+            queriedAbi,
+            std::memory_order_release
+        );
+
+        g_latestQueryCall.store(
+            queryCall,
+            std::memory_order_release
+        );
+
+        reinterpret_cast<IUnknown*>(
+            queriedAbi
+        )->Release();
+    }
 }
 
 void __cdecl
@@ -192,35 +392,22 @@ NotificationAreaIconManager_AddVisible_Hook(
     void* iconImplementation
 ) {
     const unsigned long long callNumber =
-        g_visibleAddCalls.fetch_add(
+        g_visibleAddCallCount.fetch_add(
             1,
             std::memory_order_relaxed
         ) +
         1;
-
-    const void* firstPointer =
-        ReadFirstPointer(
-            iconImplementation
-        );
 
     Wh_Log(
         L"VISIBLE_ADD_BEGIN "
         L"call=%llu "
         L"thread=%lu "
         L"manager=%p "
-        L"implementation=%p "
-        L"implementationFirstPointer=%p "
-        L"duringAddIcon=%d "
-        L"parentAddCall=%llu",
+        L"implementation=%p",
         callNumber,
         GetCurrentThreadId(),
         pThis,
-        iconImplementation,
-        firstPointer,
-        g_addIconDepth != 0
-            ? 1
-            : 0,
-        g_activeAddIconCall
+        iconImplementation
     );
 
     NotificationAreaIconManager_AddVisible_Original(
@@ -228,14 +415,9 @@ NotificationAreaIconManager_AddVisible_Hook(
         iconImplementation
     );
 
-    g_latestVisibleImplementation.store(
+    QueryAndLogAbiPointer(
         iconImplementation,
-        std::memory_order_release
-    );
-
-    g_latestVisibleCall.store(
-        callNumber,
-        std::memory_order_release
+        callNumber
     );
 
     Wh_Log(
@@ -243,13 +425,11 @@ NotificationAreaIconManager_AddVisible_Hook(
         L"call=%llu "
         L"thread=%lu "
         L"manager=%p "
-        L"implementation=%p "
-        L"parentAddCall=%llu",
+        L"implementation=%p",
         callNumber,
         GetCurrentThreadId(),
         pThis,
-        iconImplementation,
-        g_activeAddIconCall
+        iconImplementation
     );
 }
 
@@ -261,22 +441,46 @@ TaskbarModel_MoveNotificationAreaIcon_Hook(
     unsigned int index
 ) {
     const unsigned long long callNumber =
-        g_taskbarMoveCalls.fetch_add(
+        g_moveCallCount.fetch_add(
             1,
             std::memory_order_relaxed
         ) +
         1;
 
-    const unsigned long long previousActiveCall =
-        g_activeTaskbarMoveCall;
-
-    g_activeTaskbarMoveCall =
-        callNumber;
-
-    const void* abiFirstPointer =
-        ReadFirstPointer(
-            notificationAreaIconAbi
+    void* latestImplementation =
+        g_latestImplementation.load(
+            std::memory_order_acquire
         );
+
+    void* latestQueriedAbi =
+        g_latestQueriedAbi.load(
+            std::memory_order_acquire
+        );
+
+    const unsigned long long latestQueryCall =
+        g_latestQueryCall.load(
+            std::memory_order_acquire
+        );
+
+    const bool matchesQueriedAbi =
+        latestQueriedAbi &&
+        notificationAreaIconAbi ==
+            latestQueriedAbi;
+
+    void* observedOffsetAbi =
+        latestImplementation
+            ? static_cast<void*>(
+                  static_cast<BYTE*>(
+                      latestImplementation
+                  ) +
+                  0x10
+              )
+            : nullptr;
+
+    const bool matchesObservedOffset =
+        observedOffsetAbi &&
+        notificationAreaIconAbi ==
+            observedOffsetAbi;
 
     Wh_Log(
         L"TASKBAR_MOVE_BEGIN "
@@ -284,24 +488,28 @@ TaskbarModel_MoveNotificationAreaIcon_Hook(
         L"thread=%lu "
         L"taskbarModel=%p "
         L"iconAbi=%p "
-        L"iconAbiFirstPointer=%p "
         L"location=%d "
         L"index=%u "
         L"latestImplementation=%p "
-        L"latestVisibleCall=%llu",
+        L"latestQueriedAbi=%p "
+        L"latestQueryCall=%llu "
+        L"matchesQueriedAbi=%d "
+        L"matchesObservedOffset=%d",
         callNumber,
         GetCurrentThreadId(),
         pThis,
         notificationAreaIconAbi,
-        abiFirstPointer,
         location,
         index,
-        g_latestVisibleImplementation.load(
-            std::memory_order_acquire
-        ),
-        g_latestVisibleCall.load(
-            std::memory_order_acquire
-        )
+        latestImplementation,
+        latestQueriedAbi,
+        latestQueryCall,
+        matchesQueriedAbi
+            ? 1
+            : 0,
+        matchesObservedOffset
+            ? 1
+            : 0
     );
 
     const int result =
@@ -324,90 +532,13 @@ TaskbarModel_MoveNotificationAreaIcon_Hook(
         )
     );
 
-    g_activeTaskbarMoveCall =
-        previousActiveCall;
-
     return result;
 }
 
-void __cdecl
-NotificationAreaIconManager_MoveIcon_Hook(
-    void* pThis,
-    void* iconArgumentStorage,
-    int location,
-    unsigned int index
-) {
-    const unsigned long long callNumber =
-        g_managerMoveCalls.fetch_add(
-            1,
-            std::memory_order_relaxed
-        ) +
-        1;
-
-    const void* containedPointer =
-        ReadFirstPointer(
-            iconArgumentStorage
-        );
-
-    Wh_Log(
-        L"MANAGER_MOVE_BEGIN "
-        L"call=%llu "
-        L"thread=%lu "
-        L"manager=%p "
-        L"iconArgumentStorage=%p "
-        L"containedPointer=%p "
-        L"location=%d "
-        L"index=%u "
-        L"parentTaskbarMove=%llu "
-        L"latestImplementation=%p "
-        L"latestVisibleCall=%llu",
-        callNumber,
-        GetCurrentThreadId(),
-        pThis,
-        iconArgumentStorage,
-        containedPointer,
-        location,
-        index,
-        g_activeTaskbarMoveCall,
-        g_latestVisibleImplementation.load(
-            std::memory_order_acquire
-        ),
-        g_latestVisibleCall.load(
-            std::memory_order_acquire
-        )
-    );
-
-    NotificationAreaIconManager_MoveIcon_Original(
-        pThis,
-        iconArgumentStorage,
-        location,
-        index
-    );
-
-    Wh_Log(
-        L"MANAGER_MOVE_END "
-        L"call=%llu "
-        L"thread=%lu "
-        L"manager=%p "
-        L"parentTaskbarMove=%llu",
-        callNumber,
-        GetCurrentThreadId(),
-        pThis,
-        g_activeTaskbarMoveCall
-    );
-}
-
 bool HookTaskbarSymbols(
-    HMODULE module
+    HMODULE taskbarModule
 ) {
     WindhawkUtils::SYMBOL_HOOK symbolHooks[] = {
-        {
-            {
-                LR"(private: void __cdecl NotificationAreaIconManager2::AddIcon(struct _TRAYNOTIFYDATAW * const))"
-            },
-            &NotificationAreaIconManager_AddIcon_Original,
-            NotificationAreaIconManager_AddIcon_Hook,
-        },
         {
             {
                 LR"(private: void __cdecl NotificationAreaIconManager2::AddIconToVisibleCollection(struct winrt::WindowsUdk::UI::Shell::implementation::NotificationAreaIcon2 *))"
@@ -422,18 +553,11 @@ bool HookTaskbarSymbols(
             &TaskbarModel_MoveNotificationAreaIcon_Original,
             TaskbarModel_MoveNotificationAreaIcon_Hook,
         },
-        {
-            {
-                LR"(public: void __cdecl NotificationAreaIconManager2::MoveIcon(struct winrt::WindowsUdk::UI::Shell::NotificationAreaIcon,enum winrt::WindowsUdk::UI::Shell::NotificationAreaIconLocation,unsigned int))"
-            },
-            &NotificationAreaIconManager_MoveIcon_Original,
-            NotificationAreaIconManager_MoveIcon_Hook,
-        },
     };
 
     if (
         !WindhawkUtils::HookSymbols(
-            module,
+            taskbarModule,
             symbolHooks,
             ARRAYSIZE(
                 symbolHooks
@@ -441,14 +565,14 @@ bool HookTaskbarSymbols(
         )
     ) {
         Wh_Log(
-            L"Failed to hook one or more taskbar.dll symbols"
+            L"Failed to hook taskbar.dll symbols"
         );
 
         return false;
     }
 
     Wh_Log(
-        L"Tray add/move correlation hooks installed"
+        L"Tray ABI validation hooks installed"
     );
 
     return true;
@@ -459,7 +583,7 @@ bool HookTaskbarSymbols(
 BOOL Wh_ModInit() {
     Wh_Log(
         L"Tray Add Path Analyzer "
-        L"0.2.0 initializing"
+        L"0.3.0 initializing"
     );
 
     HMODULE taskbarModule =
@@ -495,6 +619,14 @@ BOOL Wh_ModInit() {
         modulePath
     );
 
+    if (
+        !ResolveQueryInterfaceSymbols(
+            taskbarModule
+        )
+    ) {
+        return FALSE;
+    }
+
     return
         HookTaskbarSymbols(
             taskbarModule
@@ -506,20 +638,16 @@ BOOL Wh_ModInit() {
 void Wh_ModUninit() {
     Wh_Log(
         L"Tray Add Path Analyzer stopped; "
-        L"addIconCalls=%llu "
         L"visibleAddCalls=%llu "
-        L"taskbarMoveCalls=%llu "
-        L"managerMoveCalls=%llu",
-        g_addIconCalls.load(
+        L"queryCalls=%llu "
+        L"moveCalls=%llu",
+        g_visibleAddCallCount.load(
             std::memory_order_relaxed
         ),
-        g_visibleAddCalls.load(
+        g_queryCallCount.load(
             std::memory_order_relaxed
         ),
-        g_taskbarMoveCalls.load(
-            std::memory_order_relaxed
-        ),
-        g_managerMoveCalls.load(
+        g_moveCallCount.load(
             std::memory_order_relaxed
         )
     );
