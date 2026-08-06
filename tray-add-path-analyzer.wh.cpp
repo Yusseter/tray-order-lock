@@ -1,38 +1,36 @@
 // ==WindhawkMod==
 // @id              tray-add-path-analyzer
 // @name            Tray Add Path Analyzer
-// @description     Validates safe conversion from live tray icon objects to ABI icon pointers.
-// @version         0.3.0
+// @description     Tests a one-shot automatic move for a newly added tray icon.
+// @version         0.4.0
 // @author          Yusseter
 // @github          https://github.com/Yusseter
 // @homepage        https://github.com/Yusseter/tray-order-lock
 // @license         MIT
 // @include         explorer.exe
 // @architecture    x86-64
+// @compilerOptions -ladvapi32
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
 /*
 # Tray Add Path Analyzer
 
-A temporary diagnostic mod.
+A temporary one-shot diagnostic mod.
 
-Version 0.3.0 validates a safe conversion from a live
-`NotificationAreaIcon2` implementation object to the
-`INotificationAreaIcon` ABI pointer used by
-`ITaskbarModel5::MoveNotificationAreaIcon`.
+Version 0.4.0 tests whether a newly added tray icon can be moved automatically,
+without a user drag, through `NotificationAreaIconManager2::MoveIcon`.
 
-The mod resolves these public Microsoft symbols:
+The test applies only to a new executable named:
 
-- The internal `root_implements::query_interface` method for
-  `NotificationAreaIcon2`
-- The IID data symbol for `INotificationAreaIcon`
+`TrayAutomaticMoveTest.exe`
 
-It compares the queried ABI pointer with the pointer received by the normal
-manual move path.
+It safely obtains the `INotificationAreaIcon` ABI pointer through the verified
+`NotificationAreaIcon2` query-interface path, then requests a move to the fixed
+test target `location=1, index=16`.
 
-All original functions are called normally. The mod does not create, remove,
-block or move tray icons and does not write to the registry.
+The fixed target is only for validating the automatic live-move path. It is not
+the final dynamic "place at end" implementation.
 */
 // ==/WindhawkModReadme==
 
@@ -40,10 +38,31 @@ block or move tray icons and does not write to the registry.
 #include <unknwn.h>
 #include <windhawk_utils.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cstdint>
+#include <cstring>
 #include <cwchar>
+#include <cwctype>
+#include <string>
+#include <vector>
 
 namespace {
+
+constexpr wchar_t kNotifyIconSettingsPath[] =
+    L"Control Panel\\NotifyIconSettings";
+
+constexpr wchar_t kUIOrderListValueName[] =
+    L"UIOrderList";
+
+constexpr wchar_t kTargetExecutableName[] =
+    L"trayautomaticmovetest.exe";
+
+constexpr int kTestLocation =
+    1;
+
+constexpr unsigned int kTestIndex =
+    16;
 
 using NotificationAreaIconManager_AddVisible_t =
     void(__cdecl*)(
@@ -51,10 +70,10 @@ using NotificationAreaIconManager_AddVisible_t =
         void* iconImplementation
     );
 
-using TaskbarModel_MoveNotificationAreaIcon_t =
-    int(__cdecl*)(
+using NotificationAreaIconManager_MoveIcon_t =
+    void(__cdecl*)(
         void* pThis,
-        void* notificationAreaIconAbi,
+        void* iconArgumentStorage,
         int location,
         unsigned int index
     );
@@ -70,8 +89,8 @@ NotificationAreaIconManager_AddVisible_t
     NotificationAreaIconManager_AddVisible_Original =
         nullptr;
 
-TaskbarModel_MoveNotificationAreaIcon_t
-    TaskbarModel_MoveNotificationAreaIcon_Original =
+NotificationAreaIconManager_MoveIcon_t
+    NotificationAreaIconManager_MoveIcon =
         nullptr;
 
 NotificationAreaIcon_QueryInterface_t
@@ -84,20 +103,24 @@ const GUID* g_notificationAreaIconInterfaceId =
 std::atomic<unsigned long long> g_visibleAddCallCount =
     0;
 
-std::atomic<unsigned long long> g_moveCallCount =
+std::atomic<unsigned long long> g_automaticMoveCount =
     0;
 
-std::atomic<unsigned long long> g_queryCallCount =
+std::atomic<bool> g_testConsumed =
+    false;
+
+thread_local unsigned int g_internalMoveDepth =
     0;
 
-std::atomic<void*> g_latestImplementation =
-    nullptr;
+struct UIOrderSnapshot {
+    bool valid =
+        false;
 
-std::atomic<void*> g_latestQueriedAbi =
-    nullptr;
+    LONG status =
+        ERROR_SUCCESS;
 
-std::atomic<unsigned long long> g_latestQueryCall =
-    0;
+    std::vector<std::uint64_t> entries;
+};
 
 bool ContainsText(
     const wchar_t* text,
@@ -165,7 +188,28 @@ bool IsNotificationAreaIconIidSymbol(
         0;
 }
 
-bool ResolveQueryInterfaceSymbols(
+bool IsMoveIconSymbol(
+    const wchar_t* symbol
+) {
+    constexpr wchar_t kExpectedSymbol[] =
+        L"public: void __cdecl "
+        L"NotificationAreaIconManager2::MoveIcon("
+        L"struct winrt::WindowsUdk::UI::Shell::"
+        L"NotificationAreaIcon,"
+        L"enum winrt::WindowsUdk::UI::Shell::"
+        L"NotificationAreaIconLocation,"
+        L"unsigned int)";
+
+    return
+        symbol &&
+        std::wcscmp(
+            symbol,
+            kExpectedSymbol
+        ) ==
+        0;
+}
+
+bool ResolveRequiredSymbols(
     HMODULE taskbarModule
 ) {
     WH_FIND_SYMBOL_OPTIONS options{};
@@ -212,10 +256,8 @@ bool ResolveQueryInterfaceSymbols(
 
             Wh_Log(
                 L"QUERY_INTERFACE_SYMBOL "
-                L"address=%p "
-                L"symbol=\"%s\"",
-                symbol.address,
-                symbol.symbol
+                L"address=%p",
+                symbol.address
             );
         }
 
@@ -234,16 +276,35 @@ bool ResolveQueryInterfaceSymbols(
 
             Wh_Log(
                 L"INTERFACE_ID_SYMBOL "
-                L"address=%p "
-                L"symbol=\"%s\"",
-                symbol.address,
+                L"address=%p",
+                symbol.address
+            );
+        }
+
+        if (
+            !NotificationAreaIconManager_MoveIcon &&
+            IsMoveIconSymbol(
                 symbol.symbol
+            )
+        ) {
+            NotificationAreaIconManager_MoveIcon =
+                reinterpret_cast<
+                    NotificationAreaIconManager_MoveIcon_t
+                >(
+                    symbol.address
+                );
+
+            Wh_Log(
+                L"MOVE_ICON_SYMBOL "
+                L"address=%p",
+                symbol.address
             );
         }
 
         if (
             NotificationAreaIcon_QueryInterface &&
-            g_notificationAreaIconInterfaceId
+            g_notificationAreaIconInterfaceId &&
+            NotificationAreaIconManager_MoveIcon
         ) {
             break;
         }
@@ -275,115 +336,459 @@ bool ResolveQueryInterfaceSymbols(
         return false;
     }
 
+    if (!NotificationAreaIconManager_MoveIcon) {
+        Wh_Log(
+            L"NotificationAreaIconManager2::MoveIcon "
+            L"symbol not found"
+        );
+
+        return false;
+    }
+
     Wh_Log(
-        L"QUERY_INTERFACE_SUPPORT_READY "
+        L"AUTOMATIC_MOVE_SUPPORT_READY "
         L"queryFunction=%p "
         L"interfaceId=%p "
-        L"iid={%08lX-%04hX-%04hX-"
-        L"%02hhX%"
-        L"%02hhX%02hhX-"
-        L"%02hhX%02hhX%02hhX%02hhX%02hhX%02hhX}",
+        L"moveFunction=%p",
         NotificationAreaIcon_QueryInterface,
         g_notificationAreaIconInterfaceId,
-        g_notificationAreaIconInterfaceId->Data1,
-        g_notificationAreaIconInterfaceId->Data2,
-        g_notificationAreaIconInterfaceId->Data3,
-        g_notificationAreaIconInterfaceId->Data4[0],
-        g_notificationAreaIconInterfaceId->Data4[1],
-        g_notificationAreaIconInterfaceId->Data4[2],
-        g_notificationAreaIconInterfaceId->Data4[3],
-        g_notificationAreaIconInterfaceId->Data4[4],
-        g_notificationAreaIconInterfaceId->Data4[5],
-        g_notificationAreaIconInterfaceId->Data4[6],
-        g_notificationAreaIconInterfaceId->Data4[7]
+        NotificationAreaIconManager_MoveIcon
     );
 
     return true;
 }
 
-void QueryAndLogAbiPointer(
+UIOrderSnapshot CaptureUIOrderSnapshot() {
+    UIOrderSnapshot snapshot;
+
+    DWORD registryType =
+        REG_NONE;
+
+    DWORD requiredBytes =
+        0;
+
+    LONG status =
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            kNotifyIconSettingsPath,
+            kUIOrderListValueName,
+            RRF_RT_REG_BINARY,
+            &registryType,
+            nullptr,
+            &requiredBytes
+        );
+
+    snapshot.status =
+        status;
+
+    if (status != ERROR_SUCCESS) {
+        return snapshot;
+    }
+
+    std::vector<BYTE> data(
+        requiredBytes
+    );
+
+    DWORD actualBytes =
+        requiredBytes;
+
+    status =
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            kNotifyIconSettingsPath,
+            kUIOrderListValueName,
+            RRF_RT_REG_BINARY,
+            &registryType,
+            data.empty()
+                ? nullptr
+                : data.data(),
+            &actualBytes
+        );
+
+    snapshot.status =
+        status;
+
+    if (status != ERROR_SUCCESS) {
+        return snapshot;
+    }
+
+    if (
+        actualBytes %
+            sizeof(std::uint64_t) !=
+        0
+    ) {
+        snapshot.status =
+            ERROR_INVALID_DATA;
+
+        return snapshot;
+    }
+
+    snapshot.entries.resize(
+        actualBytes /
+        sizeof(std::uint64_t)
+    );
+
+    if (actualBytes != 0) {
+        std::memcpy(
+            snapshot.entries.data(),
+            data.data(),
+            actualBytes
+        );
+    }
+
+    snapshot.valid =
+        true;
+
+    return snapshot;
+}
+
+std::wstring MakeTrayEntrySubkey(
+    std::uint64_t identity
+) {
+    return
+        std::wstring(
+            kNotifyIconSettingsPath
+        ) +
+        L"\\" +
+        std::to_wstring(
+            identity
+        );
+}
+
+std::wstring QueryStringValue(
+    const std::wstring& subkey,
+    const wchar_t* valueName
+) {
+    DWORD registryType =
+        REG_NONE;
+
+    DWORD requiredBytes =
+        0;
+
+    LONG status =
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            subkey.c_str(),
+            valueName,
+            RRF_RT_REG_SZ |
+                RRF_RT_REG_EXPAND_SZ,
+            &registryType,
+            nullptr,
+            &requiredBytes
+        );
+
+    if (
+        status != ERROR_SUCCESS ||
+        requiredBytes == 0
+    ) {
+        return L"";
+    }
+
+    std::vector<wchar_t> buffer(
+        requiredBytes /
+            sizeof(wchar_t) +
+        1
+    );
+
+    DWORD actualBytes =
+        requiredBytes;
+
+    status =
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            subkey.c_str(),
+            valueName,
+            RRF_RT_REG_SZ |
+                RRF_RT_REG_EXPAND_SZ,
+            &registryType,
+            buffer.data(),
+            &actualBytes
+        );
+
+    if (status != ERROR_SUCCESS) {
+        return L"";
+    }
+
+    buffer.back() =
+        L'\0';
+
+    return
+        std::wstring(
+            buffer.data()
+        );
+}
+
+bool EndsWithOrdinalIgnoreCase(
+    const std::wstring& value,
+    const std::wstring& suffix
+) {
+    if (
+        value.size() <
+        suffix.size()
+    ) {
+        return false;
+    }
+
+    const std::size_t offset =
+        value.size() -
+        suffix.size();
+
+    for (
+        std::size_t index = 0;
+        index < suffix.size();
+        index++
+    ) {
+        const wchar_t left =
+            static_cast<wchar_t>(
+                std::towlower(
+                    value[
+                        offset +
+                        index
+                    ]
+                )
+            );
+
+        const wchar_t right =
+            static_cast<wchar_t>(
+                std::towlower(
+                    suffix[index]
+                )
+            );
+
+        if (left != right) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+unsigned long long FindOneBasedPosition(
+    const UIOrderSnapshot& snapshot,
+    std::uint64_t identity
+) {
+    const auto iterator =
+        std::find(
+            snapshot.entries.begin(),
+            snapshot.entries.end(),
+            identity
+        );
+
+    if (
+        iterator ==
+        snapshot.entries.end()
+    ) {
+        return 0;
+    }
+
+    return
+        static_cast<unsigned long long>(
+            std::distance(
+                snapshot.entries.begin(),
+                iterator
+            )
+        ) +
+        1;
+}
+
+void TryAutomaticMove(
+    void* manager,
     void* iconImplementation,
     unsigned long long visibleAddCall
 ) {
-    const unsigned long long queryCall =
-        g_queryCallCount.fetch_add(
-            1,
-            std::memory_order_relaxed
-        ) +
-        1;
+    const UIOrderSnapshot beforeMove =
+        CaptureUIOrderSnapshot();
+
+    if (
+        !beforeMove.valid ||
+        beforeMove.entries.empty()
+    ) {
+        Wh_Log(
+            L"AUTOMATIC_MOVE_SKIPPED "
+            L"reason=invalid-order-snapshot "
+            L"visibleAddCall=%llu "
+            L"status=%ld",
+            visibleAddCall,
+            beforeMove.status
+        );
+
+        return;
+    }
+
+    const std::uint64_t candidateIdentity =
+        beforeMove.entries.front();
+
+    const std::wstring executablePath =
+        QueryStringValue(
+            MakeTrayEntrySubkey(
+                candidateIdentity
+            ),
+            L"ExecutablePath"
+        );
+
+    if (
+        !EndsWithOrdinalIgnoreCase(
+            executablePath,
+            kTargetExecutableName
+        )
+    ) {
+        Wh_Log(
+            L"VISIBLE_ADD_IGNORED "
+            L"call=%llu "
+            L"id=%llu "
+            L"path=\"%s\"",
+            visibleAddCall,
+            static_cast<unsigned long long>(
+                candidateIdentity
+            ),
+            executablePath.c_str()
+        );
+
+        return;
+    }
+
+    bool expected =
+        false;
+
+    if (
+        !g_testConsumed.compare_exchange_strong(
+            expected,
+            true,
+            std::memory_order_acq_rel
+        )
+    ) {
+        Wh_Log(
+            L"AUTOMATIC_MOVE_SKIPPED "
+            L"reason=test-already-consumed "
+            L"visibleAddCall=%llu",
+            visibleAddCall
+        );
+
+        return;
+    }
 
     void* queriedAbi =
         nullptr;
 
-    const int result =
+    const int queryResult =
         NotificationAreaIcon_QueryInterface(
             iconImplementation,
             *g_notificationAreaIconInterfaceId,
             &queriedAbi
         );
 
-    void* observedOffsetAbi =
-        iconImplementation
-            ? static_cast<void*>(
-                  static_cast<BYTE*>(
-                      iconImplementation
-                  ) +
-                  0x10
-              )
-            : nullptr;
-
-    const bool matchesObservedOffset =
-        queriedAbi &&
-        queriedAbi ==
-            observedOffsetAbi;
-
     Wh_Log(
-        L"QUERY_INTERFACE_RESULT "
-        L"call=%llu "
+        L"AUTOMATIC_MOVE_QUERY "
         L"visibleAddCall=%llu "
-        L"thread=%lu "
         L"implementation=%p "
         L"result=0x%08X "
-        L"queriedAbi=%p "
-        L"observedOffsetAbi=%p "
-        L"matchesObservedOffset=%d",
-        queryCall,
+        L"queriedAbi=%p",
         visibleAddCall,
-        GetCurrentThreadId(),
         iconImplementation,
         static_cast<unsigned int>(
-            result
+            queryResult
         ),
+        queriedAbi
+    );
+
+    if (
+        FAILED(queryResult) ||
+        !queriedAbi
+    ) {
+        return;
+    }
+
+    void* iconArgumentStorage =
+        queriedAbi;
+
+    const unsigned long long moveNumber =
+        g_automaticMoveCount.fetch_add(
+            1,
+            std::memory_order_relaxed
+        ) +
+        1;
+
+    Wh_Log(
+        L"AUTOMATIC_MOVE_BEGIN "
+        L"move=%llu "
+        L"visibleAddCall=%llu "
+        L"thread=%lu "
+        L"manager=%p "
+        L"implementation=%p "
+        L"iconAbi=%p "
+        L"id=%llu "
+        L"beforePosition=%llu "
+        L"location=%d "
+        L"index=%u",
+        moveNumber,
+        visibleAddCall,
+        GetCurrentThreadId(),
+        manager,
+        iconImplementation,
         queriedAbi,
-        observedOffsetAbi,
-        matchesObservedOffset
+        static_cast<unsigned long long>(
+            candidateIdentity
+        ),
+        FindOneBasedPosition(
+            beforeMove,
+            candidateIdentity
+        ),
+        kTestLocation,
+        kTestIndex
+    );
+
+    g_internalMoveDepth++;
+
+    NotificationAreaIconManager_MoveIcon(
+        manager,
+        &iconArgumentStorage,
+        kTestLocation,
+        kTestIndex
+    );
+
+    g_internalMoveDepth--;
+
+    const UIOrderSnapshot afterMove =
+        CaptureUIOrderSnapshot();
+
+    const unsigned long long afterPosition =
+        afterMove.valid
+            ? FindOneBasedPosition(
+                  afterMove,
+                  candidateIdentity
+              )
+            : 0;
+
+    Wh_Log(
+        L"AUTOMATIC_MOVE_END "
+        L"move=%llu "
+        L"thread=%lu "
+        L"id=%llu "
+        L"afterSnapshotValid=%d "
+        L"afterStatus=%ld "
+        L"afterPosition=%llu "
+        L"orderChanged=%d",
+        moveNumber,
+        GetCurrentThreadId(),
+        static_cast<unsigned long long>(
+            candidateIdentity
+        ),
+        afterMove.valid
+            ? 1
+            : 0,
+        afterMove.status,
+        afterPosition,
+        beforeMove.valid &&
+                afterMove.valid &&
+                beforeMove.entries !=
+                    afterMove.entries
             ? 1
             : 0
     );
 
-    if (
-        SUCCEEDED(result) &&
+    reinterpret_cast<IUnknown*>(
         queriedAbi
-    ) {
-        g_latestImplementation.store(
-            iconImplementation,
-            std::memory_order_release
-        );
-
-        g_latestQueriedAbi.store(
-            queriedAbi,
-            std::memory_order_release
-        );
-
-        g_latestQueryCall.store(
-            queryCall,
-            std::memory_order_release
-        );
-
-        reinterpret_cast<IUnknown*>(
-            queriedAbi
-        )->Release();
-    }
+    )->Release();
 }
 
 void __cdecl
@@ -403,11 +808,13 @@ NotificationAreaIconManager_AddVisible_Hook(
         L"call=%llu "
         L"thread=%lu "
         L"manager=%p "
-        L"implementation=%p",
+        L"implementation=%p "
+        L"internalMoveDepth=%u",
         callNumber,
         GetCurrentThreadId(),
         pThis,
-        iconImplementation
+        iconImplementation,
+        g_internalMoveDepth
     );
 
     NotificationAreaIconManager_AddVisible_Original(
@@ -415,7 +822,26 @@ NotificationAreaIconManager_AddVisible_Hook(
         iconImplementation
     );
 
-    QueryAndLogAbiPointer(
+    if (g_internalMoveDepth != 0) {
+        Wh_Log(
+            L"VISIBLE_ADD_INTERNAL_MOVE "
+            L"call=%llu "
+            L"thread=%lu "
+            L"manager=%p "
+            L"implementation=%p "
+            L"internalMoveDepth=%u",
+            callNumber,
+            GetCurrentThreadId(),
+            pThis,
+            iconImplementation,
+            g_internalMoveDepth
+        );
+
+        return;
+    }
+
+    TryAutomaticMove(
+        pThis,
         iconImplementation,
         callNumber
     );
@@ -433,108 +859,6 @@ NotificationAreaIconManager_AddVisible_Hook(
     );
 }
 
-int __cdecl
-TaskbarModel_MoveNotificationAreaIcon_Hook(
-    void* pThis,
-    void* notificationAreaIconAbi,
-    int location,
-    unsigned int index
-) {
-    const unsigned long long callNumber =
-        g_moveCallCount.fetch_add(
-            1,
-            std::memory_order_relaxed
-        ) +
-        1;
-
-    void* latestImplementation =
-        g_latestImplementation.load(
-            std::memory_order_acquire
-        );
-
-    void* latestQueriedAbi =
-        g_latestQueriedAbi.load(
-            std::memory_order_acquire
-        );
-
-    const unsigned long long latestQueryCall =
-        g_latestQueryCall.load(
-            std::memory_order_acquire
-        );
-
-    const bool matchesQueriedAbi =
-        latestQueriedAbi &&
-        notificationAreaIconAbi ==
-            latestQueriedAbi;
-
-    void* observedOffsetAbi =
-        latestImplementation
-            ? static_cast<void*>(
-                  static_cast<BYTE*>(
-                      latestImplementation
-                  ) +
-                  0x10
-              )
-            : nullptr;
-
-    const bool matchesObservedOffset =
-        observedOffsetAbi &&
-        notificationAreaIconAbi ==
-            observedOffsetAbi;
-
-    Wh_Log(
-        L"TASKBAR_MOVE_BEGIN "
-        L"call=%llu "
-        L"thread=%lu "
-        L"taskbarModel=%p "
-        L"iconAbi=%p "
-        L"location=%d "
-        L"index=%u "
-        L"latestImplementation=%p "
-        L"latestQueriedAbi=%p "
-        L"latestQueryCall=%llu "
-        L"matchesQueriedAbi=%d "
-        L"matchesObservedOffset=%d",
-        callNumber,
-        GetCurrentThreadId(),
-        pThis,
-        notificationAreaIconAbi,
-        location,
-        index,
-        latestImplementation,
-        latestQueriedAbi,
-        latestQueryCall,
-        matchesQueriedAbi
-            ? 1
-            : 0,
-        matchesObservedOffset
-            ? 1
-            : 0
-    );
-
-    const int result =
-        TaskbarModel_MoveNotificationAreaIcon_Original(
-            pThis,
-            notificationAreaIconAbi,
-            location,
-            index
-        );
-
-    Wh_Log(
-        L"TASKBAR_MOVE_END "
-        L"call=%llu "
-        L"thread=%lu "
-        L"result=0x%08X",
-        callNumber,
-        GetCurrentThreadId(),
-        static_cast<unsigned int>(
-            result
-        )
-    );
-
-    return result;
-}
-
 bool HookTaskbarSymbols(
     HMODULE taskbarModule
 ) {
@@ -545,13 +869,6 @@ bool HookTaskbarSymbols(
             },
             &NotificationAreaIconManager_AddVisible_Original,
             NotificationAreaIconManager_AddVisible_Hook,
-        },
-        {
-            {
-                LR"(public: virtual int __cdecl winrt::impl::produce<struct winrt::WindowsUdk::UI::Shell::implementation::TaskbarModel,struct winrt::WindowsUdk::UI::Shell::ITaskbarModel5>::MoveNotificationAreaIcon(void *,int,unsigned int))"
-            },
-            &TaskbarModel_MoveNotificationAreaIcon_Original,
-            TaskbarModel_MoveNotificationAreaIcon_Hook,
         },
     };
 
@@ -565,14 +882,15 @@ bool HookTaskbarSymbols(
         )
     ) {
         Wh_Log(
-            L"Failed to hook taskbar.dll symbols"
+            L"Failed to hook "
+            L"AddIconToVisibleCollection"
         );
 
         return false;
     }
 
     Wh_Log(
-        L"Tray ABI validation hooks installed"
+        L"One-shot automatic-move hook installed"
     );
 
     return true;
@@ -583,7 +901,7 @@ bool HookTaskbarSymbols(
 BOOL Wh_ModInit() {
     Wh_Log(
         L"Tray Add Path Analyzer "
-        L"0.3.0 initializing"
+        L"0.4.0 initializing"
     );
 
     HMODULE taskbarModule =
@@ -620,7 +938,7 @@ BOOL Wh_ModInit() {
     );
 
     if (
-        !ResolveQueryInterfaceSymbols(
+        !ResolveRequiredSymbols(
             taskbarModule
         )
     ) {
@@ -639,16 +957,18 @@ void Wh_ModUninit() {
     Wh_Log(
         L"Tray Add Path Analyzer stopped; "
         L"visibleAddCalls=%llu "
-        L"queryCalls=%llu "
-        L"moveCalls=%llu",
+        L"automaticMoves=%llu "
+        L"testConsumed=%d",
         g_visibleAddCallCount.load(
             std::memory_order_relaxed
         ),
-        g_queryCallCount.load(
+        g_automaticMoveCount.load(
             std::memory_order_relaxed
         ),
-        g_moveCallCount.load(
+        g_testConsumed.load(
             std::memory_order_relaxed
         )
+            ? 1
+            : 0
     );
 }
