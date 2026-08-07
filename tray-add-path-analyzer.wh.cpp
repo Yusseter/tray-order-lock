@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              tray-add-path-analyzer
 // @name            Tray Add Path Analyzer
-// @description     Compares stable and rotating GUID tray identities across version-directory changes.
-// @version         0.16.0
+// @description     Tests native saved tray-order reuse after one safe end move.
+// @version         0.17.0
 // @author          Yusseter
 // @github          https://github.com/Yusseter
 // @homepage        https://github.com/Yusseter/tray-order-lock
@@ -16,39 +16,41 @@
 /*
 # Tray Add Path Analyzer
 
-A temporary read-only diagnostic mod.
+A temporary two-run diagnostic mod.
 
-Version 0.16.0 analyzes a dedicated synthetic application which creates two
-GUID-based tray icons across two executable version directories.
+Version 0.17.0 tests whether Windows natively reuses a tray icon's stored UI
+order when the same identity returns.
 
-The first icon keeps the same GUID in both versions.
+The dedicated test executable is:
 
-The second icon uses one GUID in Version-1.0.0 and a different GUID in
-Version-2.0.0.
+TraySavedOrderProbeV170.exe
 
-After the first run, Version-1.0.0 is removed before the second run.
+It uses UID 1 and is run twice from the exact same executable path.
 
-The analyzer verifies whether:
+First run:
 
-- The stable GUID is represented by one current registry identity.
-- The rotating GUID produces one stale old-version identity and one current
-  new-version identity.
-- Both current tray icons share the same executable path.
-- Executable-path-only matching is therefore ambiguous.
-- Exact GUID matching remains safe for the stable icon.
-- A GUID-changing icon cannot be paired across versions from path alone when
-  another current GUID-based icon shares the same executable.
+- A new registry identity is created.
+- The analyzer identifies that exact new identity.
+- The live overflow collection size is read.
+- The test icon is moved exactly once to the overflow end using the previously
+  validated NotificationAreaIconManager2::MoveIcon path.
+- The resulting UIOrderList position is recorded.
 
-This version:
+Second run:
 
-- Installs no taskbar hooks.
-- Calls no MoveIcon function.
-- Writes nothing to the registry.
-- Does not change tray order.
+- No MoveIcon call is made by the analyzer.
+- The analyzer checks that Windows reuses the same registry identity.
+- NotifyIconSettingsDatabase::GetUIOrderForIcon calls are observed.
+- The returned UI order is compared with the stored UIOrderList position.
+- UIOrderList before and after AddIcon is compared to determine whether the
+  saved position was preserved without analyzer intervention.
+
+The analyzer never moves any non-test icon and performs no registry writes.
 */
 // ==/WindhawkModReadme==
 
 #include <windows.h>
+#include <unknwn.h>
 #include <windhawk_utils.h>
 
 #include <algorithm>
@@ -57,8 +59,7 @@ This version:
 #include <cstring>
 #include <cwchar>
 #include <cwctype>
-#include <map>
-#include <set>
+#include <iterator>
 #include <string>
 #include <utility>
 #include <vector>
@@ -72,19 +73,124 @@ constexpr wchar_t kUIOrderListValueName[] =
     L"UIOrderList";
 
 constexpr wchar_t kTargetExecutableName[] =
-    L"trayguidfallbackprobev160.exe";
+    L"traysavedorderprobev170.exe";
 
-constexpr wchar_t kStableGuid[] =
-    L"{0f29c634-2a3b-4a77-9d15-8bf6dd6a1601}";
+constexpr int kOverflowLocation =
+    1;
 
-constexpr wchar_t kRotatingGuidV1[] =
-    L"{1a3bd745-3b4c-5b88-ae26-9cf7ee7b1602}";
+using NotificationAreaIconManager_AddIcon_t =
+    void(__cdecl*)(
+        void* pThis,
+        void* trayNotifyData
+    );
 
-constexpr wchar_t kRotatingGuidV2[] =
-    L"{2b4ce856-4c5d-6c99-bf37-ad08ff8c1603}";
+using NotificationAreaIconManager_AddVisible_t =
+    void(__cdecl*)(
+        void* pThis,
+        void* iconImplementation
+    );
 
-std::atomic<bool> g_auditCompleted =
+using NotificationAreaIconManager_MoveIcon_t =
+    void(__cdecl*)(
+        void* pThis,
+        void* iconArgumentStorage,
+        int location,
+        unsigned int index
+    );
+
+using NotificationAreaIcon_QueryInterface_t =
+    int(__cdecl*)(
+        void* iconImplementation,
+        const GUID& interfaceId,
+        void** result
+    );
+
+using TaskbarModel_GetOverflowIcons_t =
+    int(__cdecl*)(
+        void* pThis,
+        void** result
+    );
+
+using NotifyIconSettingsDatabase_GetUIOrderForIcon_t =
+    unsigned int(__cdecl*)(
+        void* pThis,
+        std::uint64_t identity
+    );
+
+using Vector_GetSize_t =
+    HRESULT(STDMETHODCALLTYPE*)(
+        void* pThis,
+        unsigned int* size
+    );
+
+NotificationAreaIconManager_AddIcon_t
+    NotificationAreaIconManager_AddIcon_Original =
+        nullptr;
+
+NotificationAreaIconManager_AddVisible_t
+    NotificationAreaIconManager_AddVisible_Original =
+        nullptr;
+
+NotificationAreaIconManager_MoveIcon_t
+    NotificationAreaIconManager_MoveIcon =
+        nullptr;
+
+NotificationAreaIcon_QueryInterface_t
+    NotificationAreaIcon_QueryInterface =
+        nullptr;
+
+TaskbarModel_GetOverflowIcons_t
+    TaskbarModel_GetOverflowIcons_Original =
+        nullptr;
+
+NotifyIconSettingsDatabase_GetUIOrderForIcon_t
+    NotifyIconSettingsDatabase_GetUIOrderForIcon_Original =
+        nullptr;
+
+const GUID* g_notificationAreaIconInterfaceId =
+    nullptr;
+
+const GUID* g_notificationAreaIconVectorId =
+    nullptr;
+
+std::atomic<void*> g_taskbarModel6 =
+    nullptr;
+
+std::atomic<unsigned long long> g_addIconCalls =
+    0;
+
+std::atomic<unsigned long long> g_visibleAddCalls =
+    0;
+
+std::atomic<unsigned long long> g_overflowGetterCalls =
+    0;
+
+std::atomic<unsigned long long> g_orderQueries =
+    0;
+
+std::atomic<unsigned long long> g_moveAttempts =
+    0;
+
+std::atomic<unsigned long long> g_targetResults =
+    0;
+
+std::atomic<std::uint64_t> g_firstTargetIdentity =
+    0;
+
+std::atomic<unsigned long long> g_savedPositionAfterMove =
+    0;
+
+std::atomic<bool> g_moveConsumed =
     false;
+
+std::atomic<bool> g_firstMoveCompleted =
+    false;
+
+std::atomic<bool> g_returnValidationCompleted =
+    false;
+
+thread_local unsigned int g_internalMoveDepth =
+    0;
 
 struct UIOrderSnapshot {
     bool valid =
@@ -96,157 +202,311 @@ struct UIOrderSnapshot {
     std::vector<std::uint64_t> entries;
 };
 
-struct RegistryRecord {
+struct OrderQueryObservation {
     std::uint64_t identity =
         0;
 
-    unsigned long long oneBasedPosition =
+    unsigned int returnedOrder =
         0;
-
-    std::wstring executablePath;
-    std::wstring normalizedExecutablePath;
-    std::wstring initialTooltip;
-    std::wstring iconGuid;
-
-    bool executableExists =
-        false;
-
-    bool hasVersionDirectory =
-        false;
 };
 
-std::wstring ToLower(
-    std::wstring value
-) {
-    std::transform(
-        value.begin(),
-        value.end(),
-        value.begin(),
-        [](
-            wchar_t character
-        ) {
-            return
-                static_cast<wchar_t>(
-                    std::towlower(
-                        character
-                    )
-                );
-        }
-    );
+struct AddIconContext {
+    bool active =
+        false;
 
-    return value;
-}
-
-std::wstring NormalizeSlashes(
-    std::wstring path
-) {
-    std::replace(
-        path.begin(),
-        path.end(),
-        L'/',
-        L'\\'
-    );
-
-    constexpr wchar_t kExtendedPrefix[] =
-        L"\\\\?\\";
-
-    if (
-        path.size() >=
-            4 &&
-        path.compare(
-            0,
-            4,
-            kExtendedPrefix
-        ) ==
-            0
-    ) {
-        path.erase(
-            0,
-            4
-        );
-    }
-
-    return path;
-}
-
-std::wstring MakeTrayEntrySubkey(
-    std::uint64_t identity
-) {
-    return
-        std::wstring(
-            kNotifyIconSettingsPath
-        ) +
-        L"\\" +
-        std::to_wstring(
-            identity
-        );
-}
-
-std::wstring QueryStringValue(
-    const std::wstring& subkey,
-    const wchar_t* valueName
-) {
-    DWORD registryType =
-        REG_NONE;
-
-    DWORD requiredBytes =
+    unsigned long long callNumber =
         0;
 
-    LONG status =
-        RegGetValueW(
-            HKEY_CURRENT_USER,
-            subkey.c_str(),
-            valueName,
-            RRF_RT_REG_SZ |
-                RRF_RT_REG_EXPAND_SZ,
-            &registryType,
-            nullptr,
-            &requiredBytes
+    UIOrderSnapshot before;
+
+    std::vector<OrderQueryObservation> orderQueries;
+};
+
+thread_local AddIconContext g_addIconContext;
+
+bool ContainsText(
+    const wchar_t* text,
+    const wchar_t* expected
+) {
+    return
+        text &&
+        expected &&
+        std::wcsstr(
+            text,
+            expected
+        ) !=
+        nullptr;
+}
+
+bool IsNotificationAreaIconQueryInterfaceSymbol(
+    const wchar_t* symbol
+) {
+    return
+        ContainsText(
+            symbol,
+            L"root_implements<"
+        ) &&
+        ContainsText(
+            symbol,
+            L"NotificationAreaIcon2"
+        ) &&
+        ContainsText(
+            symbol,
+            L">::query_interface("
+        ) &&
+        ContainsText(
+            symbol,
+            L"winrt::guid const &"
+        ) &&
+        ContainsText(
+            symbol,
+            L"void * *"
+        ) &&
+        !ContainsText(
+            symbol,
+            L"query_interface_common"
+        ) &&
+        !ContainsText(
+            symbol,
+            L"query_interface_tearoff"
         );
+}
 
-    if (
-        status != ERROR_SUCCESS ||
-        requiredBytes == 0
-    ) {
-        return L"";
-    }
-
-    std::vector<wchar_t> buffer(
-        requiredBytes /
-            sizeof(wchar_t) +
-        1,
-        L'\0'
-    );
-
-    DWORD actualBytes =
-        requiredBytes;
-
-    status =
-        RegGetValueW(
-            HKEY_CURRENT_USER,
-            subkey.c_str(),
-            valueName,
-            RRF_RT_REG_SZ |
-                RRF_RT_REG_EXPAND_SZ,
-            &registryType,
-            buffer.data(),
-            &actualBytes
-        );
-
-    if (
-        status !=
-        ERROR_SUCCESS
-    ) {
-        return L"";
-    }
-
-    buffer.back() =
-        L'\0';
+bool IsNotificationAreaIconIidSymbol(
+    const wchar_t* symbol
+) {
+    constexpr wchar_t kExpectedSymbol[] =
+        L"struct guid::guid const "
+        L"winrt::impl::guid_v<struct "
+        L"winrt::WindowsUdk::UI::Shell::"
+        L"INotificationAreaIcon>";
 
     return
-        std::wstring(
-            buffer.data()
+        symbol &&
+        std::wcscmp(
+            symbol,
+            kExpectedSymbol
+        ) ==
+            0;
+}
+
+bool IsNotificationAreaIconVectorIidSymbol(
+    const wchar_t* symbol
+) {
+    constexpr wchar_t kExpectedSymbol[] =
+        L"struct guid::guid const "
+        L"winrt::impl::guid_v<struct "
+        L"winrt::Windows::Foundation::Collections::"
+        L"IVector<struct "
+        L"winrt::WindowsUdk::UI::Shell::"
+        L"NotificationAreaIcon> >";
+
+    return
+        symbol &&
+        std::wcscmp(
+            symbol,
+            kExpectedSymbol
+        ) ==
+            0;
+}
+
+bool IsMoveIconSymbol(
+    const wchar_t* symbol
+) {
+    constexpr wchar_t kExpectedSymbol[] =
+        L"public: void __cdecl "
+        L"NotificationAreaIconManager2::MoveIcon("
+        L"struct winrt::WindowsUdk::UI::Shell::"
+        L"NotificationAreaIcon,"
+        L"enum winrt::WindowsUdk::UI::Shell::"
+        L"NotificationAreaIconLocation,"
+        L"unsigned int)";
+
+    return
+        symbol &&
+        std::wcscmp(
+            symbol,
+            kExpectedSymbol
+        ) ==
+            0;
+}
+
+bool ResolveRequiredSymbols(
+    HMODULE taskbarModule
+) {
+    WH_FIND_SYMBOL_OPTIONS options{};
+
+    options.optionsSize =
+        sizeof(options);
+
+    options.symbolServer =
+        nullptr;
+
+    options.noUndecoratedSymbols =
+        FALSE;
+
+    WH_FIND_SYMBOL symbol{};
+
+    HANDLE symbolSearch =
+        Wh_FindFirstSymbol(
+            taskbarModule,
+            &options,
+            &symbol
         );
+
+    if (!symbolSearch) {
+        Wh_Log(
+            L"Wh_FindFirstSymbol failed"
+        );
+
+        return false;
+    }
+
+    do {
+        if (
+            !NotificationAreaIcon_QueryInterface &&
+            IsNotificationAreaIconQueryInterfaceSymbol(
+                symbol.symbol
+            )
+        ) {
+            NotificationAreaIcon_QueryInterface =
+                reinterpret_cast<
+                    NotificationAreaIcon_QueryInterface_t
+                >(
+                    symbol.address
+                );
+
+            Wh_Log(
+                L"QUERY_INTERFACE_SYMBOL "
+                L"address=%p",
+                symbol.address
+            );
+        }
+
+        if (
+            !g_notificationAreaIconInterfaceId &&
+            IsNotificationAreaIconIidSymbol(
+                symbol.symbol
+            )
+        ) {
+            g_notificationAreaIconInterfaceId =
+                reinterpret_cast<const GUID*>(
+                    symbol.address
+                );
+
+            Wh_Log(
+                L"ICON_INTERFACE_ID_SYMBOL "
+                L"address=%p",
+                symbol.address
+            );
+        }
+
+        if (
+            !g_notificationAreaIconVectorId &&
+            IsNotificationAreaIconVectorIidSymbol(
+                symbol.symbol
+            )
+        ) {
+            g_notificationAreaIconVectorId =
+                reinterpret_cast<const GUID*>(
+                    symbol.address
+                );
+
+            Wh_Log(
+                L"VECTOR_INTERFACE_ID_SYMBOL "
+                L"address=%p",
+                symbol.address
+            );
+        }
+
+        if (
+            !NotificationAreaIconManager_MoveIcon &&
+            IsMoveIconSymbol(
+                symbol.symbol
+            )
+        ) {
+            NotificationAreaIconManager_MoveIcon =
+                reinterpret_cast<
+                    NotificationAreaIconManager_MoveIcon_t
+                >(
+                    symbol.address
+                );
+
+            Wh_Log(
+                L"MOVE_ICON_SYMBOL "
+                L"address=%p",
+                symbol.address
+            );
+        }
+
+        if (
+            NotificationAreaIcon_QueryInterface &&
+            g_notificationAreaIconInterfaceId &&
+            g_notificationAreaIconVectorId &&
+            NotificationAreaIconManager_MoveIcon
+        ) {
+            break;
+        }
+    } while (
+        Wh_FindNextSymbol(
+            symbolSearch,
+            &symbol
+        )
+    );
+
+    Wh_FindCloseSymbol(
+        symbolSearch
+    );
+
+    if (!NotificationAreaIcon_QueryInterface) {
+        Wh_Log(
+            L"NotificationAreaIcon2 "
+            L"query_interface symbol not found"
+        );
+
+        return false;
+    }
+
+    if (!g_notificationAreaIconInterfaceId) {
+        Wh_Log(
+            L"INotificationAreaIcon IID "
+            L"symbol not found"
+        );
+
+        return false;
+    }
+
+    if (!g_notificationAreaIconVectorId) {
+        Wh_Log(
+            L"IVector<NotificationAreaIcon> "
+            L"IID symbol not found"
+        );
+
+        return false;
+    }
+
+    if (!NotificationAreaIconManager_MoveIcon) {
+        Wh_Log(
+            L"NotificationAreaIconManager2::"
+            L"MoveIcon symbol not found"
+        );
+
+        return false;
+    }
+
+    Wh_Log(
+        L"SAVED_ORDER_MOVE_SUPPORT_READY "
+        L"queryFunction=%p "
+        L"iconInterfaceId=%p "
+        L"vectorInterfaceId=%p "
+        L"moveFunction=%p",
+        NotificationAreaIcon_QueryInterface,
+        g_notificationAreaIconInterfaceId,
+        g_notificationAreaIconVectorId,
+        NotificationAreaIconManager_MoveIcon
+    );
+
+    return true;
 }
 
 UIOrderSnapshot CaptureUIOrderSnapshot() {
@@ -323,9 +583,7 @@ UIOrderSnapshot CaptureUIOrderSnapshot() {
 
         if (
             actualBytes %
-                sizeof(
-                    std::uint64_t
-                ) !=
+                sizeof(std::uint64_t) !=
             0
         ) {
             snapshot.status =
@@ -336,9 +594,7 @@ UIOrderSnapshot CaptureUIOrderSnapshot() {
 
         snapshot.entries.resize(
             actualBytes /
-            sizeof(
-                std::uint64_t
-            )
+            sizeof(std::uint64_t)
         );
 
         if (
@@ -364,255 +620,169 @@ UIOrderSnapshot CaptureUIOrderSnapshot() {
     return snapshot;
 }
 
-bool StartsWith(
-    const std::wstring& value,
-    const wchar_t* prefix
+std::vector<std::uint64_t> FindAddedIdentities(
+    const UIOrderSnapshot& before,
+    const UIOrderSnapshot& after
 ) {
-    if (!prefix) {
-        return false;
-    }
-
-    const std::size_t prefixLength =
-        std::wcslen(
-            prefix
-        );
-
-    return
-        value.size() >=
-            prefixLength &&
-        value.compare(
-            0,
-            prefixLength,
-            prefix
-        ) ==
-            0;
-}
-
-bool IsNumericDottedVersionCore(
-    const std::wstring& value
-) {
-    if (value.empty()) {
-        return false;
-    }
+    std::vector<std::uint64_t> added;
 
     if (
-        value.front() ==
-            L'.' ||
-        value.back() ==
-            L'.'
+        !before.valid ||
+        !after.valid
     ) {
-        return false;
+        return added;
     }
-
-    unsigned int digitCount =
-        0;
-
-    unsigned int dotCount =
-        0;
-
-    bool previousWasDot =
-        false;
 
     for (
-        wchar_t character :
-        value
+        std::uint64_t identity :
+        after.entries
     ) {
         if (
-            character >=
-                L'0' &&
-            character <=
-                L'9'
+            std::find(
+                before.entries.begin(),
+                before.entries.end(),
+                identity
+            ) ==
+            before.entries.end()
         ) {
-            digitCount++;
-
-            previousWasDot =
-                false;
-
-            continue;
+            added.push_back(
+                identity
+            );
         }
+    }
 
-        if (
-            character ==
-            L'.'
-        ) {
-            if (
-                previousWasDot
-            ) {
-                return false;
-            }
+    return added;
+}
 
-            dotCount++;
-
-            previousWasDot =
-                true;
-
-            continue;
-        }
-
+bool ContainsIdentity(
+    const UIOrderSnapshot& snapshot,
+    std::uint64_t identity
+) {
+    if (!snapshot.valid) {
         return false;
     }
 
     return
-        digitCount >
-            0 &&
-        dotCount >=
-            1;
+        std::find(
+            snapshot.entries.begin(),
+            snapshot.entries.end(),
+            identity
+        ) !=
+        snapshot.entries.end();
 }
 
-bool LooksLikeVersionDirectory(
-    const std::wstring& directoryName
+unsigned long long FindOneBasedPosition(
+    const UIOrderSnapshot& snapshot,
+    std::uint64_t identity
 ) {
-    if (
-        directoryName.empty()
-    ) {
-        return false;
+    if (!snapshot.valid) {
+        return 0;
     }
 
-    std::wstring candidate =
-        ToLower(
-            directoryName
+    const auto iterator =
+        std::find(
+            snapshot.entries.begin(),
+            snapshot.entries.end(),
+            identity
         );
 
     if (
-        StartsWith(
-            candidate,
-            L"app-"
-        )
+        iterator ==
+        snapshot.entries.end()
     ) {
-        candidate.erase(
-            0,
-            4
-        );
-    } else if (
-        StartsWith(
-            candidate,
-            L"version-"
-        )
-    ) {
-        candidate.erase(
-            0,
-            8
-        );
-    } else if (
-        candidate.size() >=
-            2 &&
-        candidate[0] ==
-            L'v' &&
-        candidate[1] >=
-            L'0' &&
-        candidate[1] <=
-            L'9'
-    ) {
-        candidate.erase(
-            0,
-            1
-        );
+        return 0;
     }
 
     return
-        IsNumericDottedVersionCore(
-            candidate
-        );
-}
-
-std::wstring BuildVersionNormalizedPath(
-    const std::wstring& executablePath,
-    bool* foundVersionDirectory
-) {
-    if (
-        foundVersionDirectory
-    ) {
-        *foundVersionDirectory =
-            false;
-    }
-
-    const std::wstring path =
-        ToLower(
-            NormalizeSlashes(
-                executablePath
+        static_cast<unsigned long long>(
+            std::distance(
+                snapshot.entries.begin(),
+                iterator
             )
+        ) +
+        1;
+}
+
+std::wstring MakeTrayEntrySubkey(
+    std::uint64_t identity
+) {
+    return
+        std::wstring(
+            kNotifyIconSettingsPath
+        ) +
+        L"\\" +
+        std::to_wstring(
+            identity
         );
+}
 
-    if (path.empty()) {
-        return path;
-    }
+std::wstring QueryStringValue(
+    const std::wstring& subkey,
+    const wchar_t* valueName
+) {
+    DWORD registryType =
+        REG_NONE;
 
-    std::wstring result;
-
-    std::size_t segmentStart =
+    DWORD requiredBytes =
         0;
 
-    bool firstSegment =
-        true;
+    LONG status =
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            subkey.c_str(),
+            valueName,
+            RRF_RT_REG_SZ |
+                RRF_RT_REG_EXPAND_SZ,
+            &registryType,
+            nullptr,
+            &requiredBytes
+        );
 
-    while (
-        segmentStart <=
-        path.size()
+    if (
+        status !=
+            ERROR_SUCCESS ||
+        requiredBytes ==
+            0
     ) {
-        const std::size_t separator =
-            path.find(
-                L'\\',
-                segmentStart
-            );
-
-        const std::size_t segmentEnd =
-            separator ==
-                    std::wstring::npos
-                ? path.size()
-                : separator;
-
-        const std::wstring segment =
-            path.substr(
-                segmentStart,
-                segmentEnd -
-                    segmentStart
-            );
-
-        if (!firstSegment) {
-            result +=
-                L'\\';
-        }
-
-        const bool isLastSegment =
-            separator ==
-            std::wstring::npos;
-
-        if (
-            !isLastSegment &&
-            LooksLikeVersionDirectory(
-                segment
-            )
-        ) {
-            result +=
-                L"<version>";
-
-            if (
-                foundVersionDirectory
-            ) {
-                *foundVersionDirectory =
-                    true;
-            }
-        } else {
-            result +=
-                segment;
-        }
-
-        firstSegment =
-            false;
-
-        if (
-            separator ==
-            std::wstring::npos
-        ) {
-            break;
-        }
-
-        segmentStart =
-            separator +
-            1;
+        return L"";
     }
 
-    return result;
+    std::vector<wchar_t> buffer(
+        requiredBytes /
+            sizeof(wchar_t) +
+        1,
+        L'\0'
+    );
+
+    DWORD actualBytes =
+        requiredBytes;
+
+    status =
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            subkey.c_str(),
+            valueName,
+            RRF_RT_REG_SZ |
+                RRF_RT_REG_EXPAND_SZ,
+            &registryType,
+            buffer.data(),
+            &actualBytes
+        );
+
+    if (
+        status !=
+        ERROR_SUCCESS
+    ) {
+        return L"";
+    }
+
+    buffer.back() =
+        L'\0';
+
+    return
+        std::wstring(
+            buffer.data()
+        );
 }
 
 bool EndsWithOrdinalIgnoreCase(
@@ -666,106 +836,1252 @@ bool EndsWithOrdinalIgnoreCase(
     return true;
 }
 
-bool ExecutableExists(
-    const std::wstring& executablePath
+bool IsTargetIdentity(
+    std::uint64_t identity
 ) {
-    if (
-        executablePath.empty()
-    ) {
-        return false;
-    }
-
-    const std::wstring normalizedPath =
-        NormalizeSlashes(
-            executablePath
-        );
-
-    const DWORD attributes =
-        GetFileAttributesW(
-            normalizedPath.c_str()
-        );
-
-    if (
-        attributes ==
-        INVALID_FILE_ATTRIBUTES
-    ) {
-        return false;
-    }
-
-    return
-        (
-            attributes &
-            FILE_ATTRIBUTE_DIRECTORY
-        ) ==
-        0;
-}
-
-RegistryRecord ReadRegistryRecord(
-    std::uint64_t identity,
-    unsigned long long oneBasedPosition
-) {
-    RegistryRecord record;
-
-    record.identity =
-        identity;
-
-    record.oneBasedPosition =
-        oneBasedPosition;
-
-    const std::wstring subkey =
-        MakeTrayEntrySubkey(
-            identity
-        );
-
-    record.executablePath =
+    const std::wstring executablePath =
         QueryStringValue(
-            subkey,
+            MakeTrayEntrySubkey(
+                identity
+            ),
             L"ExecutablePath"
         );
 
-    record.initialTooltip =
-        QueryStringValue(
-            subkey,
-            L"InitialTooltip"
+    return
+        EndsWithOrdinalIgnoreCase(
+            executablePath,
+            kTargetExecutableName
         );
-
-    record.iconGuid =
-        ToLower(
-            QueryStringValue(
-                subkey,
-                L"IconGuid"
-            )
-        );
-
-    record.normalizedExecutablePath =
-        BuildVersionNormalizedPath(
-            record.executablePath,
-            &record.hasVersionDirectory
-        );
-
-    record.executableExists =
-        ExecutableExists(
-            record.executablePath
-        );
-
-    return record;
 }
 
-bool IsTargetRecord(
-    const RegistryRecord& record
+unsigned int CountObservedIdentity(
+    const std::vector<OrderQueryObservation>& observations,
+    std::uint64_t identity
 ) {
+    unsigned int count =
+        0;
+
+    for (
+        const OrderQueryObservation& observation :
+        observations
+    ) {
+        if (
+            observation.identity ==
+            identity
+        ) {
+            count++;
+        }
+    }
+
+    return count;
+}
+
+unsigned int CountObservedIdentityOrder(
+    const std::vector<OrderQueryObservation>& observations,
+    std::uint64_t identity,
+    unsigned int expectedOrder
+) {
+    unsigned int count =
+        0;
+
+    for (
+        const OrderQueryObservation& observation :
+        observations
+    ) {
+        if (
+            observation.identity ==
+                identity &&
+            observation.returnedOrder ==
+                expectedOrder
+        ) {
+            count++;
+        }
+    }
+
+    return count;
+}
+
+bool QueryVectorSize(
+    void* collectionAbi,
+    unsigned int* size,
+    HRESULT* queryResult,
+    HRESULT* sizeResult
+) {
+    if (size) {
+        *size =
+            0;
+    }
+
+    if (queryResult) {
+        *queryResult =
+            E_FAIL;
+    }
+
+    if (sizeResult) {
+        *sizeResult =
+            E_FAIL;
+    }
+
     if (
-        record.executablePath.empty() ||
-        !record.hasVersionDirectory
+        !collectionAbi ||
+        !g_notificationAreaIconVectorId
     ) {
         return false;
     }
 
-    return
-        EndsWithOrdinalIgnoreCase(
-            record.executablePath,
-            kTargetExecutableName
+    void* vectorAbi =
+        nullptr;
+
+    const HRESULT queryHr =
+        reinterpret_cast<IUnknown*>(
+            collectionAbi
+        )->QueryInterface(
+            *g_notificationAreaIconVectorId,
+            &vectorAbi
         );
+
+    if (queryResult) {
+        *queryResult =
+            queryHr;
+    }
+
+    if (
+        FAILED(queryHr) ||
+        !vectorAbi
+    ) {
+        return false;
+    }
+
+    void** vtable =
+        *reinterpret_cast<void***>(
+            vectorAbi
+        );
+
+    if (!vtable) {
+        reinterpret_cast<IUnknown*>(
+            vectorAbi
+        )->Release();
+
+        return false;
+    }
+
+    Vector_GetSize_t getSize =
+        reinterpret_cast<Vector_GetSize_t>(
+            vtable[7]
+        );
+
+    if (!getSize) {
+        reinterpret_cast<IUnknown*>(
+            vectorAbi
+        )->Release();
+
+        return false;
+    }
+
+    unsigned int vectorSize =
+        0;
+
+    const HRESULT sizeHr =
+        getSize(
+            vectorAbi,
+            &vectorSize
+        );
+
+    if (sizeResult) {
+        *sizeResult =
+            sizeHr;
+    }
+
+    if (
+        SUCCEEDED(sizeHr) &&
+        size
+    ) {
+        *size =
+            vectorSize;
+    }
+
+    reinterpret_cast<IUnknown*>(
+        vectorAbi
+    )->Release();
+
+    return
+        SUCCEEDED(sizeHr);
+}
+
+bool QueryCurrentOverflowSize(
+    unsigned int* size,
+    HRESULT* getterResult,
+    HRESULT* vectorQueryResult,
+    HRESULT* sizeResult
+) {
+    if (size) {
+        *size =
+            0;
+    }
+
+    if (getterResult) {
+        *getterResult =
+            E_FAIL;
+    }
+
+    if (vectorQueryResult) {
+        *vectorQueryResult =
+            E_FAIL;
+    }
+
+    if (sizeResult) {
+        *sizeResult =
+            E_FAIL;
+    }
+
+    void* taskbarModel6 =
+        g_taskbarModel6.load(
+            std::memory_order_acquire
+        );
+
+    if (
+        !taskbarModel6 ||
+        !TaskbarModel_GetOverflowIcons_Original
+    ) {
+        return false;
+    }
+
+    void* collectionAbi =
+        nullptr;
+
+    const HRESULT getterHr =
+        static_cast<HRESULT>(
+            TaskbarModel_GetOverflowIcons_Original(
+                taskbarModel6,
+                &collectionAbi
+            )
+        );
+
+    if (getterResult) {
+        *getterResult =
+            getterHr;
+    }
+
+    bool success =
+        false;
+
+    if (
+        SUCCEEDED(getterHr) &&
+        collectionAbi
+    ) {
+        success =
+            QueryVectorSize(
+                collectionAbi,
+                size,
+                vectorQueryResult,
+                sizeResult
+            );
+    }
+
+    if (collectionAbi) {
+        reinterpret_cast<IUnknown*>(
+            collectionAbi
+        )->Release();
+    }
+
+    return success;
+}
+
+void AnalyzeCompletedAddIcon(
+    const AddIconContext& context,
+    const UIOrderSnapshot& after
+) {
+    const std::vector<std::uint64_t> addedIdentities =
+        FindAddedIdentities(
+            context.before,
+            after
+        );
+
+    std::vector<std::uint64_t> targetAdded;
+
+    for (
+        std::uint64_t identity :
+        addedIdentities
+    ) {
+        if (
+            IsTargetIdentity(
+                identity
+            )
+        ) {
+            targetAdded.push_back(
+                identity
+            );
+        }
+    }
+
+    std::uint64_t firstTargetIdentity =
+        g_firstTargetIdentity.load(
+            std::memory_order_acquire
+        );
+
+    if (
+        targetAdded.size() ==
+        1
+    ) {
+        const std::uint64_t targetIdentity =
+            targetAdded.front();
+
+        if (
+            firstTargetIdentity ==
+            0
+        ) {
+            std::uint64_t expected =
+                0;
+
+            g_firstTargetIdentity.compare_exchange_strong(
+                expected,
+                targetIdentity,
+                std::memory_order_acq_rel
+            );
+
+            firstTargetIdentity =
+                g_firstTargetIdentity.load(
+                    std::memory_order_acquire
+                );
+        }
+
+        const unsigned long long afterPosition =
+            FindOneBasedPosition(
+                after,
+                targetIdentity
+            );
+
+        const unsigned long long savedPosition =
+            g_savedPositionAfterMove.load(
+                std::memory_order_acquire
+            );
+
+        const bool identityMatchesMove =
+            firstTargetIdentity ==
+            targetIdentity;
+
+        const bool firstMoveCompleted =
+            g_firstMoveCompleted.load(
+                std::memory_order_acquire
+            );
+
+        g_targetResults.fetch_add(
+            1,
+            std::memory_order_relaxed
+        );
+
+        Wh_Log(
+            L"SAVED_ORDER_FIRST_ADD_RESULT "
+            L"addCall=%llu "
+            L"id=%llu "
+            L"afterPosition=%llu "
+            L"savedPositionAfterMove=%llu "
+            L"identityMatchesMove=%d "
+            L"firstMoveCompleted=%d "
+            L"moveAttempts=%llu",
+            context.callNumber,
+            static_cast<unsigned long long>(
+                targetIdentity
+            ),
+            afterPosition,
+            savedPosition,
+            identityMatchesMove
+                ? 1
+                : 0,
+            firstMoveCompleted
+                ? 1
+                : 0,
+            g_moveAttempts.load(
+                std::memory_order_acquire
+            )
+        );
+
+        return;
+    }
+
+    if (
+        firstTargetIdentity ==
+        0
+    ) {
+        return;
+    }
+
+    const bool identityInBefore =
+        ContainsIdentity(
+            context.before,
+            firstTargetIdentity
+        );
+
+    const bool identityInAfter =
+        ContainsIdentity(
+            after,
+            firstTargetIdentity
+        );
+
+    const unsigned int targetOrderQueries =
+        CountObservedIdentity(
+            context.orderQueries,
+            firstTargetIdentity
+        );
+
+    if (
+        !identityInBefore ||
+        !identityInAfter ||
+        targetOrderQueries ==
+            0
+    ) {
+        return;
+    }
+
+    const unsigned long long beforePosition =
+        FindOneBasedPosition(
+            context.before,
+            firstTargetIdentity
+        );
+
+    const unsigned long long afterPosition =
+        FindOneBasedPosition(
+            after,
+            firstTargetIdentity
+        );
+
+    unsigned int expectedZeroBasedOrder =
+        0;
+
+    if (
+        beforePosition >
+        0
+    ) {
+        expectedZeroBasedOrder =
+            static_cast<unsigned int>(
+                beforePosition -
+                1
+            );
+    }
+
+    const unsigned int matchingSavedOrderQueries =
+        beforePosition >
+                0
+            ? CountObservedIdentityOrder(
+                  context.orderQueries,
+                  firstTargetIdentity,
+                  expectedZeroBasedOrder
+              )
+            : 0;
+
+    const bool beforeAtEnd =
+        context.before.valid &&
+        beforePosition !=
+            0 &&
+        beforePosition ==
+            context.before.entries.size();
+
+    const bool afterAtEnd =
+        after.valid &&
+        afterPosition !=
+            0 &&
+        afterPosition ==
+            after.entries.size();
+
+    const bool positionPreserved =
+        beforePosition !=
+            0 &&
+        afterPosition ==
+            beforePosition;
+
+    const bool firstMoveCompleted =
+        g_firstMoveCompleted.load(
+            std::memory_order_acquire
+        );
+
+    const bool onlyOneAnalyzerMove =
+        g_moveAttempts.load(
+            std::memory_order_acquire
+        ) ==
+        1;
+
+    const bool savedOrderQueried =
+        matchingSavedOrderQueries >
+        0;
+
+    const bool savedOrderReused =
+        firstMoveCompleted &&
+        onlyOneAnalyzerMove &&
+        positionPreserved &&
+        beforeAtEnd &&
+        afterAtEnd &&
+        savedOrderQueried;
+
+    g_returnValidationCompleted.store(
+        savedOrderReused,
+        std::memory_order_release
+    );
+
+    g_targetResults.fetch_add(
+        1,
+        std::memory_order_relaxed
+    );
+
+    Wh_Log(
+        L"SAVED_ORDER_RETURN_RESULT "
+        L"addCall=%llu "
+        L"id=%llu "
+        L"originalSavedPosition=%llu "
+        L"beforePosition=%llu "
+        L"afterPosition=%llu "
+        L"beforeCount=%llu "
+        L"afterCount=%llu "
+        L"expectedZeroBasedOrder=%u "
+        L"targetOrderQueries=%u "
+        L"matchingSavedOrderQueries=%u "
+        L"beforeAtEnd=%d "
+        L"afterAtEnd=%d "
+        L"positionPreserved=%d "
+        L"firstMoveCompleted=%d "
+        L"onlyOneAnalyzerMove=%d "
+        L"savedOrderQueried=%d "
+        L"savedOrderReused=%d",
+        context.callNumber,
+        static_cast<unsigned long long>(
+            firstTargetIdentity
+        ),
+        g_savedPositionAfterMove.load(
+            std::memory_order_acquire
+        ),
+        beforePosition,
+        afterPosition,
+        static_cast<unsigned long long>(
+            context.before.entries.size()
+        ),
+        static_cast<unsigned long long>(
+            after.entries.size()
+        ),
+        expectedZeroBasedOrder,
+        targetOrderQueries,
+        matchingSavedOrderQueries,
+        beforeAtEnd
+            ? 1
+            : 0,
+        afterAtEnd
+            ? 1
+            : 0,
+        positionPreserved
+            ? 1
+            : 0,
+        firstMoveCompleted
+            ? 1
+            : 0,
+        onlyOneAnalyzerMove
+            ? 1
+            : 0,
+        savedOrderQueried
+            ? 1
+            : 0,
+        savedOrderReused
+            ? 1
+            : 0
+    );
+
+    Wh_Log(
+        L"SAVED_ORDER_REUSE_SUMMARY "
+        L"firstIdentity=%llu "
+        L"savedPositionAfterMove=%llu "
+        L"moveAttempts=%llu "
+        L"targetResults=%llu "
+        L"returnValidationCompleted=%d",
+        static_cast<unsigned long long>(
+            firstTargetIdentity
+        ),
+        g_savedPositionAfterMove.load(
+            std::memory_order_acquire
+        ),
+        g_moveAttempts.load(
+            std::memory_order_acquire
+        ),
+        g_targetResults.load(
+            std::memory_order_acquire
+        ),
+        g_returnValidationCompleted.load(
+            std::memory_order_acquire
+        )
+            ? 1
+            : 0
+    );
+}
+
+unsigned int __cdecl
+NotifyIconSettingsDatabase_GetUIOrderForIcon_Hook(
+    void* pThis,
+    std::uint64_t identity
+) {
+    const unsigned int returnedOrder =
+        NotifyIconSettingsDatabase_GetUIOrderForIcon_Original(
+            pThis,
+            identity
+        );
+
+    const unsigned long long queryNumber =
+        g_orderQueries.fetch_add(
+            1,
+            std::memory_order_relaxed
+        ) +
+        1;
+
+    if (
+        g_addIconContext.active
+    ) {
+        g_addIconContext.orderQueries.push_back(
+            {
+                identity,
+                returnedOrder
+            }
+        );
+    }
+
+    Wh_Log(
+        L"UI_ORDER_QUERY "
+        L"query=%llu "
+        L"identity=%llu "
+        L"returnedOrder=%u "
+        L"duringAddIcon=%d "
+        L"parentAddCall=%llu",
+        queryNumber,
+        static_cast<unsigned long long>(
+            identity
+        ),
+        returnedOrder,
+        g_addIconContext.active
+            ? 1
+            : 0,
+        g_addIconContext.active
+            ? g_addIconContext.callNumber
+            : 0
+    );
+
+    return returnedOrder;
+}
+
+int __cdecl
+TaskbarModel_GetOverflowIcons_Hook(
+    void* pThis,
+    void** result
+) {
+    const unsigned long long callNumber =
+        g_overflowGetterCalls.fetch_add(
+            1,
+            std::memory_order_relaxed
+        ) +
+        1;
+
+    const int originalResult =
+        TaskbarModel_GetOverflowIcons_Original(
+            pThis,
+            result
+        );
+
+    const HRESULT getterHr =
+        static_cast<HRESULT>(
+            originalResult
+        );
+
+    unsigned int size =
+        0;
+
+    HRESULT vectorQueryResult =
+        E_FAIL;
+
+    HRESULT sizeResult =
+        E_FAIL;
+
+    bool sizeValid =
+        false;
+
+    if (
+        SUCCEEDED(getterHr) &&
+        result &&
+        *result
+    ) {
+        g_taskbarModel6.store(
+            pThis,
+            std::memory_order_release
+        );
+
+        sizeValid =
+            QueryVectorSize(
+                *result,
+                &size,
+                &vectorQueryResult,
+                &sizeResult
+            );
+    }
+
+    Wh_Log(
+        L"OVERFLOW_GETTER "
+        L"call=%llu "
+        L"pThis=%p "
+        L"result=0x%08X "
+        L"collection=%p "
+        L"sizeValid=%d "
+        L"size=%u "
+        L"vectorQueryResult=0x%08X "
+        L"sizeResult=0x%08X",
+        callNumber,
+        pThis,
+        static_cast<unsigned int>(
+            getterHr
+        ),
+        result
+            ? *result
+            : nullptr,
+        sizeValid
+            ? 1
+            : 0,
+        size,
+        static_cast<unsigned int>(
+            vectorQueryResult
+        ),
+        static_cast<unsigned int>(
+            sizeResult
+        )
+    );
+
+    return originalResult;
+}
+
+void __cdecl
+NotificationAreaIconManager_AddIcon_Hook(
+    void* pThis,
+    void* trayNotifyData
+) {
+    const unsigned long long callNumber =
+        g_addIconCalls.fetch_add(
+            1,
+            std::memory_order_relaxed
+        ) +
+        1;
+
+    AddIconContext previousContext =
+        std::move(
+            g_addIconContext
+        );
+
+    g_addIconContext =
+        {};
+
+    g_addIconContext.active =
+        true;
+
+    g_addIconContext.callNumber =
+        callNumber;
+
+    g_addIconContext.before =
+        CaptureUIOrderSnapshot();
+
+    Wh_Log(
+        L"ADD_ICON_BEGIN "
+        L"call=%llu "
+        L"thread=%lu "
+        L"manager=%p "
+        L"trayNotifyData=%p "
+        L"beforeValid=%d "
+        L"beforeStatus=%ld "
+        L"beforeCount=%llu",
+        callNumber,
+        GetCurrentThreadId(),
+        pThis,
+        trayNotifyData,
+        g_addIconContext.before.valid
+            ? 1
+            : 0,
+        g_addIconContext.before.status,
+        static_cast<unsigned long long>(
+            g_addIconContext.before.entries.size()
+        )
+    );
+
+    NotificationAreaIconManager_AddIcon_Original(
+        pThis,
+        trayNotifyData
+    );
+
+    const UIOrderSnapshot after =
+        CaptureUIOrderSnapshot();
+
+    AnalyzeCompletedAddIcon(
+        g_addIconContext,
+        after
+    );
+
+    Wh_Log(
+        L"ADD_ICON_END "
+        L"call=%llu "
+        L"afterValid=%d "
+        L"afterStatus=%ld "
+        L"afterCount=%llu "
+        L"orderQueriesDuringCall=%llu",
+        callNumber,
+        after.valid
+            ? 1
+            : 0,
+        after.status,
+        static_cast<unsigned long long>(
+            after.entries.size()
+        ),
+        static_cast<unsigned long long>(
+            g_addIconContext.orderQueries.size()
+        )
+    );
+
+    g_addIconContext =
+        std::move(
+            previousContext
+        );
+}
+
+void __cdecl
+NotificationAreaIconManager_AddVisible_Hook(
+    void* pThis,
+    void* iconImplementation
+) {
+    const unsigned long long callNumber =
+        g_visibleAddCalls.fetch_add(
+            1,
+            std::memory_order_relaxed
+        ) +
+        1;
+
+    Wh_Log(
+        L"VISIBLE_ADD_BEGIN "
+        L"call=%llu "
+        L"thread=%lu "
+        L"manager=%p "
+        L"implementation=%p "
+        L"duringAddIcon=%d "
+        L"parentAddCall=%llu "
+        L"internalMoveDepth=%u",
+        callNumber,
+        GetCurrentThreadId(),
+        pThis,
+        iconImplementation,
+        g_addIconContext.active
+            ? 1
+            : 0,
+        g_addIconContext.active
+            ? g_addIconContext.callNumber
+            : 0,
+        g_internalMoveDepth
+    );
+
+    NotificationAreaIconManager_AddVisible_Original(
+        pThis,
+        iconImplementation
+    );
+
+    if (
+        g_internalMoveDepth !=
+        0
+    ) {
+        Wh_Log(
+            L"VISIBLE_ADD_INTERNAL_MOVE "
+            L"call=%llu "
+            L"thread=%lu "
+            L"manager=%p "
+            L"implementation=%p "
+            L"internalMoveDepth=%u",
+            callNumber,
+            GetCurrentThreadId(),
+            pThis,
+            iconImplementation,
+            g_internalMoveDepth
+        );
+
+        return;
+    }
+
+    if (
+        !g_addIconContext.active
+    ) {
+        return;
+    }
+
+    const UIOrderSnapshot beforeMove =
+        CaptureUIOrderSnapshot();
+
+    const std::vector<std::uint64_t> addedIdentities =
+        FindAddedIdentities(
+            g_addIconContext.before,
+            beforeMove
+        );
+
+    std::vector<std::uint64_t> targetAdded;
+
+    for (
+        std::uint64_t identity :
+        addedIdentities
+    ) {
+        if (
+            IsTargetIdentity(
+                identity
+            )
+        ) {
+            targetAdded.push_back(
+                identity
+            );
+        }
+    }
+
+    Wh_Log(
+        L"VISIBLE_ADD_DELTA "
+        L"call=%llu "
+        L"parentAddCall=%llu "
+        L"beforeValid=%d "
+        L"currentValid=%d "
+        L"beforeCount=%llu "
+        L"currentCount=%llu "
+        L"addedCount=%llu "
+        L"targetAddedCount=%llu",
+        callNumber,
+        g_addIconContext.callNumber,
+        g_addIconContext.before.valid
+            ? 1
+            : 0,
+        beforeMove.valid
+            ? 1
+            : 0,
+        static_cast<unsigned long long>(
+            g_addIconContext.before.entries.size()
+        ),
+        static_cast<unsigned long long>(
+            beforeMove.entries.size()
+        ),
+        static_cast<unsigned long long>(
+            addedIdentities.size()
+        ),
+        static_cast<unsigned long long>(
+            targetAdded.size()
+        )
+    );
+
+    if (
+        targetAdded.size() !=
+        1
+    ) {
+        return;
+    }
+
+    const std::uint64_t targetIdentity =
+        targetAdded.front();
+
+    void* queriedAbi =
+        nullptr;
+
+    const HRESULT iconQueryResult =
+        static_cast<HRESULT>(
+            NotificationAreaIcon_QueryInterface(
+                iconImplementation,
+                *g_notificationAreaIconInterfaceId,
+                &queriedAbi
+            )
+        );
+
+    Wh_Log(
+        L"TARGET_ICON_QUERY "
+        L"call=%llu "
+        L"id=%llu "
+        L"implementation=%p "
+        L"result=0x%08X "
+        L"queriedAbi=%p",
+        callNumber,
+        static_cast<unsigned long long>(
+            targetIdentity
+        ),
+        iconImplementation,
+        static_cast<unsigned int>(
+            iconQueryResult
+        ),
+        queriedAbi
+    );
+
+    if (
+        FAILED(iconQueryResult) ||
+        !queriedAbi
+    ) {
+        return;
+    }
+
+    unsigned int overflowSize =
+        0;
+
+    HRESULT getterResult =
+        E_FAIL;
+
+    HRESULT vectorQueryResult =
+        E_FAIL;
+
+    HRESULT sizeResult =
+        E_FAIL;
+
+    const bool overflowSizeValid =
+        QueryCurrentOverflowSize(
+            &overflowSize,
+            &getterResult,
+            &vectorQueryResult,
+            &sizeResult
+        );
+
+    Wh_Log(
+        L"TARGET_OVERFLOW_SIZE "
+        L"call=%llu "
+        L"id=%llu "
+        L"valid=%d "
+        L"size=%u "
+        L"getterResult=0x%08X "
+        L"vectorQueryResult=0x%08X "
+        L"sizeResult=0x%08X",
+        callNumber,
+        static_cast<unsigned long long>(
+            targetIdentity
+        ),
+        overflowSizeValid
+            ? 1
+            : 0,
+        overflowSize,
+        static_cast<unsigned int>(
+            getterResult
+        ),
+        static_cast<unsigned int>(
+            vectorQueryResult
+        ),
+        static_cast<unsigned int>(
+            sizeResult
+        )
+    );
+
+    if (
+        !overflowSizeValid ||
+        overflowSize ==
+            0
+    ) {
+        reinterpret_cast<IUnknown*>(
+            queriedAbi
+        )->Release();
+
+        return;
+    }
+
+    bool expected =
+        false;
+
+    if (
+        !g_moveConsumed.compare_exchange_strong(
+            expected,
+            true,
+            std::memory_order_acq_rel
+        )
+    ) {
+        reinterpret_cast<IUnknown*>(
+            queriedAbi
+        )->Release();
+
+        return;
+    }
+
+    const unsigned int targetIndex =
+        overflowSize -
+        1;
+
+    const unsigned long long beforePosition =
+        FindOneBasedPosition(
+            beforeMove,
+            targetIdentity
+        );
+
+    std::uint64_t expectedIdentity =
+        0;
+
+    g_firstTargetIdentity.compare_exchange_strong(
+        expectedIdentity,
+        targetIdentity,
+        std::memory_order_acq_rel
+    );
+
+    const unsigned long long moveNumber =
+        g_moveAttempts.fetch_add(
+            1,
+            std::memory_order_relaxed
+        ) +
+        1;
+
+    void* iconArgumentStorage =
+        queriedAbi;
+
+    Wh_Log(
+        L"SINGLE_END_MOVE_BEGIN "
+        L"move=%llu "
+        L"call=%llu "
+        L"parentAddCall=%llu "
+        L"id=%llu "
+        L"beforePosition=%llu "
+        L"overflowSize=%u "
+        L"location=%d "
+        L"targetIndex=%u",
+        moveNumber,
+        callNumber,
+        g_addIconContext.callNumber,
+        static_cast<unsigned long long>(
+            targetIdentity
+        ),
+        beforePosition,
+        overflowSize,
+        kOverflowLocation,
+        targetIndex
+    );
+
+    g_internalMoveDepth++;
+
+    NotificationAreaIconManager_MoveIcon(
+        pThis,
+        &iconArgumentStorage,
+        kOverflowLocation,
+        targetIndex
+    );
+
+    g_internalMoveDepth--;
+
+    const UIOrderSnapshot afterMove =
+        CaptureUIOrderSnapshot();
+
+    const unsigned long long afterPosition =
+        FindOneBasedPosition(
+            afterMove,
+            targetIdentity
+        );
+
+    const bool orderChanged =
+        beforeMove.valid &&
+        afterMove.valid &&
+        beforeMove.entries !=
+            afterMove.entries;
+
+    const bool movedToGlobalEnd =
+        afterMove.valid &&
+        afterPosition !=
+            0 &&
+        afterPosition ==
+            afterMove.entries.size();
+
+    const bool moveCompleted =
+        orderChanged &&
+        movedToGlobalEnd;
+
+    if (
+        afterPosition !=
+        0
+    ) {
+        g_savedPositionAfterMove.store(
+            afterPosition,
+            std::memory_order_release
+        );
+    }
+
+    g_firstMoveCompleted.store(
+        moveCompleted,
+        std::memory_order_release
+    );
+
+    Wh_Log(
+        L"SINGLE_END_MOVE_COMPLETE "
+        L"move=%llu "
+        L"call=%llu "
+        L"id=%llu "
+        L"afterSnapshotValid=%d "
+        L"afterStatus=%ld "
+        L"afterCount=%llu "
+        L"afterPosition=%llu "
+        L"orderChanged=%d "
+        L"movedToGlobalEnd=%d "
+        L"moveCompleted=%d",
+        moveNumber,
+        callNumber,
+        static_cast<unsigned long long>(
+            targetIdentity
+        ),
+        afterMove.valid
+            ? 1
+            : 0,
+        afterMove.status,
+        static_cast<unsigned long long>(
+            afterMove.entries.size()
+        ),
+        afterPosition,
+        orderChanged
+            ? 1
+            : 0,
+        movedToGlobalEnd
+            ? 1
+            : 0,
+        moveCompleted
+            ? 1
+            : 0
+    );
+
+    reinterpret_cast<IUnknown*>(
+        queriedAbi
+    )->Release();
+}
+
+bool HookTaskbarSymbols(
+    HMODULE taskbarModule
+) {
+    WindhawkUtils::SYMBOL_HOOK symbolHooks[] = {
+        {
+            {
+                LR"(private: void __cdecl NotificationAreaIconManager2::AddIcon(struct _TRAYNOTIFYDATAW * const))"
+            },
+            &NotificationAreaIconManager_AddIcon_Original,
+            NotificationAreaIconManager_AddIcon_Hook,
+        },
+        {
+            {
+                LR"(private: void __cdecl NotificationAreaIconManager2::AddIconToVisibleCollection(struct winrt::WindowsUdk::UI::Shell::implementation::NotificationAreaIcon2 *))"
+            },
+            &NotificationAreaIconManager_AddVisible_Original,
+            NotificationAreaIconManager_AddVisible_Hook,
+        },
+        {
+            {
+                LR"(public: virtual int __cdecl winrt::impl::produce<struct winrt::WindowsUdk::UI::Shell::implementation::TaskbarModel,struct winrt::WindowsUdk::UI::Shell::ITaskbarModel6>::get_NotificationAreaOverflowIcons(void * *))"
+            },
+            &TaskbarModel_GetOverflowIcons_Original,
+            TaskbarModel_GetOverflowIcons_Hook,
+        },
+        {
+            {
+                LR"(public: unsigned int __cdecl NotifyIconSettingsDatabase::GetUIOrderForIcon(unsigned __int64))"
+            },
+            &NotifyIconSettingsDatabase_GetUIOrderForIcon_Original,
+            NotifyIconSettingsDatabase_GetUIOrderForIcon_Hook,
+        },
+    };
+
+    if (
+        !WindhawkUtils::HookSymbols(
+            taskbarModule,
+            symbolHooks,
+            ARRAYSIZE(
+                symbolHooks
+            )
+        )
+    ) {
+        Wh_Log(
+            L"Failed to hook one or more "
+            L"taskbar.dll symbols"
+        );
+
+        return false;
+    }
+
+    return true;
 }
 
 bool IsPrimaryShellProcess() {
@@ -789,557 +2105,19 @@ bool IsPrimaryShellProcess() {
         GetCurrentProcessId();
 }
 
-void RunGuidFallbackAudit() {
-    const UIOrderSnapshot snapshot =
-        CaptureUIOrderSnapshot();
-
-    if (!snapshot.valid) {
-        Wh_Log(
-            L"GUID_FALLBACK_AUDIT_FAILED "
-            L"registryStatus=%ld",
-            snapshot.status
-        );
-
-        return;
-    }
-
-    std::map<
-        std::wstring,
-        std::vector<RegistryRecord>
-    > groups;
-
-    unsigned long long targetRecords =
-        0;
-
-    unsigned long long targetGuidRecords =
-        0;
-
-    unsigned long long targetMissingGuidRecords =
-        0;
-
-    for (
-        std::size_t index = 0;
-        index <
-            snapshot.entries.size();
-        index++
-    ) {
-        RegistryRecord record =
-            ReadRegistryRecord(
-                snapshot.entries[
-                    index
-                ],
-                static_cast<
-                    unsigned long long
-                >(
-                    index +
-                    1
-                )
-            );
-
-        if (
-            !IsTargetRecord(
-                record
-            )
-        ) {
-            continue;
-        }
-
-        targetRecords++;
-
-        if (
-            record.iconGuid.empty()
-        ) {
-            targetMissingGuidRecords++;
-        } else {
-            targetGuidRecords++;
-        }
-
-        groups[
-            record.normalizedExecutablePath
-        ].push_back(
-            std::move(
-                record
-            )
-        );
-    }
-
-    unsigned long long normalizedPathGroups =
-        0;
-
-    unsigned long long activeCandidateGroups =
-        0;
-
-    unsigned long long expectedMixedGroups =
-        0;
-
-    unsigned long long pathOnlyAmbiguousGroups =
-        0;
-
-    unsigned long long stableGuidCurrentRecords =
-        0;
-
-    unsigned long long stableGuidStaleRecords =
-        0;
-
-    unsigned long long rotatingV1CurrentRecords =
-        0;
-
-    unsigned long long rotatingV1StaleRecords =
-        0;
-
-    unsigned long long rotatingV2CurrentRecords =
-        0;
-
-    unsigned long long rotatingV2StaleRecords =
-        0;
-
-    for (
-        const auto& groupPair :
-        groups
-    ) {
-        normalizedPathGroups++;
-
-        const std::wstring& normalizedPath =
-            groupPair.first;
-
-        const std::vector<RegistryRecord>& members =
-            groupPair.second;
-
-        std::set<std::wstring>
-            exactPaths;
-
-        std::set<std::wstring>
-            allGuids;
-
-        std::set<std::wstring>
-            currentGuids;
-
-        std::set<std::wstring>
-            existingPaths;
-
-        std::map<
-            std::wstring,
-            unsigned long long
-        > exactPathCounts;
-
-        unsigned long long existingRecords =
-            0;
-
-        unsigned long long stableRecords =
-            0;
-
-        unsigned long long stableCurrent =
-            0;
-
-        unsigned long long stableStale =
-            0;
-
-        unsigned long long rotatingV1Records =
-            0;
-
-        unsigned long long rotatingV1Current =
-            0;
-
-        unsigned long long rotatingV1Stale =
-            0;
-
-        unsigned long long rotatingV2Records =
-            0;
-
-        unsigned long long rotatingV2Current =
-            0;
-
-        unsigned long long rotatingV2Stale =
-            0;
-
-        for (
-            const RegistryRecord& member :
-            members
-        ) {
-            const std::wstring exactPath =
-                ToLower(
-                    NormalizeSlashes(
-                        member.executablePath
-                    )
-                );
-
-            exactPaths.insert(
-                exactPath
-            );
-
-            exactPathCounts[
-                exactPath
-            ]++;
-
-            if (
-                !member.iconGuid.empty()
-            ) {
-                allGuids.insert(
-                    member.iconGuid
-                );
-            }
-
-            if (
-                member.executableExists
-            ) {
-                existingRecords++;
-
-                existingPaths.insert(
-                    exactPath
-                );
-
-                if (
-                    !member.iconGuid.empty()
-                ) {
-                    currentGuids.insert(
-                        member.iconGuid
-                    );
-                }
-            }
-
-            if (
-                member.iconGuid ==
-                kStableGuid
-            ) {
-                stableRecords++;
-
-                if (
-                    member.executableExists
-                ) {
-                    stableCurrent++;
-                } else {
-                    stableStale++;
-                }
-            }
-
-            if (
-                member.iconGuid ==
-                kRotatingGuidV1
-            ) {
-                rotatingV1Records++;
-
-                if (
-                    member.executableExists
-                ) {
-                    rotatingV1Current++;
-                } else {
-                    rotatingV1Stale++;
-                }
-            }
-
-            if (
-                member.iconGuid ==
-                kRotatingGuidV2
-            ) {
-                rotatingV2Records++;
-
-                if (
-                    member.executableExists
-                ) {
-                    rotatingV2Current++;
-                } else {
-                    rotatingV2Stale++;
-                }
-            }
-        }
-
-        bool sameExactPathDuplicate =
-            false;
-
-        for (
-            const auto& count :
-            exactPathCounts
-        ) {
-            if (
-                count.second >
-                1
-            ) {
-                sameExactPathDuplicate =
-                    true;
-
-                break;
-            }
-        }
-
-        const bool hasCurrentRecords =
-            existingRecords >
-            0;
-
-        if (
-            hasCurrentRecords
-        ) {
-            activeCandidateGroups++;
-        }
-
-        const bool pathOnlyAmbiguous =
-            existingRecords >
-                1 &&
-            currentGuids.size() >
-                1;
-
-        if (
-            pathOnlyAmbiguous
-        ) {
-            pathOnlyAmbiguousGroups++;
-        }
-
-        const bool stableGuidExactMatchSafe =
-            stableRecords ==
-                1 &&
-            stableCurrent ==
-                1 &&
-            stableStale ==
-                0;
-
-        const bool rotatingGuidChanged =
-            rotatingV1Records ==
-                1 &&
-            rotatingV1Stale ==
-                1 &&
-            rotatingV1Current ==
-                0 &&
-            rotatingV2Records ==
-                1 &&
-            rotatingV2Current ==
-                1 &&
-            rotatingV2Stale ==
-                0;
-
-        const bool rotatingFallbackAmbiguous =
-            rotatingGuidChanged &&
-            pathOnlyAmbiguous;
-
-        const bool expectedMixedShape =
-            members.size() ==
-                3 &&
-            exactPaths.size() ==
-                2 &&
-            allGuids.size() ==
-                3 &&
-            currentGuids.size() ==
-                2 &&
-            existingRecords ==
-                2 &&
-            existingPaths.size() ==
-                1 &&
-            sameExactPathDuplicate &&
-            stableGuidExactMatchSafe &&
-            rotatingGuidChanged &&
-            rotatingFallbackAmbiguous;
-
-        if (
-            expectedMixedShape
-        ) {
-            expectedMixedGroups++;
-        }
-
-        stableGuidCurrentRecords +=
-            stableCurrent;
-
-        stableGuidStaleRecords +=
-            stableStale;
-
-        rotatingV1CurrentRecords +=
-            rotatingV1Current;
-
-        rotatingV1StaleRecords +=
-            rotatingV1Stale;
-
-        rotatingV2CurrentRecords +=
-            rotatingV2Current;
-
-        rotatingV2StaleRecords +=
-            rotatingV2Stale;
-
-        Wh_Log(
-            L"GUID_FALLBACK_GROUP "
-            L"group=%llu "
-            L"memberCount=%llu "
-            L"uniqueExactPaths=%llu "
-            L"uniqueGuids=%llu "
-            L"existingRecords=%llu "
-            L"uniqueExistingPaths=%llu "
-            L"currentGuids=%llu "
-            L"sameExactPathDuplicate=%d "
-            L"pathOnlyAmbiguous=%d "
-            L"stableGuidExactMatchSafe=%d "
-            L"rotatingGuidChanged=%d "
-            L"rotatingFallbackAmbiguous=%d "
-            L"expectedMixedShape=%d "
-            L"normalizedPath=\"%s\"",
-            normalizedPathGroups,
-            static_cast<
-                unsigned long long
-            >(
-                members.size()
-            ),
-            static_cast<
-                unsigned long long
-            >(
-                exactPaths.size()
-            ),
-            static_cast<
-                unsigned long long
-            >(
-                allGuids.size()
-            ),
-            existingRecords,
-            static_cast<
-                unsigned long long
-            >(
-                existingPaths.size()
-            ),
-            static_cast<
-                unsigned long long
-            >(
-                currentGuids.size()
-            ),
-            sameExactPathDuplicate
-                ? 1
-                : 0,
-            pathOnlyAmbiguous
-                ? 1
-                : 0,
-            stableGuidExactMatchSafe
-                ? 1
-                : 0,
-            rotatingGuidChanged
-                ? 1
-                : 0,
-            rotatingFallbackAmbiguous
-                ? 1
-                : 0,
-            expectedMixedShape
-                ? 1
-                : 0,
-            normalizedPath.c_str()
-        );
-
-        for (
-            std::size_t memberIndex = 0;
-            memberIndex <
-                members.size();
-            memberIndex++
-        ) {
-            const RegistryRecord& member =
-                members[
-                    memberIndex
-                ];
-
-            Wh_Log(
-                L"GUID_FALLBACK_GROUP_MEMBER "
-                L"group=%llu "
-                L"member=%llu "
-                L"id=%llu "
-                L"position=%llu "
-                L"exists=%d "
-                L"guid=\"%s\" "
-                L"tooltip=\"%s\" "
-                L"path=\"%s\"",
-                normalizedPathGroups,
-                static_cast<
-                    unsigned long long
-                >(
-                    memberIndex +
-                    1
-                ),
-                static_cast<
-                    unsigned long long
-                >(
-                    member.identity
-                ),
-                member.oneBasedPosition,
-                member.executableExists
-                    ? 1
-                    : 0,
-                member.iconGuid.c_str(),
-                member.initialTooltip.c_str(),
-                member.executablePath.c_str()
-            );
-        }
-    }
-
-    const bool mixedGuidBehaviorValidated =
-        activeCandidateGroups ==
-            1 &&
-        expectedMixedGroups ==
-            1 &&
-        pathOnlyAmbiguousGroups ==
-            1 &&
-        stableGuidCurrentRecords ==
-            1 &&
-        stableGuidStaleRecords ==
-            0 &&
-        rotatingV1CurrentRecords ==
-            0 &&
-        rotatingV1StaleRecords ==
-            1 &&
-        rotatingV2CurrentRecords ==
-            1 &&
-        rotatingV2StaleRecords ==
-            0 &&
-        targetMissingGuidRecords ==
-            0;
-
-    Wh_Log(
-        L"GUID_FALLBACK_AUDIT_SUMMARY "
-        L"uiOrderEntries=%llu "
-        L"targetRecords=%llu "
-        L"targetGuidRecords=%llu "
-        L"targetMissingGuidRecords=%llu "
-        L"normalizedPathGroups=%llu "
-        L"activeCandidateGroups=%llu "
-        L"pathOnlyAmbiguousGroups=%llu "
-        L"expectedMixedGroups=%llu "
-        L"stableGuidCurrentRecords=%llu "
-        L"stableGuidStaleRecords=%llu "
-        L"rotatingV1CurrentRecords=%llu "
-        L"rotatingV1StaleRecords=%llu "
-        L"rotatingV2CurrentRecords=%llu "
-        L"rotatingV2StaleRecords=%llu "
-        L"mixedGuidBehaviorValidated=%d",
-        static_cast<
-            unsigned long long
-        >(
-            snapshot.entries.size()
-        ),
-        targetRecords,
-        targetGuidRecords,
-        targetMissingGuidRecords,
-        normalizedPathGroups,
-        activeCandidateGroups,
-        pathOnlyAmbiguousGroups,
-        expectedMixedGroups,
-        stableGuidCurrentRecords,
-        stableGuidStaleRecords,
-        rotatingV1CurrentRecords,
-        rotatingV1StaleRecords,
-        rotatingV2CurrentRecords,
-        rotatingV2StaleRecords,
-        mixedGuidBehaviorValidated
-            ? 1
-            : 0
-    );
-
-    g_auditCompleted.store(
-        true,
-        std::memory_order_release
-    );
-}
-
 }  // namespace
 
 BOOL Wh_ModInit() {
     Wh_Log(
         L"Tray Add Path Analyzer "
-        L"0.16.0 initializing"
+        L"0.17.0 initializing"
     );
 
     if (
         !IsPrimaryShellProcess()
     ) {
         Wh_Log(
-            L"GUID_FALLBACK_AUDIT_SKIPPED "
+            L"SAVED_ORDER_TEST_SKIPPED "
             L"reason=\"non-primary Explorer process\" "
             L"processId=%lu",
             GetCurrentProcessId()
@@ -1348,13 +2126,60 @@ BOOL Wh_ModInit() {
         return TRUE;
     }
 
+    HMODULE taskbarModule =
+        GetModuleHandleW(
+            L"taskbar.dll"
+        );
+
+    if (!taskbarModule) {
+        Wh_Log(
+            L"taskbar.dll is not loaded"
+        );
+
+        return FALSE;
+    }
+
+    wchar_t modulePath[
+        32768
+    ]{};
+
+    GetModuleFileNameW(
+        taskbarModule,
+        modulePath,
+        ARRAYSIZE(
+            modulePath
+        )
+    );
+
     Wh_Log(
-        L"GUID_FALLBACK_AUDIT_BEGIN "
+        L"TASKBAR_MODULE "
+        L"address=%p "
+        L"path=\"%s\"",
+        taskbarModule,
+        modulePath
+    );
+
+    if (
+        !ResolveRequiredSymbols(
+            taskbarModule
+        )
+    ) {
+        return FALSE;
+    }
+
+    if (
+        !HookTaskbarSymbols(
+            taskbarModule
+        )
+    ) {
+        return FALSE;
+    }
+
+    Wh_Log(
+        L"SAVED_ORDER_TEST_READY "
         L"processId=%lu",
         GetCurrentProcessId()
     );
-
-    RunGuidFallbackAudit();
 
     return TRUE;
 }
@@ -1362,8 +2187,44 @@ BOOL Wh_ModInit() {
 void Wh_ModUninit() {
     Wh_Log(
         L"Tray Add Path Analyzer stopped; "
-        L"auditCompleted=%d",
-        g_auditCompleted.load(
+        L"addIconCalls=%llu "
+        L"visibleAddCalls=%llu "
+        L"overflowGetterCalls=%llu "
+        L"orderQueries=%llu "
+        L"moveAttempts=%llu "
+        L"firstIdentity=%llu "
+        L"savedPositionAfterMove=%llu "
+        L"firstMoveCompleted=%d "
+        L"returnValidationCompleted=%d",
+        g_addIconCalls.load(
+            std::memory_order_acquire
+        ),
+        g_visibleAddCalls.load(
+            std::memory_order_acquire
+        ),
+        g_overflowGetterCalls.load(
+            std::memory_order_acquire
+        ),
+        g_orderQueries.load(
+            std::memory_order_acquire
+        ),
+        g_moveAttempts.load(
+            std::memory_order_acquire
+        ),
+        static_cast<unsigned long long>(
+            g_firstTargetIdentity.load(
+                std::memory_order_acquire
+            )
+        ),
+        g_savedPositionAfterMove.load(
+            std::memory_order_acquire
+        ),
+        g_firstMoveCompleted.load(
+            std::memory_order_acquire
+        )
+            ? 1
+            : 0,
+        g_returnValidationCompleted.load(
             std::memory_order_acquire
         )
             ? 1
