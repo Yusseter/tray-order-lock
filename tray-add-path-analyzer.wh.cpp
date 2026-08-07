@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              tray-add-path-analyzer
 // @name            Tray Add Path Analyzer
-// @description     Tests stable UID fallback chains for multiple tray icons across version-directory changes.
-// @version         0.15.0
+// @description     Compares stable and rotating GUID tray identities across version-directory changes.
+// @version         0.16.0
 // @author          Yusseter
 // @github          https://github.com/Yusseter
 // @homepage        https://github.com/Yusseter/tray-order-lock
@@ -18,29 +18,26 @@
 
 A temporary read-only diagnostic mod.
 
-Version 0.15.0 analyzes a dedicated synthetic test application which creates
-two UID-based tray icons from two version directories.
+Version 0.16.0 analyzes a dedicated synthetic application which creates two
+GUID-based tray icons across two executable version directories.
 
-The test application uses:
+The first icon keeps the same GUID in both versions.
 
-- UID 101
-- UID 202
+The second icon uses one GUID in Version-1.0.0 and a different GUID in
+Version-2.0.0.
 
-The first executable runs from Version-1.0.0.
- first executable runs from Version-1.0.0.
-The second executable runs from Version-2.0.0.
-
-After the first run, the Version-1.0.0 directory is removed before the second
-run. This leaves two stale registry identities from the first version and two
-current identities from the second version.
+After the first run, Version-1.0.0 is removed before the second run.
 
 The analyzer verifies whether:
 
-- Version-normalized executable path alone combines both tray icons into one
-  ambiguous group.
-- Stable UID separates that group into two independent historical chains.
-- Each UID chain contains one stale old-version record and one current
-  new-version record.
+- The stable GUID is represented by one current registry identity.
+- The rotating GUID produces one stale old-version identity and one current
+  new-version identity.
+- Both current tray icons share the same executable path.
+- Executable-path-only matching is therefore ambiguous.
+- Exact GUID matching remains safe for the stable icon.
+- A GUID-changing icon cannot be paired across versions from path alone when
+  another current GUID-based icon shares the same executable.
 
 This version:
 
@@ -75,7 +72,16 @@ constexpr wchar_t kUIOrderListValueName[] =
     L"UIOrderList";
 
 constexpr wchar_t kTargetExecutableName[] =
-    L"traydualuidversionprobev150.exe";
+    L"trayguidfallbackprobev160.exe";
+
+constexpr wchar_t kStableGuid[] =
+    L"{0f29c634-2a3b-4a77-9d15-8bf6dd6a1601}";
+
+constexpr wchar_t kRotatingGuidV1[] =
+    L"{1a3bd745-3b4c-5b88-ae26-9cf7ee7b1602}";
+
+constexpr wchar_t kRotatingGuidV2[] =
+    L"{2b4ce856-4c5d-6c99-bf37-ad08ff8c1603}";
 
 std::atomic<bool> g_auditCompleted =
     false;
@@ -100,12 +106,7 @@ struct RegistryRecord {
     std::wstring executablePath;
     std::wstring normalizedExecutablePath;
     std::wstring initialTooltip;
-
-    bool uidValid =
-        false;
-
-    DWORD uid =
-        0;
+    std::wstring iconGuid;
 
     bool executableExists =
         false;
@@ -204,10 +205,8 @@ std::wstring QueryStringValue(
         );
 
     if (
-        status !=
-            ERROR_SUCCESS ||
-        requiredBytes ==
-            0
+        status != ERROR_SUCCESS ||
+        requiredBytes == 0
     ) {
         return L"";
     }
@@ -248,52 +247,6 @@ std::wstring QueryStringValue(
         std::wstring(
             buffer.data()
         );
-}
-
-bool QueryDwordValue(
-    const std::wstring& subkey,
-    const wchar_t* valueName,
-    DWORD* value
-) {
-    if (!value) {
-        return false;
-    }
-
-    DWORD registryType =
-        REG_NONE;
-
-    DWORD result =
-        0;
-
-    DWORD resultBytes =
-        sizeof(result);
-
-    const LONG status =
-        RegGetValueW(
-            HKEY_CURRENT_USER,
-            subkey.c_str(),
-            valueName,
-            RRF_RT_REG_DWORD,
-            &registryType,
-            &result,
-            &resultBytes
-        );
-
-    if (
-        status !=
-            ERROR_SUCCESS ||
-        registryType !=
-            REG_DWORD ||
-        resultBytes !=
-            sizeof(result)
-    ) {
-        return false;
-    }
-
-    *value =
-        result;
-
-    return true;
 }
 
 UIOrderSnapshot CaptureUIOrderSnapshot() {
@@ -776,11 +729,12 @@ RegistryRecord ReadRegistryRecord(
             L"InitialTooltip"
         );
 
-    record.uidValid =
-        QueryDwordValue(
-            subkey,
-            L"UID",
-            &record.uid
+    record.iconGuid =
+        ToLower(
+            QueryStringValue(
+                subkey,
+                L"IconGuid"
+            )
         );
 
     record.normalizedExecutablePath =
@@ -835,13 +789,13 @@ bool IsPrimaryShellProcess() {
         GetCurrentProcessId();
 }
 
-void RunDualUidAudit() {
+void RunGuidFallbackAudit() {
     const UIOrderSnapshot snapshot =
         CaptureUIOrderSnapshot();
 
     if (!snapshot.valid) {
         Wh_Log(
-            L"DUAL_UID_AUDIT_FAILED "
+            L"GUID_FALLBACK_AUDIT_FAILED "
             L"registryStatus=%ld",
             snapshot.status
         );
@@ -852,15 +806,15 @@ void RunDualUidAudit() {
     std::map<
         std::wstring,
         std::vector<RegistryRecord>
-    > pathGroups;
+    > groups;
 
     unsigned long long targetRecords =
         0;
 
-    unsigned long long targetUidRecords =
+    unsigned long long targetGuidRecords =
         0;
 
-    unsigned long long targetMissingUidRecords =
+    unsigned long long targetMissingGuidRecords =
         0;
 
     for (
@@ -893,14 +847,14 @@ void RunDualUidAudit() {
         targetRecords++;
 
         if (
-            record.uidValid
+            record.iconGuid.empty()
         ) {
-            targetUidRecords++;
+            targetMissingGuidRecords++;
         } else {
-            targetMissingUidRecords++;
+            targetGuidRecords++;
         }
 
-        pathGroups[
+        groups[
             record.normalizedExecutablePath
         ].push_back(
             std::move(
@@ -912,48 +866,53 @@ void RunDualUidAudit() {
     unsigned long long normalizedPathGroups =
         0;
 
-    unsigned long long multiRecordPathGroups =
+    unsigned long long activeCandidateGroups =
+        0;
+
+    unsigned long long expectedMixedGroups =
         0;
 
     unsigned long long pathOnlyAmbiguousGroups =
         0;
 
-    unsigned long long uidChains =
+    unsigned long long stableGuidCurrentRecords =
         0;
 
-    unsigned long long uidHistoricalChainCandidates =
+    unsigned long long stableGuidStaleRecords =
         0;
 
-    unsigned long long uidAmbiguousChains =
+    unsigned long long rotatingV1CurrentRecords =
         0;
 
-    unsigned long long expectedDualUidGroups =
+    unsigned long long rotatingV1StaleRecords =
+        0;
+
+    unsigned long long rotatingV2CurrentRecords =
+        0;
+
+    unsigned long long rotatingV2StaleRecords =
         0;
 
     for (
-        const auto& pathGroup :
-        pathGroups
+        const auto& groupPair :
+        groups
     ) {
         normalizedPathGroups++;
 
         const std::wstring& normalizedPath =
-            pathGroup.first;
+            groupPair.first;
 
         const std::vector<RegistryRecord>& members =
-            pathGroup.second;
-
-        if (
-            members.size() >
-            1
-        ) {
-            multiRecordPathGroups++;
-        }
+            groupPair.second;
 
         std::set<std::wstring>
             exactPaths;
 
-        std::set<DWORD>
-            uniqueUids;
+        std::set<std::wstring>
+            allGuids;
+
+        std::set<std::wstring>
+            currentGuids;
 
         std::set<std::wstring>
             existingPaths;
@@ -963,14 +922,34 @@ void RunDualUidAudit() {
             unsigned long long
         > exactPathCounts;
 
-        std::map<
-            DWORD,
-            std::vector<
-                const RegistryRecord*
-            >
-        > uidGroups;
-
         unsigned long long existingRecords =
+            0;
+
+        unsigned long long stableRecords =
+            0;
+
+        unsigned long long stableCurrent =
+            0;
+
+        unsigned long long stableStale =
+            0;
+
+        unsigned long long rotatingV1Records =
+            0;
+
+        unsigned long long rotatingV1Current =
+            0;
+
+        unsigned long long rotatingV1Stale =
+            0;
+
+        unsigned long long rotatingV2Records =
+            0;
+
+        unsigned long long rotatingV2Current =
+            0;
+
+        unsigned long long rotatingV2Stale =
             0;
 
         for (
@@ -993,6 +972,14 @@ void RunDualUidAudit() {
             ]++;
 
             if (
+                !member.iconGuid.empty()
+            ) {
+                allGuids.insert(
+                    member.iconGuid
+                );
+            }
+
+            if (
                 member.executableExists
             ) {
                 existingRecords++;
@@ -1000,20 +987,59 @@ void RunDualUidAudit() {
                 existingPaths.insert(
                     exactPath
                 );
+
+                if (
+                    !member.iconGuid.empty()
+                ) {
+                    currentGuids.insert(
+                        member.iconGuid
+                    );
+                }
             }
 
             if (
-                member.uidValid
+                member.iconGuid ==
+                kStableGuid
             ) {
-                uniqueUids.insert(
-                    member.uid
-                );
+                stableRecords++;
 
-                uidGroups[
-                    member.uid
-                ].push_back(
-                    &member
-                );
+                if (
+                    member.executableExists
+                ) {
+                    stableCurrent++;
+                } else {
+                    stableStale++;
+                }
+            }
+
+            if (
+                member.iconGuid ==
+                kRotatingGuidV1
+            ) {
+                rotatingV1Records++;
+
+                if (
+                    member.executableExists
+                ) {
+                    rotatingV1Current++;
+                } else {
+                    rotatingV1Stale++;
+                }
+            }
+
+            if (
+                member.iconGuid ==
+                kRotatingGuidV2
+            ) {
+                rotatingV2Records++;
+
+                if (
+                    member.executableExists
+                ) {
+                    rotatingV2Current++;
+                } else {
+                    rotatingV2Stale++;
+                }
             }
         }
 
@@ -1035,12 +1061,20 @@ void RunDualUidAudit() {
             }
         }
 
-        const bool pathOnlyAmbiguous =
-            uniqueUids.size() >
-                1 &&
-            existingPaths.size() ==
-                1 &&
+        const bool hasCurrentRecords =
             existingRecords >
+            0;
+
+        if (
+            hasCurrentRecords
+        ) {
+            activeCandidateGroups++;
+        }
+
+        const bool pathOnlyAmbiguous =
+            existingRecords >
+                1 &&
+            currentGuids.size() >
                 1;
 
         if (
@@ -1049,37 +1083,89 @@ void RunDualUidAudit() {
             pathOnlyAmbiguousGroups++;
         }
 
-        const bool expectedDualUidGroup =
+        const bool stableGuidExactMatchSafe =
+            stableRecords ==
+                1 &&
+            stableCurrent ==
+                1 &&
+            stableStale ==
+                0;
+
+        const bool rotatingGuidChanged =
+            rotatingV1Records ==
+                1 &&
+            rotatingV1Stale ==
+                1 &&
+            rotatingV1Current ==
+                0 &&
+            rotatingV2Records ==
+                1 &&
+            rotatingV2Current ==
+                1 &&
+            rotatingV2Stale ==
+                0;
+
+        const bool rotatingFallbackAmbiguous =
+            rotatingGuidChanged &&
+            pathOnlyAmbiguous;
+
+        const bool expectedMixedShape =
             members.size() ==
-                4 &&
+                3 &&
             exactPaths.size() ==
                 2 &&
-            uniqueUids.size() ==
+            allGuids.size() ==
+                3 &&
+            currentGuids.size() ==
                 2 &&
             existingRecords ==
                 2 &&
             existingPaths.size() ==
                 1 &&
             sameExactPathDuplicate &&
-            pathOnlyAmbiguous;
+            stableGuidExactMatchSafe &&
+            rotatingGuidChanged &&
+            rotatingFallbackAmbiguous;
 
         if (
-            expectedDualUidGroup
+            expectedMixedShape
         ) {
-            expectedDualUidGroups++;
+            expectedMixedGroups++;
         }
 
+        stableGuidCurrentRecords +=
+            stableCurrent;
+
+        stableGuidStaleRecords +=
+            stableStale;
+
+        rotatingV1CurrentRecords +=
+            rotatingV1Current;
+
+        rotatingV1StaleRecords +=
+            rotatingV1Stale;
+
+        rotatingV2CurrentRecords +=
+            rotatingV2Current;
+
+        rotatingV2StaleRecords +=
+            rotatingV2Stale;
+
         Wh_Log(
-            L"DUAL_UID_PATH_GROUP "
+            L"GUID_FALLBACK_GROUP "
             L"group=%llu "
             L"memberCount=%llu "
             L"uniqueExactPaths=%llu "
-            L"uniqueUids=%llu "
+            L"uniqueGuids=%llu "
             L"existingRecords=%llu "
             L"uniqueExistingPaths=%llu "
+            L"currentGuids=%llu "
             L"sameExactPathDuplicate=%d "
             L"pathOnlyAmbiguous=%d "
-            L"expectedDualUidShape=%d "
+            L"stableGuidExactMatchSafe=%d "
+            L"rotatingGuidChanged=%d "
+            L"rotatingFallbackAmbiguous=%d "
+            L"expectedMixedShape=%d "
             L"normalizedPath=\"%s\"",
             normalizedPathGroups,
             static_cast<
@@ -1095,7 +1181,7 @@ void RunDualUidAudit() {
             static_cast<
                 unsigned long long
             >(
-                uniqueUids.size()
+                allGuids.size()
             ),
             existingRecords,
             static_cast<
@@ -1103,13 +1189,27 @@ void RunDualUidAudit() {
             >(
                 existingPaths.size()
             ),
+            static_cast<
+                unsigned long long
+            >(
+                currentGuids.size()
+            ),
             sameExactPathDuplicate
                 ? 1
                 : 0,
             pathOnlyAmbiguous
                 ? 1
                 : 0,
-            expectedDualUidGroup
+            stableGuidExactMatchSafe
+                ? 1
+                : 0,
+            rotatingGuidChanged
+                ? 1
+                : 0,
+            rotatingFallbackAmbiguous
+                ? 1
+                : 0,
+            expectedMixedShape
                 ? 1
                 : 0,
             normalizedPath.c_str()
@@ -1127,14 +1227,13 @@ void RunDualUidAudit() {
                 ];
 
             Wh_Log(
-                L"DUAL_UID_PATH_GROUP_MEMBER "
+                L"GUID_FALLBACK_GROUP_MEMBER "
                 L"group=%llu "
                 L"member=%llu "
                 L"id=%llu "
                 L"position=%llu "
-                L"uidValid=%d "
-                L"uid=%u "
                 L"exists=%d "
+                L"guid=\"%s\" "
                 L"tooltip=\"%s\" "
                 L"path=\"%s\"",
                 normalizedPathGroups,
@@ -1150,199 +1249,74 @@ void RunDualUidAudit() {
                     member.identity
                 ),
                 member.oneBasedPosition,
-                member.uidValid
-                    ? 1
-                    : 0,
-                member.uid,
                 member.executableExists
                     ? 1
                     : 0,
+                member.iconGuid.c_str(),
                 member.initialTooltip.c_str(),
                 member.executablePath.c_str()
             );
         }
-
-        for (
-            const auto& uidGroup :
-            uidGroups
-        ) {
-            uidChains++;
-
-            const DWORD uid =
-                uidGroup.first;
-
-            const std::vector<
-                const RegistryRecord*
-            >& uidMembers =
-                uidGroup.second;
-
-            std::set<std::wstring>
-                uidExactPaths;
-
-            std::set<std::wstring>
-                uidExistingPaths;
-
-            unsigned long long uidExistingRecords =
-                0;
-
-            for (
-                const RegistryRecord* member :
-                uidMembers
-            ) {
-                const std::wstring exactPath =
-                    ToLower(
-                        NormalizeSlashes(
-                            member->executablePath
-                        )
-                    );
-
-                uidExactPaths.insert(
-                    exactPath
-                );
-
-                if (
-                    member->executableExists
-                ) {
-                    uidExistingRecords++;
-
-                    uidExistingPaths.insert(
-                        exactPath
-                    );
-                }
-            }
-
-            const bool historicalPaths =
-                uidExactPaths.size() >
-                1;
-
-            const bool singleCurrentRecord =
-                uidExistingRecords ==
-                1;
-
-            const bool singleCurrentPath =
-                uidExistingPaths.size() ==
-                1;
-
-            const bool uidAmbiguous =
-                uidExistingRecords >
-                    1 ||
-                uidExistingPaths.size() >
-                    1;
-
-            const bool historicalChainCandidate =
-                uidMembers.size() ==
-                    2 &&
-                uidExactPaths.size() ==
-                    2 &&
-                historicalPaths &&
-                singleCurrentRecord &&
-                singleCurrentPath &&
-                !uidAmbiguous;
-
-            if (
-                historicalChainCandidate
-            ) {
-                uidHistoricalChainCandidates++;
-            }
-
-            if (
-                uidAmbiguous
-            ) {
-                uidAmbiguousChains++;
-            }
-
-            Wh_Log(
-                L"DUAL_UID_CHAIN "
-                L"pathGroup=%llu "
-                L"uid=%u "
-                L"memberCount=%llu "
-                L"uniqueExactPaths=%llu "
-                L"existingRecords=%llu "
-                L"uniqueExistingPaths=%llu "
-                L"historicalPaths=%d "
-                L"singleCurrentRecord=%d "
-                L"singleCurrentPath=%d "
-                L"ambiguous=%d "
-                L"historicalChainCandidate=%d",
-                normalizedPathGroups,
-                uid,
-                static_cast<
-                    unsigned long long
-                >(
-                    uidMembers.size()
-                ),
-                static_cast<
-                    unsigned long long
-                >(
-                    uidExactPaths.size()
-                ),
-                uidExistingRecords,
-                static_cast<
-                    unsigned long long
-                >(
-                    uidExistingPaths.size()
-                ),
-                historicalPaths
-                    ? 1
-                    : 0,
-                singleCurrentRecord
-                    ? 1
-                    : 0,
-                singleCurrentPath
-                    ? 1
-                    : 0,
-                uidAmbiguous
-                    ? 1
-                    : 0,
-                historicalChainCandidate
-                    ? 1
-                    : 0
-            );
-        }
     }
 
-    const bool dualUidSeparationValidated =
-        expectedDualUidGroups ==
+    const bool mixedGuidBehaviorValidated =
+        activeCandidateGroups ==
             1 &&
-        uidChains ==
-            2 &&
-        uidHistoricalChainCandidates ==
-            2 &&
-        uidAmbiguousChains ==
+        expectedMixedGroups ==
+            1 &&
+        pathOnlyAmbiguousGroups ==
+            1 &&
+        stableGuidCurrentRecords ==
+            1 &&
+        stableGuidStaleRecords ==
             0 &&
-        targetMissingUidRecords ==
+        rotatingV1CurrentRecords ==
+            0 &&
+        rotatingV1StaleRecords ==
+            1 &&
+        rotatingV2CurrentRecords ==
+            1 &&
+        rotatingV2StaleRecords ==
+            0 &&
+        targetMissingGuidRecords ==
             0;
 
     Wh_Log(
-        L"DUAL_UID_AUDIT_SUMMARY "
+        L"GUID_FALLBACK_AUDIT_SUMMARY "
         L"uiOrderEntries=%llu "
         L"targetRecords=%llu "
-        L"targetUidRecords=%llu "
-        L"targetMissingUidRecords=%llu "
+        L"targetGuidRecords=%llu "
+        L"targetMissingGuidRecords=%llu "
         L"normalizedPathGroups=%llu "
-        L"multiRecordPathGroups=%llu "
+        L"activeCandidateGroups=%llu "
         L"pathOnlyAmbiguousGroups=%llu "
-        L"uidChains=%llu "
-        L"uidHistoricalChainCandidates=%llu "
-        L"uidAmbiguousChains=%llu "
-        L"expectedDualUidGroups=%llu "
-        L"dualUidSeparationValidated=%d",
+        L"expectedMixedGroups=%llu "
+        L"stableGuidCurrentRecords=%llu "
+        L"stableGuidStaleRecords=%llu "
+        L"rotatingV1CurrentRecords=%llu "
+        L"rotatingV1StaleRecords=%llu "
+        L"rotatingV2CurrentRecords=%llu "
+        L"rotatingV2StaleRecords=%llu "
+        L"mixedGuidBehaviorValidated=%d",
         static_cast<
             unsigned long long
         >(
             snapshot.entries.size()
         ),
         targetRecords,
-        targetUidRecords,
-        targetMissingUidRecords,
+        targetGuidRecords,
+        targetMissingGuidRecords,
         normalizedPathGroups,
-        multiRecordPathGroups,
+        activeCandidateGroups,
         pathOnlyAmbiguousGroups,
-        uidChains,
-        uidHistoricalChainCandidates,
-        uidAmbiguousChains,
-        expectedDualUidGroups,
-        dualUidSeparationValidated
+        expectedMixedGroups,
+        stableGuidCurrentRecords,
+        stableGuidStaleRecords,
+        rotatingV1CurrentRecords,
+        rotatingV1StaleRecords,
+        rotatingV2CurrentRecords,
+        rotatingV2StaleRecords,
+        mixedGuidBehaviorValidated
             ? 1
             : 0
     );
@@ -1358,14 +1332,14 @@ void RunDualUidAudit() {
 BOOL Wh_ModInit() {
     Wh_Log(
         L"Tray Add Path Analyzer "
-        L"0.15.0 initializing"
+        L"0.16.0 initializing"
     );
 
     if (
         !IsPrimaryShellProcess()
     ) {
         Wh_Log(
-            L"DUAL_UID_AUDIT_SKIPPED "
+            L"GUID_FALLBACK_AUDIT_SKIPPED "
             L"reason=\"non-primary Explorer process\" "
             L"processId=%lu",
             GetCurrentProcessId()
@@ -1375,12 +1349,12 @@ BOOL Wh_ModInit() {
     }
 
     Wh_Log(
-        L"DUAL_UID_AUDIT_BEGIN "
+        L"GUID_FALLBACK_AUDIT_BEGIN "
         L"processId=%lu",
         GetCurrentProcessId()
     );
 
-    RunDualUidAudit();
+    RunGuidFallbackAudit();
 
     return TRUE;
 }
