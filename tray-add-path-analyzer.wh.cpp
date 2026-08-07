@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              tray-add-path-analyzer
 // @name            Tray Add Path Analyzer
-// @description     Tests native saved tray-order reuse after one safe end move.
-// @version         0.17.0
+// @description     Tests native saved tray-order reuse across a stable-GUID executable path change.
+// @version         0.18.0
 // @author          Yusseter
 // @github          https://github.com/Yusseter
 // @homepage        https://github.com/Yusseter/tray-order-lock
@@ -16,36 +16,44 @@
 /*
 # Tray Add Path Analyzer
 
-A temporary two-run diagnostic mod.
+A temporary two-version diagnostic mod.
 
-Version 0.17.0 tests whether Windows natively reuses a tray icon's stored UI
-order when the same identity returns.
+Version 0.18.0 tests whether Windows preserves a saved tray position when a
+GUID-based icon returns from a different executable version directory while
+retaining the same GUID.
 
 The dedicated test executable is:
 
-TraySavedOrderProbeV170.exe
+TrayGuidSavedOrderProbeV180.exe
 
-It uses UID 1 and is run twice from the exact same executable path.
+The test application is run from:
 
-First run:
+- Version-1.0.0
+- Version-2.0.0
 
-- A new registry identity is created.
-- The analyzer identifies that exact new identity.
+Both versions use the same randomly generated GUID for one test run.
+
+First version:
+
+- A fresh tray registry identity is created.
+- The analyzer identifies that exact identity.
 - The live overflow collection size is read.
-- The test icon is moved exactly once to the overflow end using the previously
-  validated NotificationAreaIconManager2::MoveIcon path.
+- The icon is moved exactly once through the previously validated
+  NotificationAreaIconManager2::MoveIcon path.
 - The resulting UIOrderList position is recorded.
 
-Second run:
+Second version:
 
-- No MoveIcon call is made by the analyzer.
-- The analyzer checks that Windows reuses the same registry identity.
-- NotifyIconSettingsDatabase::GetUIOrderForIcon calls are observed.
-- The returned UI order is compared with the stored UIOrderList position.
-- UIOrderList before and after AddIcon is compared to determine whether the
-  saved position was preserved without analyzer intervention.
+- The old Version-1.0.0 directory has been removed.
+- The same GUID is used from Version-2.0.0.
+- The analyzer performs no additional MoveIcon call.
+- It checks whether Windows reuses the same registry identity.
+- It checks whether the registry ExecutablePath changes from Version-1.0.0 to
+  Version-2.0.0.
+- It observes NotifyIconSettingsDatabase::GetUIOrderForIcon.
+- It verifies that the saved UI order remains unchanged across the path update.
 
-The analyzer never moves any non-test icon and performs no registry writes.
+The analyzer never moves a non-test icon and performs no registry writes.
 */
 // ==/WindhawkModReadme==
 
@@ -73,7 +81,13 @@ constexpr wchar_t kUIOrderListValueName[] =
     L"UIOrderList";
 
 constexpr wchar_t kTargetExecutableName[] =
-    L"traysavedorderprobev170.exe";
+    L"trayguidsavedorderprobev180.exe";
+
+constexpr wchar_t kVersion1Marker[] =
+    L"\\version-1.0.0\\";
+
+constexpr wchar_t kVersion2Marker[] =
+    L"\\version-2.0.0\\";
 
 constexpr int kOverflowLocation =
     1;
@@ -183,10 +197,10 @@ std::atomic<unsigned long long> g_savedPositionAfterMove =
 std::atomic<bool> g_moveConsumed =
     false;
 
-std::atomic<bool> g_firstMoveCompleted =
+std::atomic<bool> g_firstMoveObserved =
     false;
 
-std::atomic<bool> g_returnValidationCompleted =
+std::atomic<bool> g_crossVersionValidationCompleted =
     false;
 
 thread_local unsigned int g_internalMoveDepth =
@@ -220,9 +234,46 @@ struct AddIconContext {
     UIOrderSnapshot before;
 
     std::vector<OrderQueryObservation> orderQueries;
+
+    std::wstring targetPathBefore;
 };
 
 thread_local AddIconContext g_addIconContext;
+
+std::wstring ToLower(
+    std::wstring value
+) {
+    std::transform(
+        value.begin(),
+        value.end(),
+        value.begin(),
+        [](
+            wchar_t character
+        ) {
+            return
+                static_cast<wchar_t>(
+                    std::towlower(
+                        character
+                    )
+                );
+        }
+    );
+
+    return value;
+}
+
+std::wstring NormalizeSlashes(
+    std::wstring path
+) {
+    std::replace(
+        path.begin(),
+        path.end(),
+        L'/',
+        L'\\'
+    );
+
+    return path;
+}
 
 bool ContainsText(
     const wchar_t* text,
@@ -236,6 +287,72 @@ bool ContainsText(
             expected
         ) !=
         nullptr;
+}
+
+bool ContainsOrdinalIgnoreCase(
+    const std::wstring& value,
+    const std::wstring& expected
+) {
+    return
+        ToLower(
+            value
+        ).find(
+            ToLower(
+                expected
+            )
+        ) !=
+        std::wstring::npos;
+}
+
+bool EndsWithOrdinalIgnoreCase(
+    const std::wstring& value,
+    const std::wstring& suffix
+) {
+    if (
+        value.size() <
+        suffix.size()
+    ) {
+        return false;
+    }
+
+    const std::size_t offset =
+        value.size() -
+        suffix.size();
+
+    for (
+        std::size_t index = 0;
+        index <
+            suffix.size();
+        index++
+    ) {
+        const wchar_t left =
+            static_cast<wchar_t>(
+                std::towlower(
+                    value[
+                        offset +
+                        index
+                    ]
+                )
+            );
+
+        const wchar_t right =
+            static_cast<wchar_t>(
+                std::towlower(
+                    suffix[
+                        index
+                    ]
+                )
+            );
+
+        if (
+            left !=
+            right
+        ) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 bool IsNotificationAreaIconQueryInterfaceSymbol(
@@ -495,7 +612,7 @@ bool ResolveRequiredSymbols(
     }
 
     Wh_Log(
-        L"SAVED_ORDER_MOVE_SUPPORT_READY "
+        L"GUID_SAVED_ORDER_SUPPORT_READY "
         L"queryFunction=%p "
         L"iconInterfaceId=%p "
         L"vectorInterfaceId=%p "
@@ -785,66 +902,24 @@ std::wstring QueryStringValue(
         );
 }
 
-bool EndsWithOrdinalIgnoreCase(
-    const std::wstring& value,
-    const std::wstring& suffix
+std::wstring QueryExecutablePath(
+    std::uint64_t identity
 ) {
-    if (
-        value.size() <
-        suffix.size()
-    ) {
-        return false;
-    }
-
-    const std::size_t offset =
-        value.size() -
-        suffix.size();
-
-    for (
-        std::size_t index = 0;
-        index <
-            suffix.size();
-        index++
-    ) {
-        const wchar_t left =
-            static_cast<wchar_t>(
-                std::towlower(
-                    value[
-                        offset +
-                        index
-                    ]
-                )
-            );
-
-        const wchar_t right =
-            static_cast<wchar_t>(
-                std::towlower(
-                    suffix[
-                        index
-                    ]
-                )
-            );
-
-        if (
-            left !=
-            right
-        ) {
-            return false;
-        }
-    }
-
-    return true;
+    return
+        QueryStringValue(
+            MakeTrayEntrySubkey(
+                identity
+            ),
+            L"ExecutablePath"
+        );
 }
 
 bool IsTargetIdentity(
     std::uint64_t identity
 ) {
     const std::wstring executablePath =
-        QueryStringValue(
-            MakeTrayEntrySubkey(
-                identity
-            ),
-            L"ExecutablePath"
+        QueryExecutablePath(
+            identity
         );
 
     return
@@ -1145,24 +1220,23 @@ void AnalyzeCompletedAddIcon(
                 );
         }
 
+        const std::wstring pathAfter =
+            QueryExecutablePath(
+                targetIdentity
+            );
+
         const unsigned long long afterPosition =
             FindOneBasedPosition(
                 after,
                 targetIdentity
             );
 
-        const unsigned long long savedPosition =
-            g_savedPositionAfterMove.load(
-                std::memory_order_acquire
-            );
-
-        const bool identityMatchesMove =
-            firstTargetIdentity ==
-            targetIdentity;
-
-        const bool firstMoveCompleted =
-            g_firstMoveCompleted.load(
-                std::memory_order_acquire
+        const bool version1Path =
+            ContainsOrdinalIgnoreCase(
+                NormalizeSlashes(
+                    pathAfter
+                ),
+                kVersion1Marker
             );
 
         g_targetResults.fetch_add(
@@ -1171,29 +1245,40 @@ void AnalyzeCompletedAddIcon(
         );
 
         Wh_Log(
-            L"SAVED_ORDER_FIRST_ADD_RESULT "
+            L"GUID_SAVED_ORDER_FIRST_RESULT "
             L"addCall=%llu "
             L"id=%llu "
             L"afterPosition=%llu "
             L"savedPositionAfterMove=%llu "
             L"identityMatchesMove=%d "
-            L"firstMoveCompleted=%d "
-            L"moveAttempts=%llu",
+            L"firstMoveObserved=%d "
+            L"version1Path=%d "
+            L"moveAttempts=%llu "
+            L"path=\"%s\"",
             context.callNumber,
             static_cast<unsigned long long>(
                 targetIdentity
             ),
             afterPosition,
-            savedPosition,
-            identityMatchesMove
+            g_savedPositionAfterMove.load(
+                std::memory_order_acquire
+            ),
+            firstTargetIdentity ==
+                    targetIdentity
                 ? 1
                 : 0,
-            firstMoveCompleted
+            g_firstMoveObserved.load(
+                std::memory_order_acquire
+            )
+                ? 1
+                : 0,
+            version1Path
                 ? 1
                 : 0,
             g_moveAttempts.load(
                 std::memory_order_acquire
-            )
+            ),
+            pathAfter.c_str()
         );
 
         return;
@@ -1218,6 +1303,13 @@ void AnalyzeCompletedAddIcon(
             firstTargetIdentity
         );
 
+    if (
+        !identityInBefore ||
+        !identityInAfter
+    ) {
+        return;
+    }
+
     const unsigned int targetOrderQueries =
         CountObservedIdentity(
             context.orderQueries,
@@ -1225,10 +1317,8 @@ void AnalyzeCompletedAddIcon(
         );
 
     if (
-        !identityInBefore ||
-        !identityInAfter ||
         targetOrderQueries ==
-            0
+        0
     ) {
         return;
     }
@@ -1243,6 +1333,11 @@ void AnalyzeCompletedAddIcon(
         FindOneBasedPosition(
             after,
             firstTargetIdentity
+        );
+
+    const unsigned long long savedPositionAfterMove =
+        g_savedPositionAfterMove.load(
+            std::memory_order_acquire
         );
 
     unsigned int expectedZeroBasedOrder =
@@ -1269,28 +1364,66 @@ void AnalyzeCompletedAddIcon(
               )
             : 0;
 
-    const bool beforeAtEnd =
-        context.before.valid &&
-        beforePosition !=
+    const std::wstring pathBefore =
+        context.targetPathBefore;
+
+    const std::wstring pathAfter =
+        QueryExecutablePath(
+            firstTargetIdentity
+        );
+
+    const std::wstring normalizedPathBefore =
+        ToLower(
+            NormalizeSlashes(
+                pathBefore
+            )
+        );
+
+    const std::wstring normalizedPathAfter =
+        ToLower(
+            NormalizeSlashes(
+                pathAfter
+            )
+        );
+
+    const bool pathChanged =
+        !normalizedPathBefore.empty() &&
+        !normalizedPathAfter.empty() &&
+        normalizedPathBefore !=
+            normalizedPathAfter;
+
+    const bool beforeVersion1 =
+        ContainsOrdinalIgnoreCase(
+            normalizedPathBefore,
+            kVersion1Marker
+        );
+
+    const bool afterVersion2 =
+        ContainsOrdinalIgnoreCase(
+            normalizedPathAfter,
+            kVersion2Marker
+        );
+
+    const bool positionMatchesSaved =
+        savedPositionAfterMove !=
             0 &&
         beforePosition ==
-            context.before.entries.size();
-
-    const bool afterAtEnd =
-        after.valid &&
-        afterPosition !=
-            0 &&
+            savedPositionAfterMove &&
         afterPosition ==
-            after.entries.size();
+            savedPositionAfterMove;
 
     const bool positionPreserved =
         beforePosition !=
             0 &&
-        afterPosition ==
-            beforePosition;
+        beforePosition ==
+            afterPosition;
 
-    const bool firstMoveCompleted =
-        g_firstMoveCompleted.load(
+    const bool savedOrderQueried =
+        matchingSavedOrderQueries >
+        0;
+
+    const bool firstMoveObserved =
+        g_firstMoveObserved.load(
             std::memory_order_acquire
         );
 
@@ -1300,20 +1433,19 @@ void AnalyzeCompletedAddIcon(
         ) ==
         1;
 
-    const bool savedOrderQueried =
-        matchingSavedOrderQueries >
-        0;
-
-    const bool savedOrderReused =
-        firstMoveCompleted &&
+    const bool crossVersionSavedOrderReused =
+        firstMoveObserved &&
         onlyOneAnalyzerMove &&
+        positionMatchesSaved &&
         positionPreserved &&
-        beforeAtEnd &&
-        afterAtEnd &&
-        savedOrderQueried;
+        savedOrderQueried &&
+        pathChanged &&
+        beforeVersion1 &&
+        afterVersion2 &&
+        targetAdded.empty();
 
-    g_returnValidationCompleted.store(
-        savedOrderReused,
+    g_crossVersionValidationCompleted.store(
+        crossVersionSavedOrderReused,
         std::memory_order_release
     );
 
@@ -1323,10 +1455,10 @@ void AnalyzeCompletedAddIcon(
     );
 
     Wh_Log(
-        L"SAVED_ORDER_RETURN_RESULT "
+        L"GUID_SAVED_ORDER_RETURN_RESULT "
         L"addCall=%llu "
         L"id=%llu "
-        L"originalSavedPosition=%llu "
+        L"savedPositionAfterMove=%llu "
         L"beforePosition=%llu "
         L"afterPosition=%llu "
         L"beforeCount=%llu "
@@ -1334,20 +1466,22 @@ void AnalyzeCompletedAddIcon(
         L"expectedZeroBasedOrder=%u "
         L"targetOrderQueries=%u "
         L"matchingSavedOrderQueries=%u "
-        L"beforeAtEnd=%d "
-        L"afterAtEnd=%d "
+        L"pathChanged=%d "
+        L"beforeVersion1=%d "
+        L"afterVersion2=%d "
+        L"positionMatchesSaved=%d "
         L"positionPreserved=%d "
-        L"firstMoveCompleted=%d "
-        L"onlyOneAnalyzerMove=%d "
         L"savedOrderQueried=%d "
-        L"savedOrderReused=%d",
+        L"firstMoveObserved=%d "
+        L"onlyOneAnalyzerMove=%d "
+        L"crossVersionSavedOrderReused=%d "
+        L"pathBefore=\"%s\" "
+        L"pathAfter=\"%s\"",
         context.callNumber,
         static_cast<unsigned long long>(
             firstTargetIdentity
         ),
-        g_savedPositionAfterMove.load(
-            std::memory_order_acquire
-        ),
+        savedPositionAfterMove,
         beforePosition,
         afterPosition,
         static_cast<unsigned long long>(
@@ -1359,49 +1493,55 @@ void AnalyzeCompletedAddIcon(
         expectedZeroBasedOrder,
         targetOrderQueries,
         matchingSavedOrderQueries,
-        beforeAtEnd
+        pathChanged
             ? 1
             : 0,
-        afterAtEnd
+        beforeVersion1
+            ? 1
+            : 0,
+        afterVersion2
+            ? 1
+            : 0,
+        positionMatchesSaved
             ? 1
             : 0,
         positionPreserved
             ? 1
             : 0,
-        firstMoveCompleted
+        savedOrderQueried
+            ? 1
+            : 0,
+        firstMoveObserved
             ? 1
             : 0,
         onlyOneAnalyzerMove
             ? 1
             : 0,
-        savedOrderQueried
+        crossVersionSavedOrderReused
             ? 1
             : 0,
-        savedOrderReused
-            ? 1
-            : 0
+        pathBefore.c_str(),
+        pathAfter.c_str()
     );
 
     Wh_Log(
-        L"SAVED_ORDER_REUSE_SUMMARY "
+        L"GUID_SAVED_ORDER_SUMMARY "
         L"firstIdentity=%llu "
         L"savedPositionAfterMove=%llu "
         L"moveAttempts=%llu "
         L"targetResults=%llu "
-        L"returnValidationCompleted=%d",
+        L"crossVersionValidationCompleted=%d",
         static_cast<unsigned long long>(
             firstTargetIdentity
         ),
-        g_savedPositionAfterMove.load(
-            std::memory_order_acquire
-        ),
+        savedPositionAfterMove,
         g_moveAttempts.load(
             std::memory_order_acquire
         ),
         g_targetResults.load(
             std::memory_order_acquire
         ),
-        g_returnValidationCompleted.load(
+        g_crossVersionValidationCompleted.load(
             std::memory_order_acquire
         )
             ? 1
@@ -1577,6 +1717,21 @@ NotificationAreaIconManager_AddIcon_Hook(
     g_addIconContext.before =
         CaptureUIOrderSnapshot();
 
+    const std::uint64_t firstTargetIdentity =
+        g_firstTargetIdentity.load(
+            std::memory_order_acquire
+        );
+
+    if (
+        firstTargetIdentity !=
+        0
+    ) {
+        g_addIconContext.targetPathBefore =
+            QueryExecutablePath(
+                firstTargetIdentity
+            );
+    }
+
     Wh_Log(
         L"ADD_ICON_BEGIN "
         L"call=%llu "
@@ -1585,7 +1740,9 @@ NotificationAreaIconManager_AddIcon_Hook(
         L"trayNotifyData=%p "
         L"beforeValid=%d "
         L"beforeStatus=%ld "
-        L"beforeCount=%llu",
+        L"beforeCount=%llu "
+        L"trackedIdentity=%llu "
+        L"trackedPathBefore=\"%s\"",
         callNumber,
         GetCurrentThreadId(),
         pThis,
@@ -1596,7 +1753,11 @@ NotificationAreaIconManager_AddIcon_Hook(
         g_addIconContext.before.status,
         static_cast<unsigned long long>(
             g_addIconContext.before.entries.size()
-        )
+        ),
+        static_cast<unsigned long long>(
+            firstTargetIdentity
+        ),
+        g_addIconContext.targetPathBefore.c_str()
     );
 
     NotificationAreaIconManager_AddIcon_Original(
@@ -1916,7 +2077,7 @@ NotificationAreaIconManager_AddVisible_Hook(
         queriedAbi;
 
     Wh_Log(
-        L"SINGLE_END_MOVE_BEGIN "
+        L"GUID_SINGLE_MOVE_BEGIN "
         L"move=%llu "
         L"call=%llu "
         L"parentAddCall=%llu "
@@ -1963,16 +2124,17 @@ NotificationAreaIconManager_AddVisible_Hook(
         beforeMove.entries !=
             afterMove.entries;
 
-    const bool movedToGlobalEnd =
-        afterMove.valid &&
+    const bool positionChanged =
+        beforePosition !=
+            0 &&
         afterPosition !=
             0 &&
-        afterPosition ==
-            afterMove.entries.size();
+        beforePosition !=
+            afterPosition;
 
-    const bool moveCompleted =
+    const bool moveObserved =
         orderChanged &&
-        movedToGlobalEnd;
+        positionChanged;
 
     if (
         afterPosition !=
@@ -1984,23 +2146,24 @@ NotificationAreaIconManager_AddVisible_Hook(
         );
     }
 
-    g_firstMoveCompleted.store(
-        moveCompleted,
+    g_firstMoveObserved.store(
+        moveObserved,
         std::memory_order_release
     );
 
     Wh_Log(
-        L"SINGLE_END_MOVE_COMPLETE "
+        L"GUID_SINGLE_MOVE_COMPLETE "
         L"move=%llu "
         L"call=%llu "
         L"id=%llu "
         L"afterSnapshotValid=%d "
         L"afterStatus=%ld "
         L"afterCount=%llu "
+        L"beforePosition=%llu "
         L"afterPosition=%llu "
         L"orderChanged=%d "
-        L"movedToGlobalEnd=%d "
-        L"moveCompleted=%d",
+        L"positionChanged=%d "
+        L"moveObserved=%d",
         moveNumber,
         callNumber,
         static_cast<unsigned long long>(
@@ -2013,14 +2176,15 @@ NotificationAreaIconManager_AddVisible_Hook(
         static_cast<unsigned long long>(
             afterMove.entries.size()
         ),
+        beforePosition,
         afterPosition,
         orderChanged
             ? 1
             : 0,
-        movedToGlobalEnd
+        positionChanged
             ? 1
             : 0,
-        moveCompleted
+        moveObserved
             ? 1
             : 0
     );
@@ -2110,14 +2274,14 @@ bool IsPrimaryShellProcess() {
 BOOL Wh_ModInit() {
     Wh_Log(
         L"Tray Add Path Analyzer "
-        L"0.17.0 initializing"
+        L"0.18.0 initializing"
     );
 
     if (
         !IsPrimaryShellProcess()
     ) {
         Wh_Log(
-            L"SAVED_ORDER_TEST_SKIPPED "
+            L"GUID_SAVED_ORDER_TEST_SKIPPED "
             L"reason=\"non-primary Explorer process\" "
             L"processId=%lu",
             GetCurrentProcessId()
@@ -2176,7 +2340,7 @@ BOOL Wh_ModInit() {
     }
 
     Wh_Log(
-        L"SAVED_ORDER_TEST_READY "
+        L"GUID_SAVED_ORDER_TEST_READY "
         L"processId=%lu",
         GetCurrentProcessId()
     );
@@ -2194,8 +2358,8 @@ void Wh_ModUninit() {
         L"moveAttempts=%llu "
         L"firstIdentity=%llu "
         L"savedPositionAfterMove=%llu "
-        L"firstMoveCompleted=%d "
-        L"returnValidationCompleted=%d",
+        L"firstMoveObserved=%d "
+        L"crossVersionValidationCompleted=%d",
         g_addIconCalls.load(
             std::memory_order_acquire
         ),
@@ -2219,12 +2383,12 @@ void Wh_ModUninit() {
         g_savedPositionAfterMove.load(
             std::memory_order_acquire
         ),
-        g_firstMoveCompleted.load(
+        g_firstMoveObserved.load(
             std::memory_order_acquire
         )
             ? 1
             : 0,
-        g_returnValidationCompleted.load(
+        g_crossVersionValidationCompleted.load(
             std::memory_order_acquire
         )
             ? 1
