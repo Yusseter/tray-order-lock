@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              tray-add-path-analyzer
 // @name            Tray Add Path Analyzer
-// @description     Audits version-directory fallback identities for non-packaged tray icons.
-// @version         0.14.0
+// @description     Tests stable UID fallback chains for multiple tray icons across version-directory changes.
+// @version         0.15.0
 // @author          Yusseter
 // @github          https://github.com/Yusseter
 // @homepage        https://github.com/Yusseter/tray-order-lock
@@ -18,31 +18,29 @@
 
 A temporary read-only diagnostic mod.
 
-Version 0.14.0 audits notification-area registry records outside WindowsApps
-whose executable paths contain a conservative version-like directory.
+Version 0.15.0 analyzes a dedicated synthetic test application which creates
+two UID-based tray icons from two version directories.
 
-Examples include directory names such as:
+The test application uses:
 
-- 1.2.3
-- v1.2.3
-- app-1.2.3
-- version-1.2.3
+- UID 101
+- UID 202
 
-The analyzer replaces only those directory segments with <version> and groups
-records by the resulting normalized executable path.
+The first executable runs from Version-1.0.0.
+ first executable runs from Version-1.0.0.
+The second executable runs from Version-2.0.0.
 
-For each multi-record group it reports:
+After the first run, the Version-1.0.0 directory is removed before the second
+run. This leaves two stale registry identities from the first version and two
+current identities from the second version.
 
-- Exact executable paths.
-- Whether each executable still exists.
-- GUID or UID discriminator.
-- Number of distinct historical paths.
-- Whether more than one current executable exists.
-- Whether multiple records share the same exact executable path.
-- Whether the group resembles a safe single-app version-history chain.
+The analyzer verifies whether:
 
-The version-directory recognition is deliberately conservative. This version
-is an audit and does not establish a production matching rule.
+- Version-normalized executable path alone combines both tray icons into one
+  ambiguous group.
+- Stable UID separates that group into two independent historical chains.
+- Each UID chain contains one stale old-version record and one current
+  new-version record.
 
 This version:
 
@@ -76,8 +74,8 @@ constexpr wchar_t kNotifyIconSettingsPath[] =
 constexpr wchar_t kUIOrderListValueName[] =
     L"UIOrderList";
 
-constexpr wchar_t kWindowsAppsMarker[] =
-    L"\\windowsapps\\";
+constexpr wchar_t kTargetExecutableName[] =
+    L"traydualuidversionprobev150.exe";
 
 std::atomic<bool> g_auditCompleted =
     false;
@@ -101,7 +99,6 @@ struct RegistryRecord {
 
     std::wstring executablePath;
     std::wstring normalizedExecutablePath;
-    std::wstring publisher;
     std::wstring initialTooltip;
 
     bool uidValid =
@@ -109,9 +106,6 @@ struct RegistryRecord {
 
     DWORD uid =
         0;
-
-    std::wstring iconGuidText;
-    std::wstring discriminator;
 
     bool executableExists =
         false;
@@ -156,12 +150,14 @@ std::wstring NormalizeSlashes(
         L"\\\\?\\";
 
     if (
-        path.size() >= 4 &&
+        path.size() >=
+            4 &&
         path.compare(
             0,
             4,
             kExtendedPrefix
-        ) == 0
+        ) ==
+            0
     ) {
         path.erase(
             0,
@@ -208,8 +204,10 @@ std::wstring QueryStringValue(
         );
 
     if (
-        status != ERROR_SUCCESS ||
-        requiredBytes == 0
+        status !=
+            ERROR_SUCCESS ||
+        requiredBytes ==
+            0
     ) {
         return L"";
     }
@@ -236,7 +234,10 @@ std::wstring QueryStringValue(
             &actualBytes
         );
 
-    if (status != ERROR_SUCCESS) {
+    if (
+        status !=
+        ERROR_SUCCESS
+    ) {
         return L"";
     }
 
@@ -279,9 +280,12 @@ bool QueryDwordValue(
         );
 
     if (
-        status != ERROR_SUCCESS ||
-        registryType != REG_DWORD ||
-        resultBytes != sizeof(result)
+        status !=
+            ERROR_SUCCESS ||
+        registryType !=
+            REG_DWORD ||
+        resultBytes !=
+            sizeof(result)
     ) {
         return false;
     }
@@ -320,7 +324,10 @@ UIOrderSnapshot CaptureUIOrderSnapshot() {
         snapshot.status =
             status;
 
-        if (status != ERROR_SUCCESS) {
+        if (
+            status !=
+            ERROR_SUCCESS
+        ) {
             return snapshot;
         }
 
@@ -344,20 +351,28 @@ UIOrderSnapshot CaptureUIOrderSnapshot() {
                 &actualBytes
             );
 
-        if (status == ERROR_MORE_DATA) {
+        if (
+            status ==
+            ERROR_MORE_DATA
+        ) {
             continue;
         }
 
         snapshot.status =
             status;
 
-        if (status != ERROR_SUCCESS) {
+        if (
+            status !=
+            ERROR_SUCCESS
+        ) {
             return snapshot;
         }
 
         if (
             actualBytes %
-                sizeof(std::uint64_t) !=
+                sizeof(
+                    std::uint64_t
+                ) !=
             0
         ) {
             snapshot.status =
@@ -368,10 +383,15 @@ UIOrderSnapshot CaptureUIOrderSnapshot() {
 
         snapshot.entries.resize(
             actualBytes /
-            sizeof(std::uint64_t)
+            sizeof(
+                std::uint64_t
+            )
         );
 
-        if (actualBytes != 0) {
+        if (
+            actualBytes !=
+            0
+        ) {
             std::memcpy(
                 snapshot.entries.data(),
                 data.data(),
@@ -405,12 +425,14 @@ bool StartsWith(
         );
 
     return
-        value.size() >= prefixLength &&
+        value.size() >=
+            prefixLength &&
         value.compare(
             0,
             prefixLength,
             prefix
-        ) == 0;
+        ) ==
+            0;
 }
 
 bool IsNumericDottedVersionCore(
@@ -421,8 +443,10 @@ bool IsNumericDottedVersionCore(
     }
 
     if (
-        value.front() == L'.' ||
-        value.back() == L'.'
+        value.front() ==
+            L'.' ||
+        value.back() ==
+            L'.'
     ) {
         return false;
     }
@@ -441,8 +465,10 @@ bool IsNumericDottedVersionCore(
         value
     ) {
         if (
-            character >= L'0' &&
-            character <= L'9'
+            character >=
+                L'0' &&
+            character <=
+                L'9'
         ) {
             digitCount++;
 
@@ -452,8 +478,13 @@ bool IsNumericDottedVersionCore(
             continue;
         }
 
-        if (character == L'.') {
-            if (previousWasDot) {
+        if (
+            character ==
+            L'.'
+        ) {
+            if (
+                previousWasDot
+            ) {
                 return false;
             }
 
@@ -469,14 +500,18 @@ bool IsNumericDottedVersionCore(
     }
 
     return
-        digitCount > 0 &&
-        dotCount >= 1;
+        digitCount >
+            0 &&
+        dotCount >=
+            1;
 }
 
 bool LooksLikeVersionDirectory(
     const std::wstring& directoryName
 ) {
-    if (directoryName.empty()) {
+    if (
+        directoryName.empty()
+    ) {
         return false;
     }
 
@@ -506,10 +541,14 @@ bool LooksLikeVersionDirectory(
             8
         );
     } else if (
-        candidate.size() >= 2 &&
-        candidate[0] == L'v' &&
-        candidate[1] >= L'0' &&
-        candidate[1] <= L'9'
+        candidate.size() >=
+            2 &&
+        candidate[0] ==
+            L'v' &&
+        candidate[1] >=
+            L'0' &&
+        candidate[1] <=
+            L'9'
     ) {
         candidate.erase(
             0,
@@ -527,12 +566,14 @@ std::wstring BuildVersionNormalizedPath(
     const std::wstring& executablePath,
     bool* foundVersionDirectory
 ) {
-    if (foundVersionDirectory) {
+    if (
+        foundVersionDirectory
+    ) {
         *foundVersionDirectory =
             false;
     }
 
-    std::wstring path =
+    const std::wstring path =
         ToLower(
             NormalizeSlashes(
                 executablePath
@@ -592,7 +633,9 @@ std::wstring BuildVersionNormalizedPath(
             result +=
                 L"<version>";
 
-            if (foundVersionDirectory) {
+            if (
+                foundVersionDirectory
+            ) {
                 *foundVersionDirectory =
                     true;
             }
@@ -619,27 +662,63 @@ std::wstring BuildVersionNormalizedPath(
     return result;
 }
 
-bool IsWindowsAppsPath(
-    const std::wstring& executablePath
+bool EndsWithOrdinalIgnoreCase(
+    const std::wstring& value,
+    const std::wstring& suffix
 ) {
-    const std::wstring lowerPath =
-        ToLower(
-            NormalizeSlashes(
-                executablePath
-            )
-        );
+    if (
+        value.size() <
+        suffix.size()
+    ) {
+        return false;
+    }
 
-    return
-        lowerPath.find(
-            kWindowsAppsMarker
-        ) !=
-        std::wstring::npos;
+    const std::size_t offset =
+        value.size() -
+        suffix.size();
+
+    for (
+        std::size_t index = 0;
+        index <
+            suffix.size();
+        index++
+    ) {
+        const wchar_t left =
+            static_cast<wchar_t>(
+                std::towlower(
+                    value[
+                        offset +
+                        index
+                    ]
+                )
+            );
+
+        const wchar_t right =
+            static_cast<wchar_t>(
+                std::towlower(
+                    suffix[
+                        index
+                    ]
+                )
+            );
+
+        if (
+            left !=
+            right
+        ) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 bool ExecutableExists(
     const std::wstring& executablePath
 ) {
-    if (executablePath.empty()) {
+    if (
+        executablePath.empty()
+    ) {
         return false;
     }
 
@@ -664,31 +743,8 @@ bool ExecutableExists(
         (
             attributes &
             FILE_ATTRIBUTE_DIRECTORY
-        ) == 0;
-}
-
-std::wstring BuildDiscriminator(
-    const RegistryRecord& record
-) {
-    if (
-        !record.iconGuidText.empty()
-    ) {
-        return
-            L"guid:" +
-            ToLower(
-                record.iconGuidText
-            );
-    }
-
-    if (record.uidValid) {
-        return
-            L"uid:" +
-            std::to_wstring(
-                record.uid
-            );
-    }
-
-    return L"";
+        ) ==
+        0;
 }
 
 RegistryRecord ReadRegistryRecord(
@@ -714,12 +770,6 @@ RegistryRecord ReadRegistryRecord(
             L"ExecutablePath"
         );
 
-    record.publisher =
-        QueryStringValue(
-            subkey,
-            L"Publisher"
-        );
-
     record.initialTooltip =
         QueryStringValue(
             subkey,
@@ -733,12 +783,6 @@ RegistryRecord ReadRegistryRecord(
             &record.uid
         );
 
-    record.iconGuidText =
-        QueryStringValue(
-            subkey,
-            L"IconGuid"
-        );
-
     record.normalizedExecutablePath =
         BuildVersionNormalizedPath(
             record.executablePath,
@@ -750,12 +794,24 @@ RegistryRecord ReadRegistryRecord(
             record.executablePath
         );
 
-    record.discriminator =
-        BuildDiscriminator(
-            record
-        );
-
     return record;
+}
+
+bool IsTargetRecord(
+    const RegistryRecord& record
+) {
+    if (
+        record.executablePath.empty() ||
+        !record.hasVersionDirectory
+    ) {
+        return false;
+    }
+
+    return
+        EndsWithOrdinalIgnoreCase(
+            record.executablePath,
+            kTargetExecutableName
+        );
 }
 
 bool IsPrimaryShellProcess() {
@@ -779,13 +835,13 @@ bool IsPrimaryShellProcess() {
         GetCurrentProcessId();
 }
 
-void RunVersionDirectoryAudit() {
+void RunDualUidAudit() {
     const UIOrderSnapshot snapshot =
         CaptureUIOrderSnapshot();
 
     if (!snapshot.valid) {
         Wh_Log(
-            L"NONPACKAGE_VERSION_AUDIT_FAILED "
+            L"DUAL_UID_AUDIT_FAILED "
             L"registryStatus=%ld",
             snapshot.status
         );
@@ -796,74 +852,55 @@ void RunVersionDirectoryAudit() {
     std::map<
         std::wstring,
         std::vector<RegistryRecord>
-    > groups;
+    > pathGroups;
 
-    unsigned long long nonPackagedEntries =
+    unsigned long long targetRecords =
         0;
 
-    unsigned long long versionPatternEntries =
+    unsigned long long targetUidRecords =
         0;
 
-    unsigned long long versionPatternExisting =
-        0;
-
-    unsigned long long versionPatternMissing =
-        0;
-
-    unsigned long long recordsWithoutDiscriminator =
+    unsigned long long targetMissingUidRecords =
         0;
 
     for (
         std::size_t index = 0;
-        index < snapshot.entries.size();
+        index <
+            snapshot.entries.size();
         index++
     ) {
-        const std::uint64_t identity =
-            snapshot.entries[
-                index
-            ];
-
         RegistryRecord record =
             ReadRegistryRecord(
-                identity,
-                static_cast<unsigned long long>(
+                snapshot.entries[
+                    index
+                ],
+                static_cast<
+                    unsigned long long
+                >(
                     index +
                     1
                 )
             );
 
         if (
-            record.executablePath.empty() ||
-            IsWindowsAppsPath(
-                record.executablePath
+            !IsTargetRecord(
+                record
             )
         ) {
             continue;
         }
 
-        nonPackagedEntries++;
+        targetRecords++;
 
         if (
-            !record.hasVersionDirectory
+            record.uidValid
         ) {
-            continue;
-        }
-
-        versionPatternEntries++;
-
-        if (record.executableExists) {
-            versionPatternExisting++;
+            targetUidRecords++;
         } else {
-            versionPatternMissing++;
+            targetMissingUidRecords++;
         }
 
-        if (
-            record.discriminator.empty()
-        ) {
-            recordsWithoutDiscriminator++;
-        }
-
-        groups[
+        pathGroups[
             record.normalizedExecutablePath
         ].push_back(
             std::move(
@@ -872,75 +909,69 @@ void RunVersionDirectoryAudit() {
         );
     }
 
-    unsigned long long fallbackGroups =
+    unsigned long long normalizedPathGroups =
         0;
 
-    unsigned long long multiRecordGroups =
+    unsigned long long multiRecordPathGroups =
         0;
 
-    unsigned long long multiRecordMembers =
+    unsigned long long pathOnlyAmbiguousGroups =
         0;
 
-    unsigned long long historicalPathGroups =
+    unsigned long long uidChains =
         0;
 
-    unsigned long long oneExistingGroups =
+    unsigned long long uidHistoricalChainCandidates =
         0;
 
-    unsigned long long noExistingGroups =
+    unsigned long long uidAmbiguousChains =
         0;
 
-    unsigned long long ambiguousExistingGroups =
-        0;
-
-    unsigned long long sameExactPathDuplicateGroups =
-        0;
-
-    unsigned long long historicalChainCandidates =
+    unsigned long long expectedDualUidGroups =
         0;
 
     for (
-        const auto& groupPair :
-        groups
+        const auto& pathGroup :
+        pathGroups
     ) {
-        fallbackGroups++;
+        normalizedPathGroups++;
 
         const std::wstring& normalizedPath =
-            groupPair.first;
+            pathGroup.first;
 
         const std::vector<RegistryRecord>& members =
-            groupPair.second;
+            pathGroup.second;
 
         if (
-            members.size() <
-            2
+            members.size() >
+            1
         ) {
-            continue;
+            multiRecordPathGroups++;
         }
-
-        multiRecordGroups++;
-
-        multiRecordMembers +=
-            static_cast<unsigned long long>(
-                members.size()
-            );
 
         std::set<std::wstring>
             exactPaths;
 
+        std::set<DWORD>
+            uniqueUids;
+
         std::set<std::wstring>
-            discriminators;
+            existingPaths;
 
         std::map<
             std::wstring,
             unsigned long long
         > exactPathCounts;
 
-        unsigned long long existingMembers =
-            0;
+        std::map<
+            DWORD,
+            std::vector<
+                const RegistryRecord*
+            >
+        > uidGroups;
 
-        bool everyMemberHasDiscriminator =
-            true;
+        unsigned long long existingRecords =
+            0;
 
         for (
             const RegistryRecord& member :
@@ -964,17 +995,24 @@ void RunVersionDirectoryAudit() {
             if (
                 member.executableExists
             ) {
-                existingMembers++;
+                existingRecords++;
+
+                existingPaths.insert(
+                    exactPath
+                );
             }
 
             if (
-                member.discriminator.empty()
+                member.uidValid
             ) {
-                everyMemberHasDiscriminator =
-                    false;
-            } else {
-                discriminators.insert(
-                    member.discriminator
+                uniqueUids.insert(
+                    member.uid
+                );
+
+                uidGroups[
+                    member.uid
+                ].push_back(
+                    &member
                 );
             }
         }
@@ -997,103 +1035,81 @@ void RunVersionDirectoryAudit() {
             }
         }
 
-        const bool historicalPaths =
-            exactPaths.size() >
-            1;
+        const bool pathOnlyAmbiguous =
+            uniqueUids.size() >
+                1 &&
+            existingPaths.size() ==
+                1 &&
+            existingRecords >
+                1;
 
-        const bool oneExisting =
-            existingMembers ==
-            1;
+        if (
+            pathOnlyAmbiguous
+        ) {
+            pathOnlyAmbiguousGroups++;
+        }
 
-        const bool noExisting =
-            existingMembers ==
-            0;
-
-        const bool ambiguousExisting =
-            existingMembers >
-            1;
-
-        const bool eachRecordHasUniqueExactPath =
+        const bool expectedDualUidGroup =
+            members.size() ==
+                4 &&
             exactPaths.size() ==
-            members.size();
+                2 &&
+            uniqueUids.size() ==
+                2 &&
+            existingRecords ==
+                2 &&
+            existingPaths.size() ==
+                1 &&
+            sameExactPathDuplicate &&
+            pathOnlyAmbiguous;
 
-        const bool historicalChainCandidate =
-            historicalPaths &&
-            oneExisting &&
-            eachRecordHasUniqueExactPath &&
-            everyMemberHasDiscriminator &&
-            !sameExactPathDuplicate;
-
-        if (historicalPaths) {
-            historicalPathGroups++;
-        }
-
-        if (oneExisting) {
-            oneExistingGroups++;
-        }
-
-        if (noExisting) {
-            noExistingGroups++;
-        }
-
-        if (ambiguousExisting) {
-            ambiguousExistingGroups++;
-        }
-
-        if (sameExactPathDuplicate) {
-            sameExactPathDuplicateGroups++;
-        }
-
-        if (historicalChainCandidate) {
-            historicalChainCandidates++;
+        if (
+            expectedDualUidGroup
+        ) {
+            expectedDualUidGroups++;
         }
 
         Wh_Log(
-            L"NONPACKAGE_VERSION_GROUP "
+            L"DUAL_UID_PATH_GROUP "
             L"group=%llu "
             L"memberCount=%llu "
             L"uniqueExactPaths=%llu "
-            L"uniqueDiscriminators=%llu "
-            L"existingMembers=%llu "
-            L"missingMembers=%llu "
-            L"historicalPaths=%d "
+            L"uniqueUids=%llu "
+            L"existingRecords=%llu "
+            L"uniqueExistingPaths=%llu "
             L"sameExactPathDuplicate=%d "
-            L"oneExisting=%d "
-            L"noExisting=%d "
-            L"ambiguousExisting=%d "
-            L"historicalChainCandidate=%d "
+            L"pathOnlyAmbiguous=%d "
+            L"expectedDualUidShape=%d "
             L"normalizedPath=\"%s\"",
-            multiRecordGroups,
-            static_cast<unsigned long long>(
+            normalizedPathGroups,
+            static_cast<
+                unsigned long long
+            >(
                 members.size()
             ),
-            static_cast<unsigned long long>(
+            static_cast<
+                unsigned long long
+            >(
                 exactPaths.size()
             ),
-            static_cast<unsigned long long>(
-                discriminators.size()
+            static_cast<
+                unsigned long long
+            >(
+                uniqueUids.size()
             ),
-            existingMembers,
-            static_cast<unsigned long long>(
-                members.size()
-            ) -
-                existingMembers,
-            historicalPaths
-                ? 1
-                : 0,
+            existingRecords,
+            static_cast<
+                unsigned long long
+            >(
+                existingPaths.size()
+            ),
             sameExactPathDuplicate
                 ? 1
                 : 0,
-            oneExisting
+            pathOnlyAmbiguous
                 ? 1
                 : 0,
-            noExisting
-                ? 1
-                : 0,
-            ambiguousExisting
-                ? 1
-                : 0,
-            historicalChainCandidate
+            expectedDualUidGroup
                 ? 1
                 : 0,
             normalizedPath.c_str()
@@ -1111,70 +1127,224 @@ void RunVersionDirectoryAudit() {
                 ];
 
             Wh_Log(
-                L"NONPACKAGE_VERSION_GROUP_MEMBER "
+                L"DUAL_UID_PATH_GROUP_MEMBER "
                 L"group=%llu "
                 L"member=%llu "
                 L"id=%llu "
                 L"position=%llu "
+                L"uidValid=%d "
+                L"uid=%u "
                 L"exists=%d "
-                L"discriminator=\"%s\" "
-                L"publisher=\"%s\" "
                 L"tooltip=\"%s\" "
                 L"path=\"%s\"",
-                multiRecordGroups,
-                static_cast<unsigned long long>(
+                normalizedPathGroups,
+                static_cast<
+                    unsigned long long
+                >(
                     memberIndex +
                     1
                 ),
-                static_cast<unsigned long long>(
+                static_cast<
+                    unsigned long long
+                >(
                     member.identity
                 ),
                 member.oneBasedPosition,
+                member.uidValid
+                    ? 1
+                    : 0,
+                member.uid,
                 member.executableExists
                     ? 1
                     : 0,
-                member.discriminator.c_str(),
-                member.publisher.c_str(),
                 member.initialTooltip.c_str(),
                 member.executablePath.c_str()
             );
         }
+
+        for (
+            const auto& uidGroup :
+            uidGroups
+        ) {
+            uidChains++;
+
+            const DWORD uid =
+                uidGroup.first;
+
+            const std::vector<
+                const RegistryRecord*
+            >& uidMembers =
+                uidGroup.second;
+
+            std::set<std::wstring>
+                uidExactPaths;
+
+            std::set<std::wstring>
+                uidExistingPaths;
+
+            unsigned long long uidExistingRecords =
+                0;
+
+            for (
+                const RegistryRecord* member :
+                uidMembers
+            ) {
+                const std::wstring exactPath =
+                    ToLower(
+                        NormalizeSlashes(
+                            member->executablePath
+                        )
+                    );
+
+                uidExactPaths.insert(
+                    exactPath
+                );
+
+                if (
+                    member->executableExists
+                ) {
+                    uidExistingRecords++;
+
+                    uidExistingPaths.insert(
+                        exactPath
+                    );
+                }
+            }
+
+            const bool historicalPaths =
+                uidExactPaths.size() >
+                1;
+
+            const bool singleCurrentRecord =
+                uidExistingRecords ==
+                1;
+
+            const bool singleCurrentPath =
+                uidExistingPaths.size() ==
+                1;
+
+            const bool uidAmbiguous =
+                uidExistingRecords >
+                    1 ||
+                uidExistingPaths.size() >
+                    1;
+
+            const bool historicalChainCandidate =
+                uidMembers.size() ==
+                    2 &&
+                uidExactPaths.size() ==
+                    2 &&
+                historicalPaths &&
+                singleCurrentRecord &&
+                singleCurrentPath &&
+                !uidAmbiguous;
+
+            if (
+                historicalChainCandidate
+            ) {
+                uidHistoricalChainCandidates++;
+            }
+
+            if (
+                uidAmbiguous
+            ) {
+                uidAmbiguousChains++;
+            }
+
+            Wh_Log(
+                L"DUAL_UID_CHAIN "
+                L"pathGroup=%llu "
+                L"uid=%u "
+                L"memberCount=%llu "
+                L"uniqueExactPaths=%llu "
+                L"existingRecords=%llu "
+                L"uniqueExistingPaths=%llu "
+                L"historicalPaths=%d "
+                L"singleCurrentRecord=%d "
+                L"singleCurrentPath=%d "
+                L"ambiguous=%d "
+                L"historicalChainCandidate=%d",
+                normalizedPathGroups,
+                uid,
+                static_cast<
+                    unsigned long long
+                >(
+                    uidMembers.size()
+                ),
+                static_cast<
+                    unsigned long long
+                >(
+                    uidExactPaths.size()
+                ),
+                uidExistingRecords,
+                static_cast<
+                    unsigned long long
+                >(
+                    uidExistingPaths.size()
+                ),
+                historicalPaths
+                    ? 1
+                    : 0,
+                singleCurrentRecord
+                    ? 1
+                    : 0,
+                singleCurrentPath
+                    ? 1
+                    : 0,
+                uidAmbiguous
+                    ? 1
+                    : 0,
+                historicalChainCandidate
+                    ? 1
+                    : 0
+            );
+        }
     }
 
+    const bool dualUidSeparationValidated =
+        expectedDualUidGroups ==
+            1 &&
+        uidChains ==
+            2 &&
+        uidHistoricalChainCandidates ==
+            2 &&
+        uidAmbiguousChains ==
+            0 &&
+        targetMissingUidRecords ==
+            0;
+
     Wh_Log(
-        L"NONPACKAGE_VERSION_AUDIT_SUMMARY "
+        L"DUAL_UID_AUDIT_SUMMARY "
         L"uiOrderEntries=%llu "
-        L"nonPackagedEntries=%llu "
-        L"versionPatternEntries=%llu "
-        L"versionPatternExisting=%llu "
-        L"versionPatternMissing=%llu "
-        L"recordsWithoutDiscriminator=%llu "
-        L"fallbackGroups=%llu "
-        L"multiRecordGroups=%llu "
-        L"multiRecordMembers=%llu "
-        L"historicalPathGroups=%llu "
-        L"oneExistingGroups=%llu "
-        L"noExistingGroups=%llu "
-        L"ambiguousExistingGroups=%llu "
-        L"sameExactPathDuplicateGroups=%llu "
-        L"historicalChainCandidates=%llu",
-        static_cast<unsigned long long>(
+        L"targetRecords=%llu "
+        L"targetUidRecords=%llu "
+        L"targetMissingUidRecords=%llu "
+        L"normalizedPathGroups=%llu "
+        L"multiRecordPathGroups=%llu "
+        L"pathOnlyAmbiguousGroups=%llu "
+        L"uidChains=%llu "
+        L"uidHistoricalChainCandidates=%llu "
+        L"uidAmbiguousChains=%llu "
+        L"expectedDualUidGroups=%llu "
+        L"dualUidSeparationValidated=%d",
+        static_cast<
+            unsigned long long
+        >(
             snapshot.entries.size()
         ),
-        nonPackagedEntries,
-        versionPatternEntries,
-        versionPatternExisting,
-        versionPatternMissing,
-        recordsWithoutDiscriminator,
-        fallbackGroups,
-        multiRecordGroups,
-        multiRecordMembers,
-        historicalPathGroups,
-        oneExistingGroups,
-        noExistingGroups,
-        ambiguousExistingGroups,
-        sameExactPathDuplicateGroups,
-        historicalChainCandidates
+        targetRecords,
+        targetUidRecords,
+        targetMissingUidRecords,
+        normalizedPathGroups,
+        multiRecordPathGroups,
+        pathOnlyAmbiguousGroups,
+        uidChains,
+        uidHistoricalChainCandidates,
+        uidAmbiguousChains,
+        expectedDualUidGroups,
+        dualUidSeparationValidated
+            ? 1
+            : 0
     );
 
     g_auditCompleted.store(
@@ -1188,12 +1358,14 @@ void RunVersionDirectoryAudit() {
 BOOL Wh_ModInit() {
     Wh_Log(
         L"Tray Add Path Analyzer "
-        L"0.14.0 initializing"
+        L"0.15.0 initializing"
     );
 
-    if (!IsPrimaryShellProcess()) {
+    if (
+        !IsPrimaryShellProcess()
+    ) {
         Wh_Log(
-            L"NONPACKAGE_VERSION_AUDIT_SKIPPED "
+            L"DUAL_UID_AUDIT_SKIPPED "
             L"reason=\"non-primary Explorer process\" "
             L"processId=%lu",
             GetCurrentProcessId()
@@ -1203,12 +1375,12 @@ BOOL Wh_ModInit() {
     }
 
     Wh_Log(
-        L"NONPACKAGE_VERSION_AUDIT_BEGIN "
+        L"DUAL_UID_AUDIT_BEGIN "
         L"processId=%lu",
         GetCurrentProcessId()
     );
 
-    RunVersionDirectoryAudit();
+    RunDualUidAudit();
 
     return TRUE;
 }
