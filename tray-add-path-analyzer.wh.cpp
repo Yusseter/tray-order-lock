@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              tray-add-path-analyzer
 // @name            Tray Add Path Analyzer
-// @description     Audits raw UID and IconGuid registry representations for packaged tray icons.
-// @version         0.12.0
+// @description     Audits packaged tray identity fallback groups and installed package versions.
+// @version         0.13.0
 // @author          Yusseter
 // @github          https://github.com/Yusseter
 // @homepage        https://github.com/Yusseter/tray-order-lock
@@ -18,20 +18,27 @@
 
 A temporary read-only diagnostic mod.
 
-Version 0.12.0 audits the raw registry representation of the UID and IconGuid
-values belonging to notification-area records under WindowsApps.
+Version 0.13.0 audits a fallback logical identity for packaged tray icons:
 
-For every packaged record, the analyzer reports:
+- Package family name.
+- Executable path relative to the package directory.
 
-- Registry value existence and query status.
-- Registry value type.
-- Raw byte length.
-- Raw hexadecimal contents.
-- A decoded numeric or GUID interpretation when possible.
-- Package full name and executable path relative to the package directory.
+The IconGuid or UID remains recorded as an icon discriminator, but it is not
+included in the fallback grouping key. This allows tray records created by
+different package versions to be compared even when their GUIDs change.
 
-This determines why version 0.11.0 could read only a small subset of packaged
-icon discriminators.
+For every fallback group, the analyzer reports:
+
+- Registry record count.
+- Distinct package full-name count.
+- Distinct GUID or UID discriminator count.
+- Records whose package version is still installed.
+- Records belonging to package versions that are no longer installed.
+- Multiple records belonging to the same package full name.
+- Whether the group resembles a single historical icon chain.
+- Whether the currently installed records are ambiguous.
+
+Installed package state is queried with GetPackagePathByFullName.
 
 This version:
 
@@ -52,7 +59,9 @@ This version:
 #include <cwchar>
 #include <cwctype>
 #include <map>
+#include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -69,6 +78,17 @@ constexpr wchar_t kWindowsAppsMarker[] =
 std::atomic<bool> g_auditCompleted =
     false;
 
+using GetPackagePathByFullName_t =
+    LONG(WINAPI*)(
+        PCWSTR packageFullName,
+        UINT32* pathLength,
+        PWSTR path
+    );
+
+GetPackagePathByFullName_t
+    g_getPackagePathByFullName =
+        nullptr;
+
 struct UIOrderSnapshot {
     bool valid =
         false;
@@ -79,25 +99,59 @@ struct UIOrderSnapshot {
     std::vector<std::uint64_t> entries;
 };
 
-struct RawRegistryValue {
-    bool exists =
-        false;
-
-    LONG status =
-        ERROR_SUCCESS;
-
-    DWORD type =
-        REG_NONE;
-
-    std::vector<BYTE> data;
-};
-
 struct PackagePathInfo {
     bool valid =
         false;
 
     std::wstring packageFullName;
+    std::wstring packageName;
+    std::wstring packageVersion;
+    std::wstring architecture;
+    std::wstring resourceId;
+    std::wstring publisherId;
+    std::wstring packageFamilyName;
     std::wstring relativeExecutablePath;
+};
+
+struct PackageInstallState {
+    bool apiAvailable =
+        false;
+
+    bool installed =
+        false;
+
+    LONG queryStatus =
+        ERROR_SUCCESS;
+
+    LONG pathStatus =
+        ERROR_SUCCESS;
+
+    std::wstring installedPath;
+};
+
+struct RegistryRecord {
+    std::uint64_t identity =
+        0;
+
+    unsigned long long oneBasedPosition =
+        0;
+
+    std::wstring executablePath;
+    std::wstring initialTooltip;
+
+    bool uidValid =
+        false;
+
+    DWORD uid =
+        0;
+
+    std::wstring iconGuidText;
+
+    PackagePathInfo package;
+    PackageInstallState installState;
+
+    std::wstring discriminator;
+    std::wstring fallbackKey;
 };
 
 std::wstring ToLower(
@@ -231,115 +285,49 @@ std::wstring QueryStringValue(
         );
 }
 
-RawRegistryValue QueryRawRegistryValue(
+bool QueryDwordValue(
     const std::wstring& subkey,
-    const wchar_t* valueName
+    const wchar_t* valueName,
+    DWORD* value
 ) {
-    RawRegistryValue result;
+    if (!value) {
+        return false;
+    }
 
-    HKEY key =
-        nullptr;
+    DWORD registryType =
+        REG_NONE;
 
-    LONG status =
-        RegOpenKeyExW(
+    DWORD result =
+        0;
+
+    DWORD resultBytes =
+        sizeof(result);
+
+    const LONG status =
+        RegGetValueW(
             HKEY_CURRENT_USER,
             subkey.c_str(),
-            0,
-            KEY_QUERY_VALUE,
-            &key
+            valueName,
+            RRF_RT_REG_DWORD,
+            &registryType,
+            &result,
+            &resultBytes
         );
 
-    if (status != ERROR_SUCCESS) {
-        result.status =
-            status;
-
-        return result;
-    }
-
-    for (
-        int attempt = 0;
-        attempt < 3;
-        attempt++
+    if (
+        status != ERROR_SUCCESS ||
+        registryType !=
+            REG_DWORD ||
+        resultBytes !=
+            sizeof(result)
     ) {
-        DWORD type =
-            REG_NONE;
-
-        DWORD requiredBytes =
-            0;
-
-        status =
-            RegQueryValueExW(
-                key,
-                valueName,
-                nullptr,
-                &type,
-                nullptr,
-                &requiredBytes
-            );
-
-        if (status != ERROR_SUCCESS) {
-            result.status =
-                status;
-
-            result.type =
-                type;
-
-            break;
-        }
-
-        std::vector<BYTE> data(
-            requiredBytes
-        );
-
-        DWORD actualBytes =
-            requiredBytes;
-
-        status =
-            RegQueryValueExW(
-                key,
-                valueName,
-                nullptr,
-                &type,
-                data.empty()
-                    ? nullptr
-                    : data.data(),
-                &actualBytes
-            );
-
-        if (status == ERROR_MORE_DATA) {
-            continue;
-        }
-
-        result.status =
-            status;
-
-        result.type =
-            type;
-
-        if (status != ERROR_SUCCESS) {
-            break;
-        }
-
-        data.resize(
-            actualBytes
-        );
-
-        result.exists =
-            true;
-
-        result.data =
-            std::move(
-                data
-            );
-
-        break;
+        return false;
     }
 
-    RegCloseKey(
-        key
-    );
+    *value =
+        result;
 
-    return result;
+    return true;
 }
 
 UIOrderSnapshot CaptureUIOrderSnapshot() {
@@ -441,6 +429,131 @@ UIOrderSnapshot CaptureUIOrderSnapshot() {
     return snapshot;
 }
 
+bool ParsePackageFullName(
+    const std::wstring& packageFullName,
+    PackagePathInfo* package
+) {
+    if (!package) {
+        return false;
+    }
+
+    const std::size_t separator4 =
+        packageFullName.rfind(
+            L'_'
+        );
+
+    if (
+        separator4 ==
+            std::wstring::npos ||
+        separator4 ==
+            0 ||
+        separator4 +
+            1 >=
+            packageFullName.size()
+    ) {
+        return false;
+    }
+
+    const std::size_t separator3 =
+        packageFullName.rfind(
+            L'_',
+            separator4 -
+                1
+        );
+
+    if (
+        separator3 ==
+        std::wstring::npos
+    ) {
+        return false;
+    }
+
+    const std::size_t separator2 =
+        packageFullName.rfind(
+            L'_',
+            separator3 -
+                1
+        );
+
+    if (
+        separator2 ==
+        std::wstring::npos
+    ) {
+        return false;
+    }
+
+    const std::size_t separator1 =
+        packageFullName.rfind(
+            L'_',
+            separator2 -
+                1
+        );
+
+    if (
+        separator1 ==
+            std::wstring::npos ||
+        separator1 ==
+            0
+    ) {
+        return false;
+    }
+
+    package->packageName =
+        packageFullName.substr(
+            0,
+            separator1
+        );
+
+    package->packageVersion =
+        packageFullName.substr(
+            separator1 +
+                1,
+            separator2 -
+                separator1 -
+                1
+        );
+
+    package->architecture =
+        packageFullName.substr(
+            separator2 +
+                1,
+            separator3 -
+                separator2 -
+                1
+        );
+
+    package->resourceId =
+        packageFullName.substr(
+            separator3 +
+                1,
+            separator4 -
+                separator3 -
+                1
+        );
+
+    package->publisherId =
+        packageFullName.substr(
+            separator4 +
+                1
+        );
+
+    if (
+        package->packageName.empty() ||
+        package->packageVersion.empty() ||
+        package->architecture.empty() ||
+        package->publisherId.empty()
+    ) {
+        return false;
+    }
+
+    package->packageFamilyName =
+        package->packageName +
+        L"_" +
+        package->publisherId;
+
+    return true;
+}
+
 bool ExtractPackagePathInfo(
     const std::wstring& executablePath,
     PackagePathInfo* package
@@ -511,348 +624,269 @@ bool ExtractPackagePathInfo(
                 1
         );
 
+    if (
+        !ParsePackageFullName(
+            package->packageFullName,
+            package
+        )
+    ) {
+        return false;
+    }
+
     package->valid =
         true;
 
     return true;
 }
 
-const wchar_t* RegistryTypeName(
-    DWORD type
+bool IsWindowsAppsPath(
+    const std::wstring& executablePath
 ) {
-    switch (type) {
-        case REG_NONE:
-            return L"REG_NONE";
+    const std::wstring normalizedPath =
+        NormalizePath(
+            executablePath
+        );
 
-        case REG_SZ:
-            return L"REG_SZ";
+    const std::wstring lowerPath =
+        ToLower(
+            normalizedPath
+        );
 
-        case REG_EXPAND_SZ:
-            return L"REG_EXPAND_SZ";
-
-        case REG_BINARY:
-            return L"REG_BINARY";
-
-        case REG_DWORD:
-            return L"REG_DWORD";
-
-        case REG_DWORD_BIG_ENDIAN:
-            return L"REG_DWORD_BIG_ENDIAN";
-
-        case REG_LINK:
-            return L"REG_LINK";
-
-        case REG_MULTI_SZ:
-            return L"REG_MULTI_SZ";
-
-        case REG_RESOURCE_LIST:
-            return L"REG_RESOURCE_LIST";
-
-        case REG_FULL_RESOURCE_DESCRIPTOR:
-            return L"REG_FULL_RESOURCE_DESCRIPTOR";
-
-        case REG_RESOURCE_REQUIREMENTS_LIST:
-            return L"REG_RESOURCE_REQUIREMENTS_LIST";
-
-        case REG_QWORD:
-            return L"REG_QWORD";
-
-        default:
-            return L"REG_UNKNOWN";
-    }
+    return
+        lowerPath.find(
+            kWindowsAppsMarker
+        ) !=
+        std::wstring::npos;
 }
 
-std::wstring FormatHex(
-    const std::vector<BYTE>& data
-) {
-    std::wstring result;
+bool LoadPackagePathFunction() {
+    HMODULE kernel32Module =
+        GetModuleHandleW(
+            L"kernel32.dll"
+        );
 
-    for (
-        std::size_t index = 0;
-        index < data.size();
-        index++
-    ) {
-        if (index != 0) {
-            result +=
-                L' ';
-        }
+    if (!kernel32Module) {
+        Wh_Log(
+            L"PACKAGE_PATH_API_UNAVAILABLE "
+            L"reason=\"kernel32.dll not loaded\""
+        );
 
-        wchar_t byteText[
-            4
-        ]{};
+        return false;
+    }
 
-        swprintf_s(
-            byteText,
-            L"%02X",
-            static_cast<unsigned int>(
-                data[index]
+    g_getPackagePathByFullName =
+        reinterpret_cast<
+            GetPackagePathByFullName_t
+        >(
+            GetProcAddress(
+                kernel32Module,
+                "GetPackagePathByFullName"
             )
         );
 
-        result +=
-            byteText;
+    if (!g_getPackagePathByFullName) {
+        Wh_Log(
+            L"PACKAGE_PATH_API_UNAVAILABLE "
+            L"reason=\"GetPackagePathByFullName not exported\""
+        );
+
+        return false;
     }
 
-    return result;
+    Wh_Log(
+        L"PACKAGE_PATH_API_READY"
+    );
+
+    return true;
 }
 
-std::wstring DecodeWideString(
-    const RawRegistryValue& value
+PackageInstallState QueryPackageInstallState(
+    const std::wstring& packageFullName
 ) {
-    if (
-        !value.exists ||
-        (
-            value.type !=
-                REG_SZ &&
-            value.type !=
-                REG_EXPAND_SZ &&
-            value.type !=
-                REG_MULTI_SZ
-        ) ||
-        value.data.empty() ||
-        value.data.size() %
-            sizeof(wchar_t) !=
-        0
-    ) {
-        return L"";
+    PackageInstallState state;
+
+    state.apiAvailable =
+        g_getPackagePathByFullName !=
+        nullptr;
+
+    if (!state.apiAvailable) {
+        state.queryStatus =
+            ERROR_PROC_NOT_FOUND;
+
+        state.pathStatus =
+            ERROR_PROC_NOT_FOUND;
+
+        return state;
     }
 
-    const std::size_t characterCount =
-        value.data.size() /
-        sizeof(wchar_t);
+    UINT32 requiredCharacters =
+        0;
 
-    std::wstring text(
-        characterCount,
+    state.queryStatus =
+        g_getPackagePathByFullName(
+            packageFullName.c_str(),
+            &requiredCharacters,
+            nullptr
+        );
+
+    if (
+        state.queryStatus !=
+            ERROR_INSUFFICIENT_BUFFER &&
+        state.queryStatus !=
+            ERROR_SUCCESS
+    ) {
+        state.pathStatus =
+            state.queryStatus;
+
+        return state;
+    }
+
+    state.installed =
+        true;
+
+    if (requiredCharacters == 0) {
+        state.pathStatus =
+            ERROR_SUCCESS;
+
+        return state;
+    }
+
+    std::vector<wchar_t> pathBuffer(
+        requiredCharacters,
         L'\0'
     );
 
-    std::memcpy(
-        text.data(),
-        value.data.data(),
-        value.data.size()
-    );
+    UINT32 actualCharacters =
+        requiredCharacters;
 
-    while (
-        !text.empty() &&
-        text.back() ==
-            L'\0'
+    state.pathStatus =
+        g_getPackagePathByFullName(
+            packageFullName.c_str(),
+            &actualCharacters,
+            pathBuffer.data()
+        );
+
+    if (
+        state.pathStatus ==
+        ERROR_SUCCESS
     ) {
-        text.pop_back();
+        state.installedPath =
+            std::wstring(
+                pathBuffer.data()
+            );
     }
 
-    for (
-        wchar_t& character :
-        text
-    ) {
-        if (character == L'\0') {
-            character =
-                L'|';
-        }
-    }
-
-    return text;
+    return state;
 }
 
-std::wstring FormatGuid(
-    const GUID& guid
+std::wstring BuildDiscriminator(
+    const RegistryRecord& record
 ) {
-    wchar_t buffer[
-        64
-    ]{};
+    if (
+        !record.iconGuidText.empty()
+    ) {
+        return
+            L"guid:" +
+            ToLower(
+                record.iconGuidText
+            );
+    }
 
-    swprintf_s(
-        buffer,
-        L"{%08X-%04X-%04X-"
-        L"%02X%02X-"
-        L"%02X%02X%02X%02X%02X%02X}",
-        static_cast<unsigned int>(
-            guid.Data1
-        ),
-        static_cast<unsigned int>(
-            guid.Data2
-        ),
-        static_cast<unsigned int>(
-            guid.Data3
-        ),
-        static_cast<unsigned int>(
-            guid.Data4[0]
-        ),
-        static_cast<unsigned int>(
-            guid.Data4[1]
-        ),
-        static_cast<unsigned int>(
-            guid.Data4[2]
-        ),
-        static_cast<unsigned int>(
-            guid.Data4[3]
-        ),
-        static_cast<unsigned int>(
-            guid.Data4[4]
-        ),
-        static_cast<unsigned int>(
-            guid.Data4[5]
-        ),
-        static_cast<unsigned int>(
-            guid.Data4[6]
-        ),
-        static_cast<unsigned int>(
-            guid.Data4[7]
-        )
-    );
+    if (record.uidValid) {
+        return
+            L"uid:" +
+            std::to_wstring(
+                record.uid
+            );
+    }
+
+    return L"";
+}
+
+std::wstring BuildFallbackKey(
+    const RegistryRecord& record
+) {
+    if (!record.package.valid) {
+        return L"";
+    }
 
     return
-        std::wstring(
-            buffer
+        ToLower(
+            record.package.packageFamilyName
+        ) +
+        L"|" +
+        ToLower(
+            NormalizePath(
+                record.package.relativeExecutablePath
+            )
         );
 }
 
-std::wstring DecodeUidValue(
-    const RawRegistryValue& value
+RegistryRecord ReadRegistryRecord(
+    std::uint64_t identity,
+    unsigned long long oneBasedPosition
 ) {
-    if (!value.exists) {
-        return L"";
-    }
+    RegistryRecord record;
 
-    if (
-        value.type ==
-            REG_DWORD &&
-        value.data.size() ==
-            sizeof(std::uint32_t)
-    ) {
-        std::uint32_t decoded =
-            0;
+    record.identity =
+        identity;
 
-        std::memcpy(
-            &decoded,
-            value.data.data(),
-            sizeof(decoded)
+    record.oneBasedPosition =
+        oneBasedPosition;
+
+    const std::wstring subkey =
+        MakeTrayEntrySubkey(
+            identity
         );
 
-        return
-            L"dword:" +
-            std::to_wstring(
-                decoded
+    record.executablePath =
+        QueryStringValue(
+            subkey,
+            L"ExecutablePath"
+        );
+
+    record.initialTooltip =
+        QueryStringValue(
+            subkey,
+            L"InitialTooltip"
+        );
+
+    record.uidValid =
+        QueryDwordValue(
+            subkey,
+            L"UID",
+            &record.uid
+        );
+
+    record.iconGuidText =
+        QueryStringValue(
+            subkey,
+            L"IconGuid"
+        );
+
+    ExtractPackagePathInfo(
+        record.executablePath,
+        &record.package
+    );
+
+    if (record.package.valid) {
+        record.installState =
+            QueryPackageInstallState(
+                record.package.packageFullName
             );
     }
 
-    if (
-        value.type ==
-            REG_QWORD &&
-        value.data.size() ==
-            sizeof(std::uint64_t)
-    ) {
-        std::uint64_t decoded =
-            0;
-
-        std::memcpy(
-            &decoded,
-            value.data.data(),
-            sizeof(decoded)
+    record.discriminator =
+        BuildDiscriminator(
+            record
         );
 
-        return
-            L"qword:" +
-            std::to_wstring(
-                decoded
-            );
-    }
-
-    if (
-        value.type ==
-            REG_BINARY &&
-        value.data.size() ==
-            sizeof(std::uint32_t)
-    ) {
-        std::uint32_t decoded =
-            0;
-
-        std::memcpy(
-            &decoded,
-            value.data.data(),
-            sizeof(decoded)
+    record.fallbackKey =
+        BuildFallbackKey(
+            record
         );
 
-        return
-            L"binary32:" +
-            std::to_wstring(
-                decoded
-            );
-    }
-
-    if (
-        value.type ==
-            REG_BINARY &&
-        value.data.size() ==
-            sizeof(std::uint64_t)
-    ) {
-        std::uint64_t decoded =
-            0;
-
-        std::memcpy(
-            &decoded,
-            value.data.data(),
-            sizeof(decoded)
-        );
-
-        return
-            L"binary64:" +
-            std::to_wstring(
-                decoded
-            );
-    }
-
-    const std::wstring text =
-        DecodeWideString(
-            value
-        );
-
-    if (!text.empty()) {
-        return
-            L"text:" +
-            text;
-    }
-
-    return L"";
-}
-
-std::wstring DecodeGuidValue(
-    const RawRegistryValue& value
-) {
-    if (!value.exists) {
-        return L"";
-    }
-
-    if (
-        value.data.size() ==
-        sizeof(GUID)
-    ) {
-        GUID decoded{};
-
-        std::memcpy(
-            &decoded,
-            value.data.data(),
-            sizeof(decoded)
-        );
-
-        return
-            L"binary-guid:" +
-            FormatGuid(
-                decoded
-            );
-    }
-
-    const std::wstring text =
-        DecodeWideString(
-            value
-        );
-
-    if (!text.empty()) {
-        return
-            L"text-guid:" +
-            text;
-    }
-
-    return L"";
+    return record;
 }
 
 bool IsPrimaryShellProcess() {
@@ -876,40 +910,13 @@ bool IsPrimaryShellProcess() {
         GetCurrentProcessId();
 }
 
-void LogTypeSummary(
-    const wchar_t* valueName,
-    const std::map<
-        DWORD,
-        unsigned long long
-    >& counts
-) {
-    for (
-        const auto& count :
-        counts
-    ) {
-        Wh_Log(
-            L"PACKAGE_RAW_TYPE_SUMMARY "
-            L"value=\"%s\" "
-            L"type=%lu "
-            L"typeName=\"%s\" "
-            L"count=%llu",
-            valueName,
-            count.first,
-            RegistryTypeName(
-                count.first
-            ),
-            count.second
-        );
-    }
-}
-
-void RunRawIdentityAudit() {
+void RunFallbackIdentityAudit() {
     const UIOrderSnapshot snapshot =
         CaptureUIOrderSnapshot();
 
     if (!snapshot.valid) {
         Wh_Log(
-            L"PACKAGE_RAW_IDENTITY_AUDIT_FAILED "
+            L"PACKAGE_FALLBACK_AUDIT_FAILED "
             L"registryStatus=%ld",
             snapshot.status
         );
@@ -917,57 +924,31 @@ void RunRawIdentityAudit() {
         return;
     }
 
+    std::map<
+        std::wstring,
+        std::vector<RegistryRecord>
+    > groups;
+
     unsigned long long windowsAppsEntries =
+        0;
+
+    unsigned long long parsedPackageEntries =
         0;
 
     unsigned long long packageParseFailures =
         0;
 
-    unsigned long long uidPresent =
+    unsigned long long installedRecords =
         0;
 
-    unsigned long long uidMissing =
+    unsigned long long unavailableRecords =
         0;
 
-    unsigned long long uidQueryFailures =
+    unsigned long long unkeyedRecords =
         0;
 
-    unsigned long long uidDecoded =
+    unsigned long long recordsWithoutDiscriminator =
         0;
-
-    unsigned long long iconGuidPresent =
-        0;
-
-    unsigned long long iconGuidMissing =
-        0;
-
-    unsigned long long iconGuidQueryFailures =
-        0;
-
-    unsigned long long iconGuidDecoded =
-        0;
-
-    unsigned long long recordsWithUidOnly =
-        0;
-
-    unsigned long long recordsWithGuidOnly =
-        0;
-
-    unsigned long long recordsWithBoth =
-        0;
-
-    unsigned long long recordsWithNeither =
-        0;
-
-    std::map<
-        DWORD,
-        unsigned long long
-    > uidTypeCounts;
-
-    std::map<
-        DWORD,
-        unsigned long long
-    > iconGuidTypeCounts;
 
     for (
         std::size_t index = 0;
@@ -988,242 +969,407 @@ void RunRawIdentityAudit() {
                 L"ExecutablePath"
             );
 
-        const std::wstring normalizedPath =
-            NormalizePath(
-                executablePath
-            );
-
-        const std::wstring lowerPath =
-            ToLower(
-                normalizedPath
-            );
-
         if (
-            lowerPath.find(
-                kWindowsAppsMarker
-            ) ==
-            std::wstring::npos
+            !IsWindowsAppsPath(
+                executablePath
+            )
         ) {
             continue;
         }
 
         windowsAppsEntries++;
 
-        PackagePathInfo package;
+        RegistryRecord record =
+            ReadRegistryRecord(
+                identity,
+                static_cast<unsigned long long>(
+                    index +
+                    1
+                )
+            );
 
-        if (
-            !ExtractPackagePathInfo(
-                executablePath,
-                &package
-            )
-        ) {
+        if (!record.package.valid) {
             packageParseFailures++;
 
             Wh_Log(
-                L"PACKAGE_RAW_PATH_PARSE_FAILURE "
+                L"PACKAGE_FALLBACK_PARSE_FAILURE "
                 L"id=%llu "
                 L"position=%llu "
                 L"path=\"%s\"",
                 static_cast<unsigned long long>(
-                    identity
+                    record.identity
                 ),
-                static_cast<unsigned long long>(
-                    index +
-                    1
-                ),
-                executablePath.c_str()
+                record.oneBasedPosition,
+                record.executablePath.c_str()
             );
 
             continue;
         }
 
-        const RawRegistryValue uid =
-            QueryRawRegistryValue(
-                subkey,
-                L"UID"
-            );
+        parsedPackageEntries++;
 
-        const RawRegistryValue iconGuid =
-            QueryRawRegistryValue(
-                subkey,
-                L"IconGuid"
-            );
-
-        if (uid.exists) {
-            uidPresent++;
-
-            uidTypeCounts[
-                uid.type
-            ]++;
-        } else if (
-            uid.status ==
-                ERROR_FILE_NOT_FOUND
-        ) {
-            uidMissing++;
+        if (record.installState.installed) {
+            installedRecords++;
         } else {
-            uidQueryFailures++;
+            unavailableRecords++;
         }
 
-        if (iconGuid.exists) {
-            iconGuidPresent++;
-
-            iconGuidTypeCounts[
-                iconGuid.type
-            ]++;
-        } else if (
-            iconGuid.status ==
-                ERROR_FILE_NOT_FOUND
-        ) {
-            iconGuidMissing++;
-        } else {
-            iconGuidQueryFailures++;
+        if (record.discriminator.empty()) {
+            recordsWithoutDiscriminator++;
         }
 
-        if (
-            uid.exists &&
-            iconGuid.exists
-        ) {
-            recordsWithBoth++;
-        } else if (uid.exists) {
-            recordsWithUidOnly++;
-        } else if (iconGuid.exists) {
-            recordsWithGuidOnly++;
-        } else {
-            recordsWithNeither++;
-        }
+        if (record.fallbackKey.empty()) {
+            unkeyedRecords++;
 
-        const std::wstring uidHex =
-            FormatHex(
-                uid.data
+            Wh_Log(
+                L"PACKAGE_FALLBACK_UNKEYED "
+                L"id=%llu "
+                L"position=%llu "
+                L"packageFullName=\"%s\" "
+                L"relativePath=\"%s\"",
+                static_cast<unsigned long long>(
+                    record.identity
+                ),
+                record.oneBasedPosition,
+                record.package.packageFullName.c_str(),
+                record.package.relativeExecutablePath.c_str()
             );
 
-        const std::wstring uidDecodedText =
-            DecodeUidValue(
-                uid
-            );
-
-        const std::wstring iconGuidHex =
-            FormatHex(
-                iconGuid.data
-            );
-
-        const std::wstring iconGuidDecodedText =
-            DecodeGuidValue(
-                iconGuid
-            );
-
-        if (!uidDecodedText.empty()) {
-            uidDecoded++;
+            continue;
         }
 
-        if (!iconGuidDecodedText.empty()) {
-            iconGuidDecoded++;
-        }
-
-        Wh_Log(
-            L"PACKAGE_RAW_IDENTITY_VALUES "
-            L"id=%llu "
-            L"position=%llu "
-            L"packageFullName=\"%s\" "
-            L"relativePath=\"%s\" "
-            L"uidExists=%d "
-            L"uidStatus=%ld "
-            L"uidType=%lu "
-            L"uidTypeName=\"%s\" "
-            L"uidBytes=%llu "
-            L"uidHex=\"%s\" "
-            L"uidDecoded=\"%s\" "
-            L"iconGuidExists=%d "
-            L"iconGuidStatus=%ld "
-            L"iconGuidType=%lu "
-            L"iconGuidTypeName=\"%s\" "
-            L"iconGuidBytes=%llu "
-            L"iconGuidHex=\"%s\" "
-            L"iconGuidDecoded=\"%s\" "
-            L"fullPath=\"%s\"",
-            static_cast<unsigned long long>(
-                identity
-            ),
-            static_cast<unsigned long long>(
-                index +
-                    1
-            ),
-            package.packageFullName.c_str(),
-            package.relativeExecutablePath.c_str(),
-            uid.exists
-                ? 1
-                : 0,
-            uid.status,
-            uid.type,
-            RegistryTypeName(
-                uid.type
-            ),
-            static_cast<unsigned long long>(
-                uid.data.size()
-            ),
-            uidHex.c_str(),
-            uidDecodedText.c_str(),
-            iconGuid.exists
-                ? 1
-                : 0,
-            iconGuid.status,
-            iconGuid.type,
-            RegistryTypeName(
-                iconGuid.type
-            ),
-            static_cast<unsigned long long>(
-                iconGuid.data.size()
-            ),
-            iconGuidHex.c_str(),
-            iconGuidDecodedText.c_str(),
-            executablePath.c_str()
+        groups[
+            record.fallbackKey
+        ].push_back(
+            std::move(
+                record
+            )
         );
     }
 
-    LogTypeSummary(
-        L"UID",
-        uidTypeCounts
-    );
+    unsigned long long fallbackGroupCount =
+        0;
 
-    LogTypeSummary(
-        L"IconGuid",
-        iconGuidTypeCounts
-    );
+    unsigned long long multiRecordGroupCount =
+        0;
+
+    unsigned long long multiRecordMemberCount =
+        0;
+
+    unsigned long long versionSpanningGroupCount =
+        0;
+
+    unsigned long long sameFullNameDuplicateGroupCount =
+        0;
+
+    unsigned long long singleInstalledGroupCount =
+        0;
+
+    unsigned long long noInstalledGroupCount =
+        0;
+
+    unsigned long long ambiguousInstalledGroupCount =
+        0;
+
+    unsigned long long historicalChainCandidateCount =
+        0;
+
+    for (
+        const auto& groupPair :
+        groups
+    ) {
+        fallbackGroupCount++;
+
+        const std::wstring& fallbackKey =
+            groupPair.first;
+
+        const std::vector<RegistryRecord>& members =
+            groupPair.second;
+
+        if (members.size() < 2) {
+            continue;
+        }
+
+        multiRecordGroupCount++;
+
+        multiRecordMemberCount +=
+            static_cast<unsigned long long>(
+                members.size()
+            );
+
+        std::set<std::wstring>
+            packageFullNames;
+
+        std::set<std::wstring>
+            discriminators;
+
+        std::map<
+            std::wstring,
+            unsigned long long
+        > packageFullNameCounts;
+
+        unsigned long long installedMembers =
+            0;
+
+        bool everyMemberHasDiscriminator =
+            true;
+
+        for (
+            const RegistryRecord& member :
+            members
+        ) {
+            const std::wstring normalizedFullName =
+                ToLower(
+                    member.package.packageFullName
+                );
+
+            packageFullNames.insert(
+                normalizedFullName
+            );
+
+            packageFullNameCounts[
+                normalizedFullName
+            ]++;
+
+            if (
+                member.discriminator.empty()
+            ) {
+                everyMemberHasDiscriminator =
+                    false;
+            } else {
+                discriminators.insert(
+                    member.discriminator
+                );
+            }
+
+            if (
+                member.installState.installed
+            ) {
+                installedMembers++;
+            }
+        }
+
+        bool sameFullNameDuplicate =
+            false;
+
+        for (
+            const auto& count :
+            packageFullNameCounts
+        ) {
+            if (count.second > 1) {
+                sameFullNameDuplicate =
+                    true;
+
+                break;
+            }
+        }
+
+        const bool spansVersions =
+            packageFullNames.size() >
+            1;
+
+        const bool singleInstalled =
+            installedMembers ==
+            1;
+
+        const bool noInstalled =
+            installedMembers ==
+            0;
+
+        const bool ambiguousInstalled =
+            installedMembers >
+            1;
+
+        const bool everyRecordHasUniqueFullName =
+            packageFullNames.size() ==
+            members.size();
+
+        const bool everyDiscriminatorIsUnique =
+            everyMemberHasDiscriminator &&
+            discriminators.size() ==
+                members.size();
+
+        const bool historicalChainCandidate =
+            spansVersions &&
+            singleInstalled &&
+            everyRecordHasUniqueFullName &&
+            everyDiscriminatorIsUnique &&
+            !sameFullNameDuplicate;
+
+        if (spansVersions) {
+            versionSpanningGroupCount++;
+        }
+
+        if (sameFullNameDuplicate) {
+            sameFullNameDuplicateGroupCount++;
+        }
+
+        if (singleInstalled) {
+            singleInstalledGroupCount++;
+        }
+
+        if (noInstalled) {
+            noInstalledGroupCount++;
+        }
+
+        if (ambiguousInstalled) {
+            ambiguousInstalledGroupCount++;
+        }
+
+        if (historicalChainCandidate) {
+            historicalChainCandidateCount++;
+        }
+
+        Wh_Log(
+            L"PACKAGE_FALLBACK_GROUP "
+            L"group=%llu "
+            L"memberCount=%llu "
+            L"uniquePackageFullNames=%llu "
+            L"uniqueDiscriminators=%llu "
+            L"installedMembers=%llu "
+            L"staleMembers=%llu "
+            L"spansVersions=%d "
+            L"sameFullNameDuplicate=%d "
+            L"singleInstalled=%d "
+            L"noInstalled=%d "
+            L"ambiguousInstalled=%d "
+            L"historicalChainCandidate=%d "
+            L"key=\"%s\"",
+            multiRecordGroupCount,
+            static_cast<unsigned long long>(
+                members.size()
+            ),
+            static_cast<unsigned long long>(
+                packageFullNames.size()
+            ),
+            static_cast<unsigned long long>(
+                discriminators.size()
+            ),
+            installedMembers,
+            static_cast<unsigned long long>(
+                members.size()
+            ) -
+                installedMembers,
+            spansVersions
+                ? 1
+                : 0,
+            sameFullNameDuplicate
+                ? 1
+                : 0,
+            singleInstalled
+                ? 1
+                : 0,
+            noInstalled
+                ? 1
+                : 0,
+            ambiguousInstalled
+                ? 1
+                : 0,
+            historicalChainCandidate
+                ? 1
+                : 0,
+            fallbackKey.c_str()
+        );
+
+        for (
+            std::size_t memberIndex = 0;
+            memberIndex < members.size();
+            memberIndex++
+        ) {
+            const RegistryRecord& member =
+                members[
+                    memberIndex
+                ];
+
+            Wh_Log(
+                L"PACKAGE_FALLBACK_GROUP_MEMBER "
+                L"group=%llu "
+                L"member=%llu "
+                L"id=%llu "
+                L"position=%llu "
+                L"installed=%d "
+                L"installQueryStatus=%ld "
+                L"installPathStatus=%ld "
+                L"packageFamily=\"%s\" "
+                L"packageFullName=\"%s\" "
+                L"version=\"%s\" "
+                L"architecture=\"%s\" "
+                L"resourceId=\"%s\" "
+                L"relativePath=\"%s\" "
+                L"discriminator=\"%s\" "
+                L"tooltip=\"%s\" "
+                L"installedPath=\"%s\" "
+                L"fullPath=\"%s\"",
+                multiRecordGroupCount,
+                static_cast<unsigned long long>(
+                    memberIndex +
+                    1
+                ),
+                static_cast<unsigned long long>(
+                    member.identity
+                ),
+                member.oneBasedPosition,
+                member.installState.installed
+                    ? 1
+                    : 0,
+                member.installState.queryStatus,
+                member.installState.pathStatus,
+                member.package.packageFamilyName.c_str(),
+                member.package.packageFullName.c_str(),
+                member.package.packageVersion.c_str(),
+                member.package.architecture.c_str(),
+                member.package.resourceId.c_str(),
+                member.package.relativeExecutablePath.c_str(),
+                member.discriminator.c_str(),
+                member.initialTooltip.c_str(),
+                member.installState.installedPath.c_str(),
+                member.executablePath.c_str()
+            );
+        }
+    }
 
     Wh_Log(
-        L"PACKAGE_RAW_IDENTITY_AUDIT_SUMMARY "
+        L"PACKAGE_FALLBACK_AUDIT_SUMMARY "
         L"uiOrderEntries=%llu "
         L"windowsAppsEntries=%llu "
+        L"parsedPackageEntries=%llu "
         L"packageParseFailures=%llu "
-        L"uidPresent=%llu "
-        L"uidMissing=%llu "
-        L"uidQueryFailures=%llu "
-        L"uidDecoded=%llu "
-        L"iconGuidPresent=%llu "
-        L"iconGuidMissing=%llu "
-        L"iconGuidQueryFailures=%llu "
-        L"iconGuidDecoded=%llu "
-        L"recordsWithUidOnly=%llu "
-        L"recordsWithGuidOnly=%llu "
-        L"recordsWithBoth=%llu "
-        L"recordsWithNeither=%llu",
+        L"installedRecords=%llu "
+        L"unavailableRecords=%llu "
+        L"recordsWithoutDiscriminator=%llu "
+        L"unkeyedRecords=%llu "
+        L"fallbackGroups=%llu "
+        L"multiRecordGroups=%llu "
+        L"multiRecordMembers=%llu "
+        L"versionSpanningGroups=%llu "
+        L"sameFullNameDuplicateGroups=%llu "
+        L"singleInstalledGroups=%llu "
+        L"noInstalledGroups=%llu "
+        L"ambiguousInstalledGroups=%llu "
+        L"historicalChainCandidates=%llu "
+        L"packagePathApiAvailable=%d",
         static_cast<unsigned long long>(
             snapshot.entries.size()
         ),
         windowsAppsEntries,
+        parsedPackageEntries,
         packageParseFailures,
-        uidPresent,
-        uidMissing,
-        uidQueryFailures,
-        uidDecoded,
-        iconGuidPresent,
-        iconGuidMissing,
-        iconGuidQueryFailures,
-        iconGuidDecoded,
-        recordsWithUidOnly,
-        recordsWithGuidOnly,
-        recordsWithBoth,
-        recordsWithNeither
+        installedRecords,
+        unavailableRecords,
+        recordsWithoutDiscriminator,
+        unkeyedRecords,
+        fallbackGroupCount,
+        multiRecordGroupCount,
+        multiRecordMemberCount,
+        versionSpanningGroupCount,
+        sameFullNameDuplicateGroupCount,
+        singleInstalledGroupCount,
+        noInstalledGroupCount,
+        ambiguousInstalledGroupCount,
+        historicalChainCandidateCount,
+        g_getPackagePathByFullName
+            ? 1
+            : 0
     );
 
     g_auditCompleted.store(
@@ -1237,12 +1383,12 @@ void RunRawIdentityAudit() {
 BOOL Wh_ModInit() {
     Wh_Log(
         L"Tray Add Path Analyzer "
-        L"0.12.0 initializing"
+        L"0.13.0 initializing"
     );
 
     if (!IsPrimaryShellProcess()) {
         Wh_Log(
-            L"PACKAGE_RAW_IDENTITY_AUDIT_SKIPPED "
+            L"PACKAGE_FALLBACK_AUDIT_SKIPPED "
             L"reason=\"non-primary Explorer process\" "
             L"processId=%lu",
             GetCurrentProcessId()
@@ -1251,13 +1397,15 @@ BOOL Wh_ModInit() {
         return TRUE;
     }
 
+    LoadPackagePathFunction();
+
     Wh_Log(
-        L"PACKAGE_RAW_IDENTITY_AUDIT_BEGIN "
+        L"PACKAGE_FALLBACK_AUDIT_BEGIN "
         L"processId=%lu",
         GetCurrentProcessId()
     );
 
-    RunRawIdentityAudit();
+    RunFallbackIdentityAudit();
 
     return TRUE;
 }
