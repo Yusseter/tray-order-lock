@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              tray-add-path-analyzer
 // @name            Tray Add Path Analyzer
-// @description     Tests dual-neighbor tray-order restoration with single-neighbor fallback.
-// @version         0.21.0
+// @description     Tests outward canonical-neighbor search for replacement tray identities.
+// @version         0.22.0
 // @author          Yusseter
 // @github          https://github.com/Yusseter
 // @homepage        https://github.com/Yusseter/tray-order-lock
@@ -18,46 +18,69 @@
 
 A temporary live-collection diagnostic mod.
 
-Version 0.21.0 tests a dual-neighbor restoration model for replacement
-UID-based tray identities.
+Version 0.22.0 tests outward canonical-neighbor search when both immediate
+logical neighbors of a replacement UID-based tray icon have disappeared.
 
-Two stable GUID-based anchor icons are created.
+Four stable GUID-based anchor icons are created:
 
-During the first target version, the analyzer determines which live anchor is
-before the other in the overflow vector and establishes this canonical
-relationship:
+Anchor A
+Anchor B
+Anchor C
+Anchor D
 
-preceding anchor -> target -> following anchor
+Their actual live overflow order is observed rather than assumed.
 
-Three additional helper icons are then created, changing the live overflow
-collection and shifting the anchors.
+During Version-1.0.0, the analyzer verifies that B and C are the two middle
+anchors. It records the canonical order from the live collection and places
+the target between those two middle anchors:
 
-Version-2.0.0 creates a replacement Windows identity for the same UID-based
-target. Both logical neighbors still exist. The analyzer restores the target
-directly between them using their CURRENT live vector positions rather than a
-saved numeric index.
+far predecessor
+-> near predecessor
+-> target
+-> near follower
+-> far follower
 
-After Version-2.0.0 exits, the left anchor application is stopped gracefully.
+After Version-1.0.0 exits:
 
-Version-3.0.0 creates another replacement target identity. Exactly one of the
-two previously recorded logical neighbors remains live. The analyzer restores
-the target using that remaining neighbor:
+- Anchor B is stopped.
+- Anchor C is stopped.
+- Three helper icons are added.
 
-- immediately after the preceding neighbor, or
-- immediately before the following neighbor.
+The two immediate canonical neighbors are therefore gone and the live
+collection geometry changes.
+
+Version-2.0.0 creates a replacement UID identity. The analyzer searches
+outward through the saved canonical sequence:
+
+- first checks the missing near predecessor,
+- then finds the far predecessor,
+- first checks the missing near follower,
+- then finds the far follower.
+
+The replacement target is placed between those surviving farther neighbors
+using their CURRENT live overflow positions.
+
+After Version-2.0.0 exits, Anchor A is also stopped.
+
+Version-3.0.0 creates another replacement identity. At this point both near
+neighbors remain missing and only one of the original far anchors remains.
+The analyzer searches outward again and restores the target relative to that
+single surviving distant neighbor.
 
 The experiment verifies:
 
-- Three different Windows identities are created for the target.
-- The first target establishes a two-neighbor ordering relation.
+- Three distinct Windows target identities are created.
+- B and C are the immediate canonical neighbors established in phase 1.
+- Both immediate neighbors are absent in phases 2 and 3.
 - Three helpers change the collection geometry.
-- The second target is restored between both original neighbors.
-- The saved numeric index from the first placement is no longer correct.
-- One original neighbor is then removed.
-- The third target is restored from the surviving neighbor alone.
+- Phase 2 finds both farther neighbors at search depth 2.
+- Phase 2 restores the replacement inside the surviving canonical interval.
+- The saved phase-1 numeric index is no longer suitable in phase 2.
+- Phase 3 finds exactly one surviving farther neighbor at search depth 2.
+- Phase 3 restores the target on the correct side of that distant neighbor.
 - Exactly three analyzer MoveIcon calls occur.
-- No anchor, helper, or unrelated tray icon is moved.
-- No registry values are written by the analyzer.
+- No anchor, helper, or unrelated icon is moved.
+- The analyzer performs no registry writes.
 */
 // ==/WindhawkModReadme==
 
@@ -66,6 +89,7 @@ The experiment verifies:
 #include <windhawk_utils.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -84,17 +108,47 @@ constexpr wchar_t kNotifyIconSettingsPath[] =
 constexpr wchar_t kUIOrderListValueName[] =
     L"UIOrderList";
 
-constexpr wchar_t kLeftAnchorExecutableName[] =
-    L"trayorderleftanchorprobev210.exe";
+constexpr int kAnchorCount =
+    4;
 
-constexpr wchar_t kRightAnchorExecutableName[] =
-    L"trayorderrightanchorprobev210.exe";
+constexpr int kAnchorA =
+    0;
+
+constexpr int kAnchorB =
+    1;
+
+constexpr int kAnchorC =
+    2;
+
+constexpr int kAnchorD =
+    3;
+
+constexpr wchar_t kAnchorAExecutableName[] =
+    L"trayorderanchoraprobev220.exe";
+
+constexpr wchar_t kAnchorBExecutableName[] =
+    L"trayorderanchorbprobev220.exe";
+
+constexpr wchar_t kAnchorCExecutableName[] =
+    L"trayorderanchorcprobev220.exe";
+
+constexpr wchar_t kAnchorDExecutableName[] =
+    L"trayorderanchordprobev220.exe";
+
+constexpr const wchar_t* kAnchorExecutableNames[
+    kAnchorCount
+] = {
+    kAnchorAExecutableName,
+    kAnchorBExecutableName,
+    kAnchorCExecutableName,
+    kAnchorDExecutableName,
+};
 
 constexpr wchar_t kTargetExecutableName[] =
-    L"trayuiddualneighborrestoreprobev210.exe";
+    L"trayuidoutwardrestoreprobev220.exe";
 
 constexpr wchar_t kHelperExecutableName[] =
-    L"trayordercollectionhelperv210.exe";
+    L"trayordercollectionhelperv220.exe";
 
 constexpr wchar_t kVersion1Marker[] =
     L"\\version-1.0.0\\";
@@ -111,14 +165,8 @@ constexpr DWORD kTargetUid =
 constexpr int kOverflowLocation =
     1;
 
-constexpr int kPrecedingUnknown =
-    0;
-
-constexpr int kPrecedingLeft =
-    1;
-
-constexpr int kPrecedingRight =
-    2;
+constexpr int kInvalidAnchorSlot =
+    -1;
 
 using NotificationAreaIconManager_AddIcon_t =
     void(__cdecl*)(
@@ -195,20 +243,29 @@ const GUID* g_notificationAreaIconVectorId =
 std::atomic<void*> g_taskbarModel6 =
     nullptr;
 
-std::atomic<void*> g_leftAnchorAbi =
-    nullptr;
+std::atomic<void*> g_anchorAbis[
+    kAnchorCount
+]{};
 
-std::atomic<void*> g_rightAnchorAbi =
-    nullptr;
+std::atomic<std::uint64_t> g_anchorIdentities[
+    kAnchorCount
+]{};
 
-std::atomic<std::uint64_t> g_leftAnchorIdentity =
-    0;
+std::atomic<bool> g_anchorCaptured[
+    kAnchorCount
+]{};
 
-std::atomic<std::uint64_t> g_rightAnchorIdentity =
-    0;
+std::atomic<int> g_farPrecedingSlot =
+    kInvalidAnchorSlot;
 
-std::atomic<int> g_precedingAnchorSide =
-    kPrecedingUnknown;
+std::atomic<int> g_nearPrecedingSlot =
+    kInvalidAnchorSlot;
+
+std::atomic<int> g_nearFollowingSlot =
+    kInvalidAnchorSlot;
+
+std::atomic<int> g_farFollowingSlot =
+    kInvalidAnchorSlot;
 
 std::atomic<std::uint64_t> g_firstTargetIdentity =
     0;
@@ -252,31 +309,13 @@ std::atomic<unsigned int> g_secondMoveTargetIndex =
 std::atomic<unsigned int> g_thirdMoveTargetIndex =
     0;
 
-std::atomic<unsigned int> g_firstPrecedingIndexAfter =
+std::atomic<unsigned int> g_secondPredecessorDepth =
     0;
 
-std::atomic<unsigned int> g_firstTargetIndexAfter =
+std::atomic<unsigned int> g_secondFollowerDepth =
     0;
 
-std::atomic<unsigned int> g_firstFollowingIndexAfter =
-    0;
-
-std::atomic<unsigned int> g_secondPrecedingIndexBefore =
-    0;
-
-std::atomic<unsigned int> g_secondFollowingIndexBefore =
-    0;
-
-std::atomic<unsigned int> g_secondPrecedingIndexAfter =
-    0;
-
-std::atomic<unsigned int> g_secondTargetIndexAfter =
-    0;
-
-std::atomic<unsigned int> g_secondFollowingIndexAfter =
-    0;
-
-std::atomic<unsigned int> g_thirdTargetIndexAfter =
+std::atomic<unsigned int> g_thirdLiveNeighborDepth =
     0;
 
 std::atomic<unsigned long long> g_firstUiOrderPosition =
@@ -288,22 +327,25 @@ std::atomic<unsigned long long> g_secondUiOrderPosition =
 std::atomic<unsigned long long> g_thirdUiOrderPosition =
     0;
 
-std::atomic<bool> g_leftAnchorCaptured =
+std::atomic<bool> g_canonicalOrderEstablished =
     false;
 
-std::atomic<bool> g_rightAnchorCaptured =
+std::atomic<bool> g_firstImmediateRelationEstablished =
     false;
 
-std::atomic<bool> g_firstRelationEstablished =
+std::atomic<bool> g_secondImmediateNeighborsAbsent =
     false;
 
-std::atomic<bool> g_secondDualNeighborRestored =
+std::atomic<bool> g_secondOutwardBothRestored =
     false;
 
-std::atomic<bool> g_thirdSingleNeighborRestored =
+std::atomic<bool> g_thirdImmediateNeighborsAbsent =
     false;
 
-std::atomic<bool> g_dualNeighborValidationCompleted =
+std::atomic<bool> g_thirdOutwardSingleRestored =
+    false;
+
+std::atomic<bool> g_outwardSearchValidationCompleted =
     false;
 
 thread_local unsigned int g_internalMoveDepth =
@@ -345,17 +387,13 @@ struct OverflowPositions {
     unsigned int size =
         0;
 
-    bool leftFound =
-        false;
+    bool anchorFound[
+        kAnchorCount
+    ]{};
 
-    unsigned int leftIndex =
-        0;
-
-    bool rightFound =
-        false;
-
-    unsigned int rightIndex =
-        0;
+    unsigned int anchorIndex[
+        kAnchorCount
+    ]{};
 
     bool targetFound =
         false;
@@ -364,17 +402,17 @@ struct OverflowPositions {
         0;
 };
 
-struct LogicalNeighborPositions {
-    bool precedingFound =
+struct CanonicalSearchResult {
+    bool found =
         false;
 
-    unsigned int precedingIndex =
+    int anchorSlot =
+        kInvalidAnchorSlot;
+
+    unsigned int index =
         0;
 
-    bool followingFound =
-        false;
-
-    unsigned int followingIndex =
+    unsigned int depth =
         0;
 };
 
@@ -461,7 +499,8 @@ bool EndsWithOrdinalIgnoreCase(
 
     for (
         std::size_t index = 0;
-        index < suffix.size();
+        index <
+            suffix.size();
         index++
     ) {
         const wchar_t left =
@@ -714,44 +753,21 @@ bool ResolveRequiredSymbols(
         symbolSearch
     );
 
-    if (!NotificationAreaIcon_QueryInterface) {
+    if (
+        !NotificationAreaIcon_QueryInterface ||
+        !g_notificationAreaIconInterfaceId ||
+        !g_notificationAreaIconVectorId ||
+        !NotificationAreaIconManager_MoveIcon
+    ) {
         Wh_Log(
-            L"NotificationAreaIcon2 "
-            L"query_interface symbol not found"
-        );
-
-        return false;
-    }
-
-    if (!g_notificationAreaIconInterfaceId) {
-        Wh_Log(
-            L"INotificationAreaIcon IID "
-            L"symbol not found"
-        );
-
-        return false;
-    }
-
-    if (!g_notificationAreaIconVectorId) {
-        Wh_Log(
-            L"IVector<NotificationAreaIcon> "
-            L"IID symbol not found"
-        );
-
-        return false;
-    }
-
-    if (!NotificationAreaIconManager_MoveIcon) {
-        Wh_Log(
-            L"NotificationAreaIconManager2::"
-            L"MoveIcon symbol not found"
+            L"OUTWARD_SEARCH_REQUIRED_SYMBOL_MISSING"
         );
 
         return false;
     }
 
     Wh_Log(
-        L"DUAL_NEIGHBOR_SUPPORT_READY "
+        L"OUTWARD_SEARCH_SUPPORT_READY "
         L"queryFunction=%p "
         L"iconInterfaceId=%p "
         L"vectorInterfaceId=%p "
@@ -770,7 +786,8 @@ UIOrderSnapshot CaptureUIOrderSnapshot() {
 
     for (
         int attempt = 0;
-        attempt < 3;
+        attempt <
+            3;
         attempt++
     ) {
         DWORD registryType =
@@ -839,7 +856,9 @@ UIOrderSnapshot CaptureUIOrderSnapshot() {
 
         if (
             actualBytes %
-                sizeof(std::uint64_t) !=
+                sizeof(
+                    std::uint64_t
+                ) !=
             0
         ) {
             snapshot.status =
@@ -850,7 +869,9 @@ UIOrderSnapshot CaptureUIOrderSnapshot() {
 
         snapshot.entries.resize(
             actualBytes /
-            sizeof(std::uint64_t)
+            sizeof(
+                std::uint64_t
+            )
         );
 
         if (
@@ -1109,24 +1130,29 @@ bool IsExecutableIdentity(
         );
 }
 
-bool IsLeftAnchorIdentity(
+int GetAnchorSlotForIdentity(
     std::uint64_t identity
 ) {
-    return
-        IsExecutableIdentity(
-            identity,
-            kLeftAnchorExecutableName
-        );
-}
+    for (
+        int slot = 0;
+        slot <
+            kAnchorCount;
+        slot++
+    ) {
+        if (
+            IsExecutableIdentity(
+                identity,
+                kAnchorExecutableNames[
+                    slot
+                ]
+            )
+        ) {
+            return slot;
+        }
+    }
 
-bool IsRightAnchorIdentity(
-    std::uint64_t identity
-) {
     return
-        IsExecutableIdentity(
-            identity,
-            kRightAnchorExecutableName
-        );
+        kInvalidAnchorSlot;
 }
 
 bool IsHelperIdentity(
@@ -1233,16 +1259,6 @@ OverflowPositions QueryOverflowPositions(
             std::memory_order_acquire
         );
 
-    void* leftAnchorAbi =
-        g_leftAnchorAbi.load(
-            std::memory_order_acquire
-        );
-
-    void* rightAnchorAbi =
-        g_rightAnchorAbi.load(
-            std::memory_order_acquire
-        );
-
     if (
         !taskbarModel6 ||
         !targetAbi ||
@@ -1250,6 +1266,26 @@ OverflowPositions QueryOverflowPositions(
         !g_notificationAreaIconVectorId
     ) {
         return positions;
+    }
+
+    void* anchorAbis[
+        kAnchorCount
+    ]{};
+
+    for (
+        int slot = 0;
+        slot <
+            kAnchorCount;
+        slot++
+    ) {
+        anchorAbis[
+            slot
+        ] =
+            g_anchorAbis[
+                slot
+            ].load(
+                std::memory_order_acquire
+            );
     }
 
     void* collectionAbi =
@@ -1315,12 +1351,16 @@ OverflowPositions QueryOverflowPositions(
 
     Vector_GetAt_t getAt =
         reinterpret_cast<Vector_GetAt_t>(
-            vtable[6]
+            vtable[
+                6
+            ]
         );
 
     Vector_GetSize_t getSize =
         reinterpret_cast<Vector_GetSize_t>(
-            vtable[7]
+            vtable[
+                7
+            ]
         );
 
     if (
@@ -1365,7 +1405,8 @@ OverflowPositions QueryOverflowPositions(
 
     for (
         unsigned int index = 0;
-        index < positions.size;
+        index <
+            positions.size;
         index++
     ) {
         void* itemAbi =
@@ -1387,34 +1428,36 @@ OverflowPositions QueryOverflowPositions(
             continue;
         }
 
-        if (
-            leftAnchorAbi &&
-            !positions.leftFound &&
-            IsSameComObject(
-                itemAbi,
-                leftAnchorAbi
-            )
+        for (
+            int slot = 0;
+            slot <
+                kAnchorCount;
+            slot++
         ) {
-            positions.leftFound =
-                true;
+            if (
+                anchorAbis[
+                    slot
+                ] &&
+                !positions.anchorFound[
+                    slot
+                ] &&
+                IsSameComObject(
+                    itemAbi,
+                    anchorAbis[
+                        slot
+                    ]
+                )
+            ) {
+                positions.anchorFound[
+                    slot
+                ] =
+                    true;
 
-            positions.leftIndex =
-                index;
-        }
-
-        if (
-            rightAnchorAbi &&
-            !positions.rightFound &&
-            IsSameComObject(
-                itemAbi,
-                rightAnchorAbi
-            )
-        ) {
-            positions.rightFound =
-                true;
-
-            positions.rightIndex =
-                index;
+                positions.anchorIndex[
+                    slot
+                ] =
+                    index;
+            }
         }
 
         if (
@@ -1447,90 +1490,363 @@ OverflowPositions QueryOverflowPositions(
     return positions;
 }
 
-LogicalNeighborPositions GetLogicalNeighborPositions(
-    const OverflowPositions& positions
-) {
-    LogicalNeighborPositions logical;
-
-    const int precedingSide =
-        g_precedingAnchorSide.load(
-            std::memory_order_acquire
-        );
-
-    if (
-        precedingSide ==
-        kPrecedingLeft
-    ) {
-        logical.precedingFound =
-            positions.leftFound;
-
-        logical.precedingIndex =
-            positions.leftIndex;
-
-        logical.followingFound =
-            positions.rightFound;
-
-        logical.followingIndex =
-            positions.rightIndex;
-    } else if (
-        precedingSide ==
-        kPrecedingRight
-    ) {
-        logical.precedingFound =
-            positions.rightFound;
-
-        logical.precedingIndex =
-            positions.rightIndex;
-
-        logical.followingFound =
-            positions.leftFound;
-
-        logical.followingIndex =
-            positions.leftIndex;
-    }
-
-    return logical;
-}
-
-bool EstablishLogicalNeighborOrder(
-    const OverflowPositions& positions
+bool GetAnchorPosition(
+    const OverflowPositions& positions,
+    int slot,
+    unsigned int* index
 ) {
     if (
-        !positions.leftFound ||
-        !positions.rightFound ||
-        positions.leftIndex ==
-            positions.rightIndex
+        slot <
+            0 ||
+        slot >=
+            kAnchorCount
     ) {
         return false;
     }
 
-    int expected =
-        kPrecedingUnknown;
+    if (
+        !positions.anchorFound[
+            slot
+        ]
+    ) {
+        return false;
+    }
 
-    const int observed =
-        positions.leftIndex <
-                positions.rightIndex
-            ? kPrecedingLeft
-            : kPrecedingRight;
+    if (index) {
+        *index =
+            positions.anchorIndex[
+                slot
+            ];
+    }
 
-    g_precedingAnchorSide.compare_exchange_strong(
-        expected,
-        observed,
-        std::memory_order_acq_rel
+    return true;
+}
+
+bool EstablishCanonicalOrder(
+    const OverflowPositions& positions
+) {
+    for (
+        int slot = 0;
+        slot <
+            kAnchorCount;
+        slot++
+    ) {
+        if (
+            !positions.anchorFound[
+                slot
+            ]
+        ) {
+            return false;
+        }
+    }
+
+    std::array<
+        std::pair<
+            unsigned int,
+            int
+        >,
+        kAnchorCount
+    > ordered = {{
+        {
+            positions.anchorIndex[
+                kAnchorA
+            ],
+            kAnchorA
+        },
+        {
+            positions.anchorIndex[
+                kAnchorB
+            ],
+            kAnchorB
+        },
+        {
+            positions.anchorIndex[
+                kAnchorC
+            ],
+            kAnchorC
+        },
+        {
+            positions.anchorIndex[
+                kAnchorD
+            ],
+            kAnchorD
+        },
+    }};
+
+    std::sort(
+        ordered.begin(),
+        ordered.end(),
+        [](
+            const auto& left,
+            const auto& right
+        ) {
+            return
+                left.first <
+                right.first;
+        }
     );
 
-    return
-        g_precedingAnchorSide.load(
+    const int middle1 =
+        ordered[
+            1
+        ].second;
+
+    const int middle2 =
+        ordered[
+            2
+        ].second;
+
+    const int outer1 =
+        ordered[
+            0
+        ].second;
+
+    const int outer2 =
+        ordered[
+            3
+        ].second;
+
+    const bool middleAreBandC =
+        (
+            middle1 ==
+                kAnchorB &&
+            middle2 ==
+                kAnchorC
+        ) ||
+        (
+            middle1 ==
+                kAnchorC &&
+            middle2 ==
+                kAnchorB
+        );
+
+    const bool outerAreAandD =
+        (
+            outer1 ==
+                kAnchorA &&
+            outer2 ==
+                kAnchorD
+        ) ||
+        (
+            outer1 ==
+                kAnchorD &&
+            outer2 ==
+                kAnchorA
+        );
+
+    if (
+        !middleAreBandC ||
+        !outerAreAandD
+    ) {
+        Wh_Log(
+            L"OUTWARD_CANONICAL_ORDER_REJECTED "
+            L"orderedSlots=%d,%d,%d,%d",
+            ordered[
+                0
+            ].second,
+            ordered[
+                1
+            ].second,
+            ordered[
+                2
+            ].second,
+            ordered[
+                3
+            ].second
+        );
+
+        return false;
+    }
+
+    g_farPrecedingSlot.store(
+        ordered[
+            0
+        ].second,
+        std::memory_order_release
+    );
+
+    g_nearPrecedingSlot.store(
+        ordered[
+            1
+        ].second,
+        std::memory_order_release
+    );
+
+    g_nearFollowingSlot.store(
+        ordered[
+            2
+        ].second,
+        std::memory_order_release
+    );
+
+    g_farFollowingSlot.store(
+        ordered[
+            3
+        ].second,
+        std::memory_order_release
+    );
+
+    g_canonicalOrderEstablished.store(
+        true,
+        std::memory_order_release
+    );
+
+    Wh_Log(
+        L"OUTWARD_CANONICAL_ORDER_ESTABLISHED "
+        L"farPrecedingSlot=%d "
+        L"nearPrecedingSlot=%d "
+        L"nearFollowingSlot=%d "
+        L"farFollowingSlot=%d "
+        L"indices=%u,%u,%u,%u",
+        ordered[
+            0
+        ].second,
+        ordered[
+            1
+        ].second,
+        ordered[
+            2
+        ].second,
+        ordered[
+            3
+        ].second,
+        ordered[
+            0
+        ].first,
+        ordered[
+            1
+        ].first,
+        ordered[
+            2
+        ].first,
+        ordered[
+            3
+        ].first
+    );
+
+    return true;
+}
+
+CanonicalSearchResult SearchPredecessorOutward(
+    const OverflowPositions& positions
+) {
+    CanonicalSearchResult result;
+
+    const int candidates[] = {
+        g_nearPrecedingSlot.load(
             std::memory_order_acquire
-        ) !=
-        kPrecedingUnknown;
+        ),
+        g_farPrecedingSlot.load(
+            std::memory_order_acquire
+        ),
+    };
+
+    for (
+        unsigned int candidate = 0;
+        candidate <
+            ARRAYSIZE(
+                candidates
+            );
+        candidate++
+    ) {
+        unsigned int index =
+            0;
+
+        if (
+            GetAnchorPosition(
+                positions,
+                candidates[
+                    candidate
+                ],
+                &index
+            )
+        ) {
+            result.found =
+                true;
+
+            result.anchorSlot =
+                candidates[
+                    candidate
+                ];
+
+            result.index =
+                index;
+
+            result.depth =
+                candidate +
+                1;
+
+            return result;
+        }
+    }
+
+    return result;
+}
+
+CanonicalSearchResult SearchFollowerOutward(
+    const OverflowPositions& positions
+) {
+    CanonicalSearchResult result;
+
+    const int candidates[] = {
+        g_nearFollowingSlot.load(
+            std::memory_order_acquire
+        ),
+        g_farFollowingSlot.load(
+            std::memory_order_acquire
+        ),
+    };
+
+    for (
+        unsigned int candidate = 0;
+        candidate <
+            ARRAYSIZE(
+                candidates
+            );
+        candidate++
+    ) {
+        unsigned int index =
+            0;
+
+        if (
+            GetAnchorPosition(
+                positions,
+                candidates[
+                    candidate
+                ],
+                &index
+            )
+        ) {
+            result.found =
+                true;
+
+            result.anchorSlot =
+                candidates[
+                    candidate
+                ];
+
+            result.index =
+                index;
+
+            result.depth =
+                candidate +
+                1;
+
+            return result;
+        }
+    }
+
+    return result;
 }
 
 unsigned int ClampVectorIndex(
     unsigned int index,
     unsigned int size
 ) {
-    if (size == 0) {
+    if (
+        size ==
+        0
+    ) {
         return 0;
     }
 
@@ -1571,11 +1887,22 @@ unsigned int CalculateImmediatelyBeforeIndex(
     unsigned int size
 ) {
     unsigned int desiredIndex =
+        0;
+
+    if (
         targetIndex <
-                anchorIndex
-            ? anchorIndex -
-                1
-            : anchorIndex;
+        anchorIndex
+    ) {
+        desiredIndex =
+            anchorIndex >
+                    0
+                ? anchorIndex -
+                    1
+                : 0;
+    } else {
+        desiredIndex =
+            anchorIndex;
+    }
 
     return
         ClampVectorIndex(
@@ -1584,234 +1911,51 @@ unsigned int CalculateImmediatelyBeforeIndex(
         );
 }
 
-bool IsDirectlyBetweenLogicalNeighbors(
-    const OverflowPositions& positions
+bool ValidateTargetVersionPath(
+    std::uint64_t identity,
+    int phase
 ) {
-    if (
-        !positions.targetFound
-    ) {
-        return false;
-    }
-
-    const LogicalNeighborPositions logical =
-        GetLogicalNeighborPositions(
-            positions
-        );
-
-    return
-        logical.precedingFound &&
-        logical.followingFound &&
-        logical.precedingIndex +
-                1 ==
-            positions.targetIndex &&
-        positions.targetIndex +
-                1 ==
-            logical.followingIndex;
-}
-
-bool IsCorrectSingleNeighborRelation(
-    const OverflowPositions& positions
-) {
-    if (
-        !positions.targetFound
-    ) {
-        return false;
-    }
-
-    const LogicalNeighborPositions logical =
-        GetLogicalNeighborPositions(
-            positions
+    const std::wstring path =
+        NormalizeSlashes(
+            QueryExecutablePath(
+                identity
+            )
         );
 
     if (
-        logical.precedingFound &&
-        !logical.followingFound
+        phase ==
+        1
     ) {
         return
-            logical.precedingIndex +
-                    1 ==
-                positions.targetIndex;
+            ContainsOrdinalIgnoreCase(
+                path,
+                kVersion1Marker
+            );
     }
 
     if (
-        !logical.precedingFound &&
-        logical.followingFound
+        phase ==
+        2
     ) {
         return
-            positions.targetIndex +
-                    1 ==
-                logical.followingIndex;
+            ContainsOrdinalIgnoreCase(
+                path,
+                kVersion2Marker
+            );
+    }
+
+    if (
+        phase ==
+        3
+    ) {
+        return
+            ContainsOrdinalIgnoreCase(
+                path,
+                kVersion3Marker
+            );
     }
 
     return false;
-}
-
-int __cdecl
-TaskbarModel_GetOverflowIcons_Hook(
-    void* pThis,
-    void** result
-) {
-    const unsigned long long callNumber =
-        g_overflowGetterCalls.fetch_add(
-            1,
-            std::memory_order_relaxed
-        ) +
-        1;
-
-    const int originalResult =
-        TaskbarModel_GetOverflowIcons_Original(
-            pThis,
-            result
-        );
-
-    if (
-        SUCCEEDED(
-            static_cast<HRESULT>(
-                originalResult
-            )
-        ) &&
-        result &&
-        *result
-    ) {
-        g_taskbarModel6.store(
-            pThis,
-            std::memory_order_release
-        );
-    }
-
-    Wh_Log(
-        L"OVERFLOW_GETTER "
-        L"call=%llu "
-        L"pThis=%p "
-        L"result=0x%08X "
-        L"collection=%p",
-        callNumber,
-        pThis,
-        static_cast<unsigned int>(
-            static_cast<HRESULT>(
-                originalResult
-            )
-        ),
-        result
-            ? *result
-            : nullptr
-    );
-
-    return originalResult;
-}
-
-void CaptureAnchorInterface(
-    bool left,
-    unsigned long long callNumber,
-    std::uint64_t identity,
-    void* iconImplementation
-) {
-    std::atomic<void*>* slot =
-        left
-            ? &g_leftAnchorAbi
-            : &g_rightAnchorAbi;
-
-    std::atomic<std::uint64_t>* identitySlot =
-        left
-            ? &g_leftAnchorIdentity
-            : &g_rightAnchorIdentity;
-
-    std::atomic<bool>* capturedSlot =
-        left
-            ? &g_leftAnchorCaptured
-            : &g_rightAnchorCaptured;
-
-    if (
-        slot->load(
-            std::memory_order_acquire
-        )
-    ) {
-        return;
-    }
-
-    void* queriedAbi =
-        nullptr;
-
-    const HRESULT queryResult =
-        static_cast<HRESULT>(
-            NotificationAreaIcon_QueryInterface(
-                iconImplementation,
-                *g_notificationAreaIconInterfaceId,
-                &queriedAbi
-            )
-        );
-
-    Wh_Log(
-        L"DUAL_ANCHOR_INTERFACE_QUERY "
-        L"side=\"%s\" "
-        L"call=%llu "
-        L"id=%llu "
-        L"implementation=%p "
-        L"result=0x%08X "
-        L"queriedAbi=%p",
-        left
-            ? L"left"
-            : L"right",
-        callNumber,
-        static_cast<unsigned long long>(
-            identity
-        ),
-        iconImplementation,
-        static_cast<unsigned int>(
-            queryResult
-        ),
-        queriedAbi
-    );
-
-    if (
-        FAILED(
-            queryResult
-        ) ||
-        !queriedAbi
-    ) {
-        return;
-    }
-
-    void* expected =
-        nullptr;
-
-    if (
-        slot->compare_exchange_strong(
-            expected,
-            queriedAbi,
-            std::memory_order_acq_rel
-        )
-    ) {
-        identitySlot->store(
-            identity,
-            std::memory_order_release
-        );
-
-        capturedSlot->store(
-            true,
-            std::memory_order_release
-        );
-
-        Wh_Log(
-            L"DUAL_ANCHOR_CAPTURED "
-            L"side=\"%s\" "
-            L"id=%llu "
-            L"abi=%p",
-            left
-                ? L"left"
-                : L"right",
-            static_cast<unsigned long long>(
-                identity
-            ),
-            queriedAbi
-        );
-
-        return;
-    }
-
-    reinterpret_cast<IUnknown*>(
-        queriedAbi
-    )->Release();
 }
 
 int DetermineTargetPhase(
@@ -1862,42 +2006,135 @@ int DetermineTargetPhase(
     return 0;
 }
 
-bool ValidateTargetVersionPath(
+void CaptureAnchorInterface(
+    int anchorSlot,
+    unsigned long long callNumber,
     std::uint64_t identity,
-    int phase
+    void* iconImplementation
 ) {
-    const std::wstring path =
-        NormalizeSlashes(
-            QueryExecutablePath(
-                identity
+    if (
+        anchorSlot <
+            0 ||
+        anchorSlot >=
+            kAnchorCount
+    ) {
+        return;
+    }
+
+    if (
+        g_anchorAbis[
+            anchorSlot
+        ].load(
+            std::memory_order_acquire
+        )
+    ) {
+        return;
+    }
+
+    void* queriedAbi =
+        nullptr;
+
+    const HRESULT queryResult =
+        static_cast<HRESULT>(
+            NotificationAreaIcon_QueryInterface(
+                iconImplementation,
+                *g_notificationAreaIconInterfaceId,
+                &queriedAbi
             )
         );
 
-    if (phase == 1) {
-        return
-            ContainsOrdinalIgnoreCase(
-                path,
-                kVersion1Marker
-            );
+    Wh_Log(
+        L"OUTWARD_ANCHOR_QUERY "
+        L"slot=%d "
+        L"call=%llu "
+        L"id=%llu "
+        L"result=0x%08X "
+        L"abi=%p",
+        anchorSlot,
+        callNumber,
+        static_cast<unsigned long long>(
+            identity
+        ),
+        static_cast<unsigned int>(
+            queryResult
+        ),
+        queriedAbi
+    );
+
+    if (
+        FAILED(
+            queryResult
+        ) ||
+        !queriedAbi
+    ) {
+        return;
     }
 
-    if (phase == 2) {
-        return
-            ContainsOrdinalIgnoreCase(
-                path,
-                kVersion2Marker
-            );
+    void* expected =
+        nullptr;
+
+    if (
+        g_anchorAbis[
+            anchorSlot
+        ].compare_exchange_strong(
+            expected,
+            queriedAbi,
+            std::memory_order_acq_rel
+        )
+    ) {
+        g_anchorIdentities[
+            anchorSlot
+        ].store(
+            identity,
+            std::memory_order_release
+        );
+
+        g_anchorCaptured[
+            anchorSlot
+        ].store(
+            true,
+            std::memory_order_release
+        );
+
+        Wh_Log(
+            L"OUTWARD_ANCHOR_CAPTURED "
+            L"slot=%d "
+            L"id=%llu "
+            L"abi=%p",
+            anchorSlot,
+            static_cast<unsigned long long>(
+                identity
+            ),
+            queriedAbi
+        );
+
+        return;
     }
 
-    if (phase == 3) {
-        return
-            ContainsOrdinalIgnoreCase(
-                path,
-                kVersion3Marker
-            );
+    reinterpret_cast<IUnknown*>(
+        queriedAbi
+    )->Release();
+}
+
+bool AllAnchorsCaptured() {
+    for (
+        int slot = 0;
+        slot <
+            kAnchorCount;
+        slot++
+    ) {
+        if (
+            !g_anchorCaptured[
+                slot
+            ].load(
+                std::memory_order_acquire
+            )
+        ) {
+            return false;
+        }
     }
 
-    return false;
+    return true;
 }
 
 void LogFinalValidation() {
@@ -1985,45 +2222,19 @@ void LogFinalValidation() {
             std::memory_order_acquire
         );
 
-    const unsigned int firstMoveIndex =
-        g_firstMoveTargetIndex.load(
-            std::memory_order_acquire
-        );
-
-    const unsigned int secondMoveIndex =
-        g_secondMoveTargetIndex.load(
-            std::memory_order_acquire
-        );
-
     const bool collectionChanged =
         firstOverflowSize !=
         secondOverflowSize;
 
-    const bool savedNumericIndexInvalidated =
-        firstMoveIndex !=
-        secondMoveIndex;
-
-    const unsigned long long helperCount =
-        g_helperIdentityCount.load(
+    const bool numericIndexInvalidated =
+        g_firstMoveTargetIndex.load(
+            std::memory_order_acquire
+        ) !=
+        g_secondMoveTargetIndex.load(
             std::memory_order_acquire
         );
 
-    const bool firstRelationEstablished =
-        g_firstRelationEstablished.load(
-            std::memory_order_acquire
-        );
-
-    const bool secondDualNeighborRestored =
-        g_secondDualNeighborRestored.load(
-            std::memory_order_acquire
-        );
-
-    const bool thirdSingleNeighborRestored =
-        g_thirdSingleNeighborRestored.load(
-            std::memory_order_acquire
-        );
-
-    const bool exactlyThreeAnalyzerMoves =
+    const bool exactlyThreeMoves =
         g_moveAttempts.load(
             std::memory_order_acquire
         ) ==
@@ -2043,22 +2254,52 @@ void LogFinalValidation() {
         version1Path &&
         version2Path &&
         version3Path &&
-        helperCount ==
+        AllAnchorsCaptured() &&
+        g_canonicalOrderEstablished.load(
+            std::memory_order_acquire
+        ) &&
+        g_helperIdentityCount.load(
+            std::memory_order_acquire
+        ) ==
             3 &&
         collectionChanged &&
-        savedNumericIndexInvalidated &&
-        firstRelationEstablished &&
-        secondDualNeighborRestored &&
-        thirdSingleNeighborRestored &&
-        exactlyThreeAnalyzerMoves;
+        numericIndexInvalidated &&
+        g_firstImmediateRelationEstablished.load(
+            std::memory_order_acquire
+        ) &&
+        g_secondImmediateNeighborsAbsent.load(
+            std::memory_order_acquire
+        ) &&
+        g_secondPredecessorDepth.load(
+            std::memory_order_acquire
+        ) ==
+            2 &&
+        g_secondFollowerDepth.load(
+            std::memory_order_acquire
+        ) ==
+            2 &&
+        g_secondOutwardBothRestored.load(
+            std::memory_order_acquire
+        ) &&
+        g_thirdImmediateNeighborsAbsent.load(
+            std::memory_order_acquire
+        ) &&
+        g_thirdLiveNeighborDepth.load(
+            std::memory_order_acquire
+        ) ==
+            2 &&
+        g_thirdOutwardSingleRestored.load(
+            std::memory_order_acquire
+        ) &&
+        exactlyThreeMoves;
 
-    g_dualNeighborValidationCompleted.store(
+    g_outwardSearchValidationCompleted.store(
         validationCompleted,
         std::memory_order_release
     );
 
     Wh_Log(
-        L"DUAL_NEIGHBOR_FINAL_RESULT "
+        L"OUTWARD_SEARCH_FINAL_RESULT "
         L"firstIdentity=%llu "
         L"secondIdentity=%llu "
         L"thirdIdentity=%llu "
@@ -2072,18 +2313,25 @@ void LogFinalValidation() {
         L"version1Path=%d "
         L"version2Path=%d "
         L"version3Path=%d "
+        L"allAnchorsCaptured=%d "
+        L"canonicalOrderEstablished=%d "
         L"helperCount=%llu "
         L"firstOverflowSize=%u "
         L"secondOverflowSize=%u "
         L"collectionChanged=%d "
         L"firstMoveIndex=%u "
         L"secondMoveIndex=%u "
-        L"savedNumericIndexInvalidated=%d "
-        L"firstRelationEstablished=%d "
-        L"secondDualNeighborRestored=%d "
-        L"thirdSingleNeighborRestored=%d "
-        L"exactlyThreeAnalyzerMoves=%d "
-        L"dualNeighborValidationCompleted=%d",
+        L"numericIndexInvalidated=%d "
+        L"firstImmediateRelationEstablished=%d "
+        L"secondImmediateNeighborsAbsent=%d "
+        L"secondPredecessorDepth=%u "
+        L"secondFollowerDepth=%u "
+        L"secondOutwardBothRestored=%d "
+        L"thirdImmediateNeighborsAbsent=%d "
+        L"thirdLiveNeighborDepth=%u "
+        L"thirdOutwardSingleRestored=%d "
+        L"exactlyThreeMoves=%d "
+        L"outwardSearchValidationCompleted=%d",
         static_cast<unsigned long long>(
             firstIdentity
         ),
@@ -2117,27 +2365,66 @@ void LogFinalValidation() {
         version3Path
             ? 1
             : 0,
-        helperCount,
+        AllAnchorsCaptured()
+            ? 1
+            : 0,
+        g_canonicalOrderEstablished.load(
+            std::memory_order_acquire
+        )
+            ? 1
+            : 0,
+        g_helperIdentityCount.load(
+            std::memory_order_acquire
+        ),
         firstOverflowSize,
         secondOverflowSize,
         collectionChanged
             ? 1
             : 0,
-        firstMoveIndex,
-        secondMoveIndex,
-        savedNumericIndexInvalidated
+        g_firstMoveTargetIndex.load(
+            std::memory_order_acquire
+        ),
+        g_secondMoveTargetIndex.load(
+            std::memory_order_acquire
+        ),
+        numericIndexInvalidated
             ? 1
             : 0,
-        firstRelationEstablished
+        g_firstImmediateRelationEstablished.load(
+            std::memory_order_acquire
+        )
             ? 1
             : 0,
-        secondDualNeighborRestored
+        g_secondImmediateNeighborsAbsent.load(
+            std::memory_order_acquire
+        )
             ? 1
             : 0,
-        thirdSingleNeighborRestored
+        g_secondPredecessorDepth.load(
+            std::memory_order_acquire
+        ),
+        g_secondFollowerDepth.load(
+            std::memory_order_acquire
+        ),
+        g_secondOutwardBothRestored.load(
+            std::memory_order_acquire
+        )
             ? 1
             : 0,
-        exactlyThreeAnalyzerMoves
+        g_thirdImmediateNeighborsAbsent.load(
+            std::memory_order_acquire
+        )
+            ? 1
+            : 0,
+        g_thirdLiveNeighborDepth.load(
+            std::memory_order_acquire
+        ),
+        g_thirdOutwardSingleRestored.load(
+            std::memory_order_acquire
+        )
+            ? 1
+            : 0,
+        exactlyThreeMoves
             ? 1
             : 0,
         validationCompleted
@@ -2146,45 +2433,38 @@ void LogFinalValidation() {
     );
 
     Wh_Log(
-        L"DUAL_NEIGHBOR_SUMMARY "
-        L"leftAnchorIdentity=%llu "
-        L"rightAnchorIdentity=%llu "
-        L"precedingAnchorSide=%d "
+        L"OUTWARD_SEARCH_SUMMARY "
+        L"farPrecedingSlot=%d "
+        L"nearPrecedingSlot=%d "
+        L"nearFollowingSlot=%d "
+        L"farFollowingSlot=%d "
         L"firstTargetIdentity=%llu "
         L"secondTargetIdentity=%llu "
         L"thirdTargetIdentity=%llu "
-        L"helperCount=%llu "
         L"firstOverflowSize=%u "
         L"secondOverflowSize=%u "
         L"thirdOverflowSize=%u "
         L"firstMoveTargetIndex=%u "
         L"secondMoveTargetIndex=%u "
         L"thirdMoveTargetIndex=%u "
-        L"firstPrecedingIndexAfter=%u "
-        L"firstTargetIndexAfter=%u "
-        L"firstFollowingIndexAfter=%u "
-        L"secondPrecedingIndexBefore=%u "
-        L"secondFollowingIndexBefore=%u "
-        L"secondPrecedingIndexAfter=%u "
-        L"secondTargetIndexAfter=%u "
-        L"secondFollowingIndexAfter=%u "
-        L"thirdTargetIndexAfter=%u "
+        L"secondPredecessorDepth=%u "
+        L"secondFollowerDepth=%u "
+        L"thirdLiveNeighborDepth=%u "
         L"firstUiOrderPosition=%llu "
         L"secondUiOrderPosition=%llu "
         L"thirdUiOrderPosition=%llu "
         L"moveAttempts=%llu "
-        L"dualNeighborValidationCompleted=%d",
-        static_cast<unsigned long long>(
-            g_leftAnchorIdentity.load(
-                std::memory_order_acquire
-            )
+        L"outwardSearchValidationCompleted=%d",
+        g_farPrecedingSlot.load(
+            std::memory_order_acquire
         ),
-        static_cast<unsigned long long>(
-            g_rightAnchorIdentity.load(
-                std::memory_order_acquire
-            )
+        g_nearPrecedingSlot.load(
+            std::memory_order_acquire
         ),
-        g_precedingAnchorSide.load(
+        g_nearFollowingSlot.load(
+            std::memory_order_acquire
+        ),
+        g_farFollowingSlot.load(
             std::memory_order_acquire
         ),
         static_cast<unsigned long long>(
@@ -2196,42 +2476,31 @@ void LogFinalValidation() {
         static_cast<unsigned long long>(
             thirdIdentity
         ),
-        helperCount,
-        firstOverflowSize,
-        secondOverflowSize,
+        g_firstOverflowSize.load(
+            std::memory_order_acquire
+        ),
+        g_secondOverflowSize.load(
+            std::memory_order_acquire
+        ),
         g_thirdOverflowSize.load(
             std::memory_order_acquire
         ),
-        firstMoveIndex,
-        secondMoveIndex,
+        g_firstMoveTargetIndex.load(
+            std::memory_order_acquire
+        ),
+        g_secondMoveTargetIndex.load(
+            std::memory_order_acquire
+        ),
         g_thirdMoveTargetIndex.load(
             std::memory_order_acquire
         ),
-        g_firstPrecedingIndexAfter.load(
+        g_secondPredecessorDepth.load(
             std::memory_order_acquire
         ),
-        g_firstTargetIndexAfter.load(
+        g_secondFollowerDepth.load(
             std::memory_order_acquire
         ),
-        g_firstFollowingIndexAfter.load(
-            std::memory_order_acquire
-        ),
-        g_secondPrecedingIndexBefore.load(
-            std::memory_order_acquire
-        ),
-        g_secondFollowingIndexBefore.load(
-            std::memory_order_acquire
-        ),
-        g_secondPrecedingIndexAfter.load(
-            std::memory_order_acquire
-        ),
-        g_secondTargetIndexAfter.load(
-            std::memory_order_acquire
-        ),
-        g_secondFollowingIndexAfter.load(
-            std::memory_order_acquire
-        ),
-        g_thirdTargetIndexAfter.load(
+        g_thirdLiveNeighborDepth.load(
             std::memory_order_acquire
         ),
         g_firstUiOrderPosition.load(
@@ -2258,16 +2527,9 @@ void HandleTargetIcon(
     std::uint64_t targetIdentity,
     void* iconImplementation
 ) {
-    if (
-        !g_leftAnchorAbi.load(
-            std::memory_order_acquire
-        ) ||
-        !g_rightAnchorAbi.load(
-            std::memory_order_acquire
-        )
-    ) {
+    if (!AllAnchorsCaptured()) {
         Wh_Log(
-            L"DUAL_NEIGHBOR_TARGET_SKIPPED "
+            L"OUTWARD_TARGET_SKIPPED "
             L"reason=\"anchors-not-captured\" "
             L"id=%llu",
             static_cast<unsigned long long>(
@@ -2303,17 +2565,15 @@ void HandleTargetIcon(
         );
 
     Wh_Log(
-        L"DUAL_NEIGHBOR_TARGET_QUERY "
+        L"OUTWARD_TARGET_QUERY "
         L"phase=%d "
         L"id=%llu "
-        L"implementation=%p "
         L"result=0x%08X "
-        L"targetAbi=%p",
+        L"abi=%p",
         phase,
         static_cast<unsigned long long>(
             targetIdentity
         ),
-        iconImplementation,
         static_cast<unsigned int>(
             queryResult
         ),
@@ -2338,24 +2598,6 @@ void HandleTargetIcon(
         !before.enumerated ||
         !before.targetFound
     ) {
-        Wh_Log(
-            L"DUAL_NEIGHBOR_POSITION_FAILED "
-            L"phase=%d "
-            L"id=%llu "
-            L"enumerated=%d "
-            L"targetFound=%d",
-            phase,
-            static_cast<unsigned long long>(
-                targetIdentity
-            ),
-            before.enumerated
-                ? 1
-                : 0,
-            before.targetFound
-                ? 1
-                : 0
-        );
-
         reinterpret_cast<IUnknown*>(
             targetAbi
         )->Release();
@@ -2363,110 +2605,59 @@ void HandleTargetIcon(
         return;
     }
 
-    if (
-        phase ==
-        1
-    ) {
-        if (
-            !before.leftFound ||
-            !before.rightFound ||
-            !EstablishLogicalNeighborOrder(
-                before
-            )
-        ) {
-            Wh_Log(
-                L"DUAL_NEIGHBOR_FIRST_SKIPPED "
-                L"reason=\"both-anchors-not-live\" "
-                L"leftFound=%d "
-                L"rightFound=%d",
-                before.leftFound
-                    ? 1
-                    : 0,
-                before.rightFound
-                    ? 1
-                    : 0
-            );
-
-            reinterpret_cast<IUnknown*>(
-                targetAbi
-            )->Release();
-
-            return;
-        }
-    }
-
-    const LogicalNeighborPositions logicalBefore =
-        GetLogicalNeighborPositions(
-            before
-        );
-
-    const bool bothNeighborsLive =
-        logicalBefore.precedingFound &&
-        logicalBefore.followingFound;
-
-    const bool exactlyOneNeighborLive =
-        logicalBefore.precedingFound !=
-        logicalBefore.followingFound;
-
-    Wh_Log(
-        L"DUAL_NEIGHBOR_POSITION_BEFORE "
-        L"phase=%d "
-        L"id=%llu "
-        L"size=%u "
-        L"leftFound=%d "
-        L"leftIndex=%u "
-        L"rightFound=%d "
-        L"rightIndex=%u "
-        L"targetIndex=%u "
-        L"precedingFound=%d "
-        L"precedingIndex=%u "
-        L"followingFound=%d "
-        L"followingIndex=%u "
-        L"bothNeighborsLive=%d "
-        L"exactlyOneNeighborLive=%d",
-        phase,
-        static_cast<unsigned long long>(
-            targetIdentity
-        ),
-        before.size,
-        before.leftFound
-            ? 1
-            : 0,
-        before.leftIndex,
-        before.rightFound
-            ? 1
-            : 0,
-        before.rightIndex,
-        before.targetIndex,
-        logicalBefore.precedingFound
-            ? 1
-            : 0,
-        logicalBefore.precedingIndex,
-        logicalBefore.followingFound
-            ? 1
-            : 0,
-        logicalBefore.followingIndex,
-        bothNeighborsLive
-            ? 1
-            : 0,
-        exactlyOneNeighborLive
-            ? 1
-            : 0
-    );
-
     unsigned int desiredIndex =
         0;
 
     const wchar_t* strategy =
         L"none";
 
+    CanonicalSearchResult predecessor;
+    CanonicalSearchResult follower;
+
     if (
         phase ==
-            1 ||
-        phase ==
-            2
+        1
     ) {
-        if (!bothNeighborsLive) {
+        if (
+            !EstablishCanonicalOrder(
+                before
+            )
+        ) {
+            reinterpret_cast<IUnknown*>(
+                targetAbi
+            )->Release();
+
+            return;
+        }
+
+        unsigned int nearPrecedingIndex =
+            0;
+
+        unsigned int nearFollowingIndex =
+            0;
+
+        const bool nearPrecedingFound =
+            GetAnchorPosition(
+                before,
+                g_nearPrecedingSlot.load(
+                    std::memory_order_acquire
+                ),
+                &nearPrecedingIndex
+            );
+
+        const bool nearFollowingFound =
+            GetAnchorPosition(
+                before,
+                g_nearFollowingSlot.load(
+                    std::memory_order_acquire
+                ),
+                &nearFollowingIndex
+            );
+
+        if (
+            !nearPrecedingFound ||
+            !nearFollowingFound
+        ) {
             reinterpret_cast<IUnknown*>(
                 targetAbi
             )->Release();
@@ -2476,48 +2667,14 @@ void HandleTargetIcon(
 
         desiredIndex =
             CalculateImmediatelyAfterIndex(
-                logicalBefore.precedingIndex,
+                nearPrecedingIndex,
                 before.targetIndex,
                 before.size
             );
 
         strategy =
-            L"both-neighbors";
-    } else {
-        if (!exactlyOneNeighborLive) {
-            reinterpret_cast<IUnknown*>(
-                targetAbi
-            )->Release();
+            L"immediate-neighbors";
 
-            return;
-        }
-
-        if (
-            logicalBefore.precedingFound
-        ) {
-            desiredIndex =
-                CalculateImmediatelyAfterIndex(
-                    logicalBefore.precedingIndex,
-                    before.targetIndex,
-                    before.size
-                );
-
-            strategy =
-                L"preceding-only";
-        } else {
-            desiredIndex =
-                CalculateImmediatelyBeforeIndex(
-                    logicalBefore.followingIndex,
-                    before.targetIndex,
-                    before.size
-                );
-
-            strategy =
-                L"following-only";
-        }
-    }
-
-    if (phase == 1) {
         g_firstTargetIdentity.store(
             targetIdentity,
             std::memory_order_release
@@ -2532,46 +2689,232 @@ void HandleTargetIcon(
             desiredIndex,
             std::memory_order_release
         );
-    } else if (phase == 2) {
-        g_secondTargetIdentity.store(
-            targetIdentity,
-            std::memory_order_release
-        );
-
-        g_secondOverflowSize.store(
-            before.size,
-            std::memory_order_release
-        );
-
-        g_secondMoveTargetIndex.store(
-            desiredIndex,
-            std::memory_order_release
-        );
-
-        g_secondPrecedingIndexBefore.store(
-            logicalBefore.precedingIndex,
-            std::memory_order_release
-        );
-
-        g_secondFollowingIndexBefore.store(
-            logicalBefore.followingIndex,
-            std::memory_order_release
-        );
     } else {
-        g_thirdTargetIdentity.store(
-            targetIdentity,
-            std::memory_order_release
-        );
+        if (
+            !g_canonicalOrderEstablished.load(
+                std::memory_order_acquire
+            )
+        ) {
+            reinterpret_cast<IUnknown*>(
+                targetAbi
+            )->Release();
 
-        g_thirdOverflowSize.store(
+            return;
+        }
+
+        const int nearPrecedingSlot =
+            g_nearPrecedingSlot.load(
+                std::memory_order_acquire
+            );
+
+        const int nearFollowingSlot =
+            g_nearFollowingSlot.load(
+                std::memory_order_acquire
+            );
+
+        const bool nearPrecedingLive =
+            GetAnchorPosition(
+                before,
+                nearPrecedingSlot,
+                nullptr
+            );
+
+        const bool nearFollowingLive =
+            GetAnchorPosition(
+                before,
+                nearFollowingSlot,
+                nullptr
+            );
+
+        const bool immediateNeighborsAbsent =
+            !nearPrecedingLive &&
+            !nearFollowingLive;
+
+        predecessor =
+            SearchPredecessorOutward(
+                before
+            );
+
+        follower =
+            SearchFollowerOutward(
+                before
+            );
+
+        Wh_Log(
+            L"OUTWARD_SEARCH_BEFORE "
+            L"phase=%d "
+            L"id=%llu "
+            L"size=%u "
+            L"targetIndex=%u "
+            L"nearPrecedingLive=%d "
+            L"nearFollowingLive=%d "
+            L"immediateNeighborsAbsent=%d "
+            L"predecessorFound=%d "
+            L"predecessorSlot=%d "
+            L"predecessorIndex=%u "
+            L"predecessorDepth=%u "
+            L"followerFound=%d "
+            L"followerSlot=%d "
+            L"followerIndex=%u "
+            L"followerDepth=%u",
+            phase,
+            static_cast<unsigned long long>(
+                targetIdentity
+            ),
             before.size,
-            std::memory_order_release
+            before.targetIndex,
+            nearPrecedingLive
+                ? 1
+                : 0,
+            nearFollowingLive
+                ? 1
+                : 0,
+            immediateNeighborsAbsent
+                ? 1
+                : 0,
+            predecessor.found
+                ? 1
+                : 0,
+            predecessor.anchorSlot,
+            predecessor.index,
+            predecessor.depth,
+            follower.found
+                ? 1
+                : 0,
+            follower.anchorSlot,
+            follower.index,
+            follower.depth
         );
 
-        g_thirdMoveTargetIndex.store(
-            desiredIndex,
-            std::memory_order_release
-        );
+        if (
+            !immediateNeighborsAbsent
+        ) {
+            reinterpret_cast<IUnknown*>(
+                targetAbi
+            )->Release();
+
+            return;
+        }
+
+        if (
+            phase ==
+            2
+        ) {
+            if (
+                !predecessor.found ||
+                !follower.found
+            ) {
+                reinterpret_cast<IUnknown*>(
+                    targetAbi
+                )->Release();
+
+                return;
+            }
+
+            desiredIndex =
+                CalculateImmediatelyAfterIndex(
+                    predecessor.index,
+                    before.targetIndex,
+                    before.size
+                );
+
+            strategy =
+                L"outward-both";
+
+            g_secondTargetIdentity.store(
+                targetIdentity,
+                std::memory_order_release
+            );
+
+            g_secondOverflowSize.store(
+                before.size,
+                std::memory_order_release
+            );
+
+            g_secondMoveTargetIndex.store(
+                desiredIndex,
+                std::memory_order_release
+            );
+
+            g_secondPredecessorDepth.store(
+                predecessor.depth,
+                std::memory_order_release
+            );
+
+            g_secondFollowerDepth.store(
+                follower.depth,
+                std::memory_order_release
+            );
+
+            g_secondImmediateNeighborsAbsent.store(
+                true,
+                std::memory_order_release
+            );
+        } else {
+            const bool exactlyOneFound =
+                predecessor.found !=
+                follower.found;
+
+            if (!exactlyOneFound) {
+                reinterpret_cast<IUnknown*>(
+                    targetAbi
+                )->Release();
+
+                return;
+            }
+
+            if (predecessor.found) {
+                desiredIndex =
+                    CalculateImmediatelyAfterIndex(
+                        predecessor.index,
+                        before.targetIndex,
+                        before.size
+                    );
+
+                strategy =
+                    L"outward-predecessor-only";
+
+                g_thirdLiveNeighborDepth.store(
+                    predecessor.depth,
+                    std::memory_order_release
+                );
+            } else {
+                desiredIndex =
+                    CalculateImmediatelyBeforeIndex(
+                        follower.index,
+                        before.targetIndex,
+                        before.size
+                    );
+
+                strategy =
+                    L"outward-follower-only";
+
+                g_thirdLiveNeighborDepth.store(
+                    follower.depth,
+                    std::memory_order_release
+                );
+            }
+
+            g_thirdTargetIdentity.store(
+                targetIdentity,
+                std::memory_order_release
+            );
+
+            g_thirdOverflowSize.store(
+                before.size,
+                std::memory_order_release
+            );
+
+            g_thirdMoveTargetIndex.store(
+                desiredIndex,
+                std::memory_order_release
+            );
+
+            g_thirdImmediateNeighborsAbsent.store(
+                true,
+                std::memory_order_release
+            );
+        }
     }
 
     const unsigned long long moveNumber =
@@ -2581,15 +2924,11 @@ void HandleTargetIcon(
         ) +
         1;
 
-    void* iconArgumentStorage =
-        targetAbi;
-
     Wh_Log(
-        L"DUAL_NEIGHBOR_MOVE_BEGIN "
+        L"OUTWARD_MOVE_BEGIN "
         L"move=%llu "
         L"phase=%d "
         L"strategy=\"%s\" "
-        L"call=%llu "
         L"id=%llu "
         L"overflowSize=%u "
         L"targetIndexBefore=%u "
@@ -2597,7 +2936,6 @@ void HandleTargetIcon(
         moveNumber,
         phase,
         strategy,
-        callNumber,
         static_cast<unsigned long long>(
             targetIdentity
         ),
@@ -2605,6 +2943,9 @@ void HandleTargetIcon(
         before.targetIndex,
         desiredIndex
     );
+
+    void* iconArgumentStorage =
+        targetAbi;
 
     g_internalMoveDepth++;
 
@@ -2622,11 +2963,6 @@ void HandleTargetIcon(
             targetAbi
         );
 
-    const LogicalNeighborPositions logicalAfter =
-        GetLogicalNeighborPositions(
-            after
-        );
-
     const UIOrderSnapshot uiOrder =
         CaptureUIOrderSnapshot();
 
@@ -2641,110 +2977,178 @@ void HandleTargetIcon(
         before.targetIndex !=
             after.targetIndex;
 
-    const bool directBetween =
-        IsDirectlyBetweenLogicalNeighbors(
-            after
-        );
+    bool relationValidated =
+        false;
 
-    const bool correctSingleRelation =
-        IsCorrectSingleNeighborRelation(
-            after
-        );
+    if (
+        phase ==
+        1
+    ) {
+        unsigned int farPrecedingIndex =
+            0;
 
-    if (phase == 1) {
-        g_firstPrecedingIndexAfter.store(
-            logicalAfter.precedingIndex,
-            std::memory_order_release
-        );
+        unsigned int nearPrecedingIndex =
+            0;
 
-        g_firstTargetIndexAfter.store(
-            after.targetIndex,
-            std::memory_order_release
-        );
+        unsigned int nearFollowingIndex =
+            0;
 
-        g_firstFollowingIndexAfter.store(
-            logicalAfter.followingIndex,
-            std::memory_order_release
-        );
+        unsigned int farFollowingIndex =
+            0;
+
+        const bool allCanonicalAnchorsLive =
+            GetAnchorPosition(
+                after,
+                g_farPrecedingSlot.load(
+                    std::memory_order_acquire
+                ),
+                &farPrecedingIndex
+            ) &&
+            GetAnchorPosition(
+                after,
+                g_nearPrecedingSlot.load(
+                    std::memory_order_acquire
+                ),
+                &nearPrecedingIndex
+            ) &&
+            GetAnchorPosition(
+                after,
+                g_nearFollowingSlot.load(
+                    std::memory_order_acquire
+                ),
+                &nearFollowingIndex
+            ) &&
+            GetAnchorPosition(
+                after,
+                g_farFollowingSlot.load(
+                    std::memory_order_acquire
+                ),
+                &farFollowingIndex
+            );
+
+        relationValidated =
+            allCanonicalAnchorsLive &&
+            after.targetFound &&
+            farPrecedingIndex <
+                nearPrecedingIndex &&
+            nearPrecedingIndex +
+                    1 ==
+                after.targetIndex &&
+            after.targetIndex +
+                    1 ==
+                nearFollowingIndex &&
+            nearFollowingIndex <
+                farFollowingIndex;
 
         g_firstUiOrderPosition.store(
             uiOrderPosition,
             std::memory_order_release
         );
 
-        g_firstRelationEstablished.store(
+        g_firstImmediateRelationEstablished.store(
+            targetIndexChanged &&
+                relationValidated,
+            std::memory_order_release
+        );
+    } else if (
+        phase ==
+        2
+    ) {
+        const CanonicalSearchResult afterPredecessor =
+            SearchPredecessorOutward(
+                after
+            );
+
+        const CanonicalSearchResult afterFollower =
+            SearchFollowerOutward(
+                after
+            );
+
+        relationValidated =
             after.targetFound &&
-                targetIndexChanged &&
-                directBetween,
-            std::memory_order_release
-        );
-    } else if (phase == 2) {
-        g_secondPrecedingIndexAfter.store(
-            logicalAfter.precedingIndex,
-            std::memory_order_release
-        );
-
-        g_secondTargetIndexAfter.store(
-            after.targetIndex,
-            std::memory_order_release
-        );
-
-        g_secondFollowingIndexAfter.store(
-            logicalAfter.followingIndex,
-            std::memory_order_release
-        );
+            afterPredecessor.found &&
+            afterFollower.found &&
+            afterPredecessor.depth ==
+                2 &&
+            afterFollower.depth ==
+                2 &&
+            afterPredecessor.index <
+                after.targetIndex &&
+            after.targetIndex <
+                afterFollower.index &&
+            afterPredecessor.index +
+                    1 ==
+                after.targetIndex;
 
         g_secondUiOrderPosition.store(
             uiOrderPosition,
             std::memory_order_release
         );
 
-        g_secondDualNeighborRestored.store(
-            after.targetFound &&
-                targetIndexChanged &&
-                directBetween,
+        g_secondOutwardBothRestored.store(
+            targetIndexChanged &&
+                relationValidated,
             std::memory_order_release
         );
     } else {
-        g_thirdTargetIndexAfter.store(
-            after.targetIndex,
-            std::memory_order_release
-        );
+        const CanonicalSearchResult afterPredecessor =
+            SearchPredecessorOutward(
+                after
+            );
+
+        const CanonicalSearchResult afterFollower =
+            SearchFollowerOutward(
+                after
+            );
+
+        if (
+            afterPredecessor.found &&
+            !afterFollower.found
+        ) {
+            relationValidated =
+                after.targetFound &&
+                afterPredecessor.depth ==
+                    2 &&
+                afterPredecessor.index +
+                        1 ==
+                    after.targetIndex;
+        } else if (
+            !afterPredecessor.found &&
+            afterFollower.found
+        ) {
+            relationValidated =
+                after.targetFound &&
+                afterFollower.depth ==
+                    2 &&
+                after.targetIndex +
+                        1 ==
+                    afterFollower.index;
+        }
 
         g_thirdUiOrderPosition.store(
             uiOrderPosition,
             std::memory_order_release
         );
 
-        g_thirdSingleNeighborRestored.store(
-            after.targetFound &&
-                targetIndexChanged &&
-                correctSingleRelation,
+        g_thirdOutwardSingleRestored.store(
+            targetIndexChanged &&
+                relationValidated,
             std::memory_order_release
         );
     }
 
     Wh_Log(
-        L"DUAL_NEIGHBOR_MOVE_COMPLETE "
+        L"OUTWARD_MOVE_COMPLETE "
         L"move=%llu "
         L"phase=%d "
         L"strategy=\"%s\" "
         L"id=%llu "
         L"afterEnumerated=%d "
-        L"size=%u "
-        L"leftFound=%d "
-        L"leftIndex=%u "
-        L"rightFound=%d "
-        L"rightIndex=%u "
+        L"afterSize=%u "
         L"targetFound=%d "
         L"targetIndex=%u "
-        L"precedingFound=%d "
-        L"precedingIndex=%u "
-        L"followingFound=%d "
-        L"followingIndex=%u "
         L"targetIndexChanged=%d "
-        L"directBetween=%d "
-        L"correctSingleRelation=%d "
+        L"relationValidated=%d "
         L"uiOrderPosition=%llu",
         moveNumber,
         phase,
@@ -2756,60 +3160,38 @@ void HandleTargetIcon(
             ? 1
             : 0,
         after.size,
-        after.leftFound
-            ? 1
-            : 0,
-        after.leftIndex,
-        after.rightFound
-            ? 1
-            : 0,
-        after.rightIndex,
         after.targetFound
             ? 1
             : 0,
         after.targetIndex,
-        logicalAfter.precedingFound
-            ? 1
-            : 0,
-        logicalAfter.precedingIndex,
-        logicalAfter.followingFound
-            ? 1
-            : 0,
-        logicalAfter.followingIndex,
         targetIndexChanged
             ? 1
             : 0,
-        directBetween
-            ? 1
-            : 0,
-        correctSingleRelation
+        relationValidated
             ? 1
             : 0,
         uiOrderPosition
     );
 
-    if (phase == 2) {
-        const bool savedNumericIndexInvalidated =
-            g_firstMoveTargetIndex.load(
-                std::memory_order_acquire
-            ) !=
-            g_secondMoveTargetIndex.load(
-                std::memory_order_acquire
-            );
-
+    if (
+        phase ==
+        2
+    ) {
         Wh_Log(
-            L"DUAL_NEIGHBOR_BOTH_RESULT "
+            L"OUTWARD_BOTH_RESULT "
             L"firstIdentity=%llu "
             L"secondIdentity=%llu "
             L"identityChanged=%d "
+            L"immediateNeighborsAbsent=%d "
+            L"predecessorDepth=%u "
+            L"followerDepth=%u "
             L"helperCount=%llu "
             L"firstOverflowSize=%u "
             L"secondOverflowSize=%u "
-            L"firstMoveTargetIndex=%u "
-            L"secondMoveTargetIndex=%u "
-            L"savedNumericIndexInvalidated=%d "
-            L"firstRelationEstablished=%d "
-            L"secondDualNeighborRestored=%d",
+            L"firstMoveIndex=%u "
+            L"secondMoveIndex=%u "
+            L"numericIndexInvalidated=%d "
+            L"outwardBothRestored=%d",
             static_cast<unsigned long long>(
                 g_firstTargetIdentity.load(
                     std::memory_order_acquire
@@ -2824,6 +3206,17 @@ void HandleTargetIcon(
                     targetIdentity
                 ? 1
                 : 0,
+            g_secondImmediateNeighborsAbsent.load(
+                std::memory_order_acquire
+            )
+                ? 1
+                : 0,
+            g_secondPredecessorDepth.load(
+                std::memory_order_acquire
+            ),
+            g_secondFollowerDepth.load(
+                std::memory_order_acquire
+            ),
             g_helperIdentityCount.load(
                 std::memory_order_acquire
             ),
@@ -2839,15 +3232,15 @@ void HandleTargetIcon(
             g_secondMoveTargetIndex.load(
                 std::memory_order_acquire
             ),
-            savedNumericIndexInvalidated
-                ? 1
-                : 0,
-            g_firstRelationEstablished.load(
+            g_firstMoveTargetIndex.load(
                 std::memory_order_acquire
-            )
+            ) !=
+                    g_secondMoveTargetIndex.load(
+                        std::memory_order_acquire
+                    )
                 ? 1
                 : 0,
-            g_secondDualNeighborRestored.load(
+            g_secondOutwardBothRestored.load(
                 std::memory_order_acquire
             )
                 ? 1
@@ -2855,47 +3248,30 @@ void HandleTargetIcon(
         );
     }
 
-    if (phase == 3) {
-        const LogicalNeighborPositions beforeLogical =
-            GetLogicalNeighborPositions(
-                before
-            );
-
+    if (
+        phase ==
+        3
+    ) {
         Wh_Log(
-            L"DUAL_NEIGHBOR_FALLBACK_RESULT "
+            L"OUTWARD_SINGLE_RESULT "
             L"thirdIdentity=%llu "
             L"strategy=\"%s\" "
-            L"precedingFoundBefore=%d "
-            L"followingFoundBefore=%d "
-            L"exactlyOneNeighborBefore=%d "
-            L"leftFoundBefore=%d "
-            L"rightFoundBefore=%d "
-            L"correctSingleRelationAfter=%d "
-            L"thirdSingleNeighborRestored=%d",
+            L"immediateNeighborsAbsent=%d "
+            L"liveNeighborDepth=%u "
+            L"outwardSingleRestored=%d",
             static_cast<unsigned long long>(
                 targetIdentity
             ),
             strategy,
-            beforeLogical.precedingFound
+            g_thirdImmediateNeighborsAbsent.load(
+                std::memory_order_acquire
+            )
                 ? 1
                 : 0,
-            beforeLogical.followingFound
-                ? 1
-                : 0,
-            beforeLogical.precedingFound !=
-                    beforeLogical.followingFound
-                ? 1
-                : 0,
-            before.leftFound
-                ? 1
-                : 0,
-            before.rightFound
-                ? 1
-                : 0,
-            correctSingleRelation
-                ? 1
-                : 0,
-            g_thirdSingleNeighborRestored.load(
+            g_thirdLiveNeighborDepth.load(
+                std::memory_order_acquire
+            ),
+            g_thirdOutwardSingleRestored.load(
                 std::memory_order_acquire
             )
                 ? 1
@@ -2908,6 +3284,60 @@ void HandleTargetIcon(
     reinterpret_cast<IUnknown*>(
         targetAbi
     )->Release();
+}
+
+int __cdecl
+TaskbarModel_GetOverflowIcons_Hook(
+    void* pThis,
+    void** result
+) {
+    const unsigned long long callNumber =
+        g_overflowGetterCalls.fetch_add(
+            1,
+            std::memory_order_relaxed
+        ) +
+        1;
+
+    const int originalResult =
+        TaskbarModel_GetOverflowIcons_Original(
+            pThis,
+            result
+        );
+
+    if (
+        SUCCEEDED(
+            static_cast<HRESULT>(
+                originalResult
+            )
+        ) &&
+        result &&
+        *result
+    ) {
+        g_taskbarModel6.store(
+            pThis,
+            std::memory_order_release
+        );
+    }
+
+    Wh_Log(
+        L"OVERFLOW_GETTER "
+        L"call=%llu "
+        L"pThis=%p "
+        L"result=0x%08X "
+        L"collection=%p",
+        callNumber,
+        pThis,
+        static_cast<unsigned int>(
+            static_cast<HRESULT>(
+                originalResult
+            )
+        ),
+        result
+            ? *result
+            : nullptr
+    );
+
+    return originalResult;
 }
 
 void __cdecl
@@ -3045,32 +3475,33 @@ NotificationAreaIconManager_AddVisible_Hook(
             current
         );
 
-    std::vector<std::uint64_t> leftAnchorAdded;
-    std::vector<std::uint64_t> rightAnchorAdded;
-    std::vector<std::uint64_t> targetAdded;
-    std::vector<std::uint64_t> helperAdded;
+    std::vector<std::pair<int, std::uint64_t>>
+        anchorAdded;
+
+    std::vector<std::uint64_t>
+        targetAdded;
+
+    std::vector<std::uint64_t>
+        helperAdded;
 
     for (
         std::uint64_t identity :
         added
     ) {
-        if (
-            IsLeftAnchorIdentity(
-                identity
-            )
-        ) {
-            leftAnchorAdded.push_back(
+        const int anchorSlot =
+            GetAnchorSlotForIdentity(
                 identity
             );
-        }
 
         if (
-            IsRightAnchorIdentity(
-                identity
-            )
+            anchorSlot !=
+            kInvalidAnchorSlot
         ) {
-            rightAnchorAdded.push_back(
-                identity
+            anchorAdded.push_back(
+                {
+                    anchorSlot,
+                    identity
+                }
             );
         }
 
@@ -3100,8 +3531,7 @@ NotificationAreaIconManager_AddVisible_Hook(
         L"call=%llu "
         L"parentAddCall=%llu "
         L"addedCount=%llu "
-        L"leftAnchorAdded=%llu "
-        L"rightAnchorAdded=%llu "
+        L"anchorAdded=%llu "
         L"targetAdded=%llu "
         L"helperAdded=%llu",
         callNumber,
@@ -3110,10 +3540,7 @@ NotificationAreaIconManager_AddVisible_Hook(
             added.size()
         ),
         static_cast<unsigned long long>(
-            leftAnchorAdded.size()
-        ),
-        static_cast<unsigned long long>(
-            rightAnchorAdded.size()
+            anchorAdded.size()
         ),
         static_cast<unsigned long long>(
             targetAdded.size()
@@ -3124,27 +3551,13 @@ NotificationAreaIconManager_AddVisible_Hook(
     );
 
     if (
-        leftAnchorAdded.size() ==
+        anchorAdded.size() ==
         1
     ) {
         CaptureAnchorInterface(
-            true,
+            anchorAdded.front().first,
             callNumber,
-            leftAnchorAdded.front(),
-            iconImplementation
-        );
-
-        return;
-    }
-
-    if (
-        rightAnchorAdded.size() ==
-        1
-    ) {
-        CaptureAnchorInterface(
-            false,
-            callNumber,
-            rightAnchorAdded.front(),
+            anchorAdded.front().second,
             iconImplementation
         );
 
@@ -3163,7 +3576,7 @@ NotificationAreaIconManager_AddVisible_Hook(
             1;
 
         Wh_Log(
-            L"DUAL_NEIGHBOR_HELPER_OBSERVED "
+            L"OUTWARD_HELPER_OBSERVED "
             L"helper=%llu "
             L"id=%llu",
             helperNumber,
@@ -3225,8 +3638,7 @@ bool HookTaskbarSymbols(
         )
     ) {
         Wh_Log(
-            L"Failed to hook one or more "
-            L"taskbar.dll symbols"
+            L"Failed to hook one or more taskbar.dll symbols"
         );
 
         return false;
@@ -3261,14 +3673,14 @@ bool IsPrimaryShellProcess() {
 BOOL Wh_ModInit() {
     Wh_Log(
         L"Tray Add Path Analyzer "
-        L"0.21.0 initializing"
+        L"0.22.0 initializing"
     );
 
     if (
         !IsPrimaryShellProcess()
     ) {
         Wh_Log(
-            L"DUAL_NEIGHBOR_TEST_SKIPPED "
+            L"OUTWARD_SEARCH_TEST_SKIPPED "
             L"reason=\"non-primary Explorer process\" "
             L"processId=%lu",
             GetCurrentProcessId()
@@ -3307,7 +3719,7 @@ BOOL Wh_ModInit() {
     }
 
     Wh_Log(
-        L"DUAL_NEIGHBOR_TEST_READY "
+        L"OUTWARD_SEARCH_TEST_READY "
         L"processId=%lu",
         GetCurrentProcessId()
     );
@@ -3316,28 +3728,25 @@ BOOL Wh_ModInit() {
 }
 
 void Wh_ModUninit() {
-    void* leftAnchorAbi =
-        g_leftAnchorAbi.exchange(
-            nullptr,
-            std::memory_order_acq_rel
-        );
+    for (
+        int slot = 0;
+        slot <
+            kAnchorCount;
+        slot++
+    ) {
+        void* anchorAbi =
+            g_anchorAbis[
+                slot
+            ].exchange(
+                nullptr,
+                std::memory_order_acq_rel
+            );
 
-    if (leftAnchorAbi) {
-        reinterpret_cast<IUnknown*>(
-            leftAnchorAbi
-        )->Release();
-    }
-
-    void* rightAnchorAbi =
-        g_rightAnchorAbi.exchange(
-            nullptr,
-            std::memory_order_acq_rel
-        );
-
-    if (rightAnchorAbi) {
-        reinterpret_cast<IUnknown*>(
-            rightAnchorAbi
-        )->Release();
+        if (anchorAbi) {
+            reinterpret_cast<IUnknown*>(
+                anchorAbi
+            )->Release();
+        }
     }
 
     Wh_Log(
@@ -3346,16 +3755,17 @@ void Wh_ModUninit() {
         L"visibleAddCalls=%llu "
         L"overflowGetterCalls=%llu "
         L"moveAttempts=%llu "
-        L"leftAnchorCaptured=%d "
-        L"rightAnchorCaptured=%d "
         L"helperCount=%llu "
         L"firstTargetIdentity=%llu "
         L"secondTargetIdentity=%llu "
         L"thirdTargetIdentity=%llu "
-        L"firstRelationEstablished=%d "
-        L"secondDualNeighborRestored=%d "
-        L"thirdSingleNeighborRestored=%d "
-        L"dualNeighborValidationCompleted=%d",
+        L"canonicalOrderEstablished=%d "
+        L"firstImmediateRelationEstablished=%d "
+        L"secondImmediateNeighborsAbsent=%d "
+        L"secondOutwardBothRestored=%d "
+        L"thirdImmediateNeighborsAbsent=%d "
+        L"thirdOutwardSingleRestored=%d "
+        L"outwardSearchValidationCompleted=%d",
         g_addIconCalls.load(
             std::memory_order_acquire
         ),
@@ -3368,16 +3778,6 @@ void Wh_ModUninit() {
         g_moveAttempts.load(
             std::memory_order_acquire
         ),
-        g_leftAnchorCaptured.load(
-            std::memory_order_acquire
-        )
-            ? 1
-            : 0,
-        g_rightAnchorCaptured.load(
-            std::memory_order_acquire
-        )
-            ? 1
-            : 0,
         g_helperIdentityCount.load(
             std::memory_order_acquire
         ),
@@ -3396,22 +3796,37 @@ void Wh_ModUninit() {
                 std::memory_order_acquire
             )
         ),
-        g_firstRelationEstablished.load(
+        g_canonicalOrderEstablished.load(
             std::memory_order_acquire
         )
             ? 1
             : 0,
-        g_secondDualNeighborRestored.load(
+        g_firstImmediateRelationEstablished.load(
             std::memory_order_acquire
         )
             ? 1
             : 0,
-        g_thirdSingleNeighborRestored.load(
+        g_secondImmediateNeighborsAbsent.load(
             std::memory_order_acquire
         )
             ? 1
             : 0,
-        g_dualNeighborValidationCompleted.load(
+        g_secondOutwardBothRestored.load(
+            std::memory_order_acquire
+        )
+            ? 1
+            : 0,
+        g_thirdImmediateNeighborsAbsent.load(
+            std::memory_order_acquire
+        )
+            ? 1
+            : 0,
+        g_thirdOutwardSingleRestored.load(
+            std::memory_order_acquire
+        )
+            ? 1
+            : 0,
+        g_outwardSearchValidationCompleted.load(
             std::memory_order_acquire
         )
             ? 1
