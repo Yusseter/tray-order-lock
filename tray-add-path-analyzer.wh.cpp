@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              tray-add-path-analyzer
 // @name            Tray Add Path Analyzer
-// @description     Tests persistent manual tray order restoration across a full Explorer process restart.
-// @version         0.28.0
+// @description     Tests Explorer restart persistence with delayed primary-shell taskbar hook initialization.
+// @version         0.28.1
 // @author          Yusseter
 // @github          https://github.com/Yusseter
 // @homepage        https://github.com/Yusseter/tray-order-lock
@@ -16,7 +16,7 @@
 /*
 # Tray Add Path Analyzer
 
-Version 0.28.0 validates that manually learned canonical tray-order state
+Version 0.28.1 validates that manually learned canonical tray-order state
 survives a complete Explorer process restart.
 
 Phase 1:
@@ -82,13 +82,13 @@ constexpr wchar_t kUIOrderListValueName[] =
     L"UIOrderList";
 
 constexpr wchar_t kPersistentStateValueName[] =
-    L"CanonicalStateV280";
+    L"CanonicalStateV281";
 
 constexpr wchar_t kPersistentPathValueName[] =
-    L"CanonicalNormalizedPathV280";
+    L"CanonicalNormalizedPathV281";
 
 constexpr std::uint32_t kPersistentStateMagic =
-    0x56323830;
+    0x56323831;
 
 constexpr std::uint32_t kPersistentStateVersion =
     1;
@@ -148,6 +148,9 @@ using Vector_GetAt_t =
 
 using Vector_GetSize_t =
     HRESULT(STDMETHODCALLTYPE*)(void*, unsigned int*);
+
+using CreateWindowExW_t =
+    decltype(&CreateWindowExW);
 
 struct PersistedCanonicalState {
     std::uint32_t magic = 0;
@@ -223,6 +226,9 @@ TaskbarModel_GetOverflowIcons_t
 TaskbarModel_MoveNotificationAreaIcon_t
     TaskbarModel_MoveNotificationAreaIcon_Original = nullptr;
 
+CreateWindowExW_t
+    CreateWindowExW_Original = nullptr;
+
 const GUID* g_notificationAreaIconInterfaceId = nullptr;
 const GUID* g_notificationAreaIconVectorId = nullptr;
 
@@ -275,6 +281,9 @@ std::atomic<bool> g_persistentImmediateReadbackSucceeded = false;
 std::atomic<bool> g_persistedStateLoadedAtInit = false;
 
 std::atomic<bool> g_explorerProcessChanged = false;
+
+std::atomic<bool> g_taskbarHooksInitializing = false;
+std::atomic<bool> g_taskbarHooksInitialized = false;
 
 std::atomic<bool> g_uniqueCandidateObserved = false;
 std::atomic<bool> g_uniqueCandidateSelected = false;
@@ -2409,57 +2418,316 @@ bool HookTaskbarSymbols(
             ARRAYSIZE(hooks));
 }
 
-bool IsPrimaryShellProcess() {
-    const HWND shellWindow =
-        GetShellWindow();
+BOOL CALLBACK EnumCurrentProcessTaskbarWindowProc(
+    HWND hWnd,
+    LPARAM lParam) {
+    DWORD processId = 0;
 
-    if (!shellWindow) {
+    if (
+        !GetWindowThreadProcessId(
+            hWnd,
+            &processId) ||
+        processId !=
+            GetCurrentProcessId()) {
+        return TRUE;
+    }
+
+    wchar_t className[64]{};
+
+    if (
+        GetClassNameW(
+            hWnd,
+            className,
+            ARRAYSIZE(className)) ==
+        0) {
+        return TRUE;
+    }
+
+    if (
+        _wcsicmp(
+            className,
+            L"Shell_TrayWnd") !=
+        0) {
+        return TRUE;
+    }
+
+    *reinterpret_cast<HWND*>(
+        lParam) =
+        hWnd;
+
+    return FALSE;
+}
+
+HWND FindCurrentProcessTaskbarWindow() {
+    HWND result =
+        nullptr;
+
+    EnumWindows(
+        EnumCurrentProcessTaskbarWindowProc,
+        reinterpret_cast<LPARAM>(
+            &result));
+
+    return result;
+}
+
+void LogRestartPersistenceTestReady() {
+    Wh_Log(
+        L"RESTART_PERSISTENCE_TEST_READY "
+        L"processId=%lu "
+        L"persistedStateLoadedAtInit=%d "
+        L"explorerProcessChanged=%d "
+        L"taskbarHooksInitialized=%d",
+        GetCurrentProcessId(),
+        g_persistedStateLoadedAtInit.load(
+            std::memory_order_acquire)
+            ? 1
+            : 0,
+        g_explorerProcessChanged.load(
+            std::memory_order_acquire)
+            ? 1
+            : 0,
+        g_taskbarHooksInitialized.load(
+            std::memory_order_acquire)
+            ? 1
+            : 0);
+}
+
+bool TryInitializeTaskbarHooks(
+    bool applyImmediately) {
+    if (
+        g_taskbarHooksInitialized.load(
+            std::memory_order_acquire)) {
+        return true;
+    }
+
+    bool expected =
+        false;
+
+    if (
+        !g_taskbarHooksInitializing.compare_exchange_strong(
+            expected,
+            true,
+            std::memory_order_acq_rel)) {
         return false;
     }
 
-    DWORD processId = 0;
+    HMODULE taskbarModule =
+        GetModuleHandleW(
+            L"taskbar.dll");
+
+    if (!taskbarModule) {
+        Wh_Log(
+            L"RESTART_PERSISTENCE_TASKBAR_DLL_NOT_READY "
+            L"processId=%lu",
+            GetCurrentProcessId());
+
+        g_taskbarHooksInitializing.store(
+            false,
+            std::memory_order_release);
+
+        return false;
+    }
+
+    if (
+        !ResolveRequiredSymbols(
+            taskbarModule)) {
+        Wh_Log(
+            L"RESTART_PERSISTENCE_SYMBOL_RESOLUTION_FAILED "
+            L"processId=%lu",
+            GetCurrentProcessId());
+
+        g_taskbarHooksInitializing.store(
+            false,
+            std::memory_order_release);
+
+        return false;
+    }
+
+    if (
+        !HookTaskbarSymbols(
+            taskbarModule)) {
+        Wh_Log(
+            L"RESTART_PERSISTENCE_TASKBAR_HOOK_REGISTRATION_FAILED "
+            L"processId=%lu",
+            GetCurrentProcessId());
+
+        g_taskbarHooksInitializing.store(
+            false,
+            std::memory_order_release);
+
+        return false;
+    }
+
+    if (applyImmediately) {
+        if (!Wh_ApplyHookOperations()) {
+            Wh_Log(
+                L"RESTART_PERSISTENCE_TASKBAR_HOOK_APPLY_FAILED "
+                L"processId=%lu",
+                GetCurrentProcessId());
+
+            g_taskbarHooksInitializing.store(
+                false,
+                std::memory_order_release);
+
+            return false;
+        }
+    }
+
+    g_taskbarHooksInitialized.store(
+        true,
+        std::memory_order_release);
+
+    g_taskbarHooksInitializing.store(
+        false,
+        std::memory_order_release);
+
+    if (applyImmediately) {
+        Wh_Log(
+            L"RESTART_PERSISTENCE_TASKBAR_HOOKS_READY "
+            L"processId=%lu applyImmediately=1",
+            GetCurrentProcessId());
+    } else {
+        Wh_Log(
+            L"RESTART_PERSISTENCE_TASKBAR_HOOKS_REGISTERED "
+            L"processId=%lu applyImmediately=0",
+            GetCurrentProcessId());
+    }
+
+    return true;
+}
+
+HWND WINAPI CreateWindowExW_Hook(
+    DWORD dwExStyle,
+    LPCWSTR lpClassName,
+    LPCWSTR lpWindowName,
+    DWORD dwStyle,
+    int X,
+    int Y,
+    int nWidth,
+    int nHeight,
+    HWND hWndParent,
+    HMENU hMenu,
+    HINSTANCE hInstance,
+    LPVOID lpParam) {
+    HWND hWnd =
+        CreateWindowExW_Original(
+            dwExStyle,
+            lpClassName,
+            lpWindowName,
+            dwStyle,
+            X,
+            Y,
+            nWidth,
+            nHeight,
+            hWndParent,
+            hMenu,
+            hInstance,
+            lpParam);
+
+    if (!hWnd) {
+        return hWnd;
+    }
+
+    const bool textualClassName =
+        (
+            reinterpret_cast<ULONG_PTR>(
+                lpClassName) &
+            ~static_cast<ULONG_PTR>(
+                0xffff)
+        ) !=
+        0;
+
+    if (
+        !textualClassName ||
+        _wcsicmp(
+            lpClassName,
+            L"Shell_TrayWnd") !=
+            0) {
+        return hWnd;
+    }
+
+    DWORD processId =
+        0;
 
     GetWindowThreadProcessId(
-        shellWindow,
+        hWnd,
         &processId);
 
-    return
-        processId ==
-        GetCurrentProcessId();
+    if (
+        processId !=
+        GetCurrentProcessId()) {
+        return hWnd;
+    }
+
+    Wh_Log(
+        L"RESTART_PERSISTENCE_SHELL_WINDOW_CREATED "
+        L"processId=%lu "
+        L"hWnd=%p",
+        processId,
+        hWnd);
+
+    if (
+        !g_taskbarHooksInitialized.load(
+            std::memory_order_acquire)) {
+        if (
+            TryInitializeTaskbarHooks(
+                true)) {
+            LogRestartPersistenceTestReady();
+        }
+    }
+
+    return hWnd;
 }
 
 }  // namespace
 
 BOOL Wh_ModInit() {
     Wh_Log(
-        L"Tray Add Path Analyzer 0.28.0 initializing "
+        L"Tray Add Path Analyzer 0.28.1 initializing "
         L"processId=%lu",
         GetCurrentProcessId());
 
-    if (!IsPrimaryShellProcess()) {
-        return TRUE;
-    }
-
     LoadPersistentStateAtInit();
 
-    HMODULE taskbar =
-        GetModuleHandleW(
-            L"taskbar.dll");
+    if (
+        !WindhawkUtils::SetFunctionHook(
+            CreateWindowExW,
+            CreateWindowExW_Hook,
+            &CreateWindowExW_Original)) {
+        Wh_Log(
+            L"RESTART_PERSISTENCE_CREATEWINDOW_HOOK_FAILED "
+            L"processId=%lu",
+            GetCurrentProcessId());
 
-    if (!taskbar) {
         return FALSE;
     }
 
-    if (!ResolveRequiredSymbols(taskbar)) {
-        return FALSE;
-    }
+    HWND existingTaskbarWindow =
+        FindCurrentProcessTaskbarWindow();
 
-    if (!HookTaskbarSymbols(taskbar)) {
-        return FALSE;
+    if (existingTaskbarWindow) {
+        Wh_Log(
+            L"RESTART_PERSISTENCE_EXISTING_PRIMARY_SHELL "
+            L"processId=%lu "
+            L"hWnd=%p",
+            GetCurrentProcessId(),
+            existingTaskbarWindow);
+
+        if (
+            !TryInitializeTaskbarHooks(
+                false)) {
+            return FALSE;
+        }
+    } else {
+        Wh_Log(
+            L"RESTART_PERSISTENCE_TASKBAR_HOOKS_DEFERRED "
+            L"processId=%lu "
+            L"reason=\"Shell_TrayWnd-not-created-yet\"",
+            GetCurrentProcessId());
     }
 
     Wh_Log(
-        L"RESTART_PERSISTENCE_TEST_READY "
+        L"RESTART_PERSISTENCE_BOOTSTRAP_READY "
         L"processId=%lu "
         L"persistedStateLoadedAtInit=%d "
         L"explorerProcessChanged=%d",
@@ -2474,6 +2742,14 @@ BOOL Wh_ModInit() {
             : 0);
 
     return TRUE;
+}
+
+void Wh_ModAfterInit() {
+    if (
+        g_taskbarHooksInitialized.load(
+            std::memory_order_acquire)) {
+        LogRestartPersistenceTestReady();
+    }
 }
 
 void Wh_ModUninit() {
