@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              tray-add-path-analyzer
 // @name            Tray Add Path Analyzer
-// @description     Tests persistence of manually learned canonical tray order across a full mod reload.
-// @version         0.27.0
+// @description     Tests persistent manual tray order restoration across a full Explorer process restart.
+// @version         0.28.0
 // @author          Yusseter
 // @github          https://github.com/Yusseter
 // @homepage        https://github.com/Yusseter/tray-order-lock
@@ -16,52 +16,42 @@
 /*
 # Tray Add Path Analyzer
 
-Version 0.27.0 validates persistent canonical tray-order state across a full
-Windhawk mod unload/reload.
+Version 0.28.0 validates that manually learned canonical tray-order state
+survives a complete Explorer process restart.
 
 Phase 1:
 
-- Three GUID-based anchor icons are created.
+- Three stable logical anchor executables create fresh GUID identities.
 - Version-1.0.0 creates a UID=1 target.
-- The analyzer places the target between the first two live anchors.
-- The user manually drags the target into the other anchor interval.
-- The public MoveNotificationAreaIcon path is allowed to execute normally.
-- The resulting canonical relation is learned.
-- The following state is written to Windhawk mod local storage:
-  - first Windows target identity,
-  - manually selected predecessor anchor slot,
-  - manually selected follower anchor slot,
-  - manual target index for diagnostic comparison,
-  - first-session overflow size,
-  - manual UIOrderList position,
-  - first-session analyzer MoveIcon count,
-  - first-session manual target move count,
-  - version-normalized logical target path.
+- The analyzer places it between the first and second live anchors.
+- The user manually drags it into the second anchor interval.
+- The resulting relation is saved with Windhawk local storage.
+- The persisted state includes the current Explorer PID.
 
-The target and anchors are then stopped.
+Phase 1 applications are then closed.
 
-The Windhawk mod is manually disabled and enabled again. This destroys all
-in-process analyzer state and starts a new mod instance.
+The user restarts Windows Explorer from Task Manager.
+
+This destroys the original Explorer process and therefore all analyzer C++
+globals, COM references and process-local state.
+
+Windhawk injects the analyzer into the replacement Explorer process.
+
+At the new Wh_ModInit:
+
+- the persistent state must load successfully;
+- the current Explorer PID must differ from the persisted phase-1 PID.
 
 Phase 2:
 
-- Wh_ModInit loads the persisted binary and string state from Windhawk local
-  storage.
-- Three new GUID-based instances of the same logical anchor executables are
-  created and captured.
-- Three helper icons change the live overflow geometry.
-- Version-2.0.0 creates a new UID=1 Windows tray identity.
-- The replacement is matched to exactly one historical identity using
-  version-normalized executable path + UID.
-- That historical identity must equal the first target identity loaded from
-  persistent storage.
-- The persisted predecessor/follower logical anchor slots are resolved to
-  their CURRENT live anchor objects.
-- The replacement is restored between those anchors using their current
-  live positions.
-
-The experiment verifies that the learned manual order survives a complete
-mod reload and is not dependent on C++ globals or the old numeric index.
+- Fresh anchor GUID identities are created.
+- Three helper icons alter the live overflow geometry.
+- Version-2.0.0 creates a replacement UID identity.
+- Exactly one historical target candidate is expected.
+- It must equal the persisted phase-1 Windows target identity.
+- The persisted predecessor/follower logical anchor slots are resolved against
+  the new Explorer process's CURRENT live anchor objects.
+- The replacement is restored between them.
 
 No UIOrderList registry values are written by the analyzer.
 */
@@ -92,51 +82,42 @@ constexpr wchar_t kUIOrderListValueName[] =
     L"UIOrderList";
 
 constexpr wchar_t kPersistentStateValueName[] =
-    L"CanonicalStateV270";
+    L"CanonicalStateV280";
 
 constexpr wchar_t kPersistentPathValueName[] =
-    L"CanonicalNormalizedPathV270";
+    L"CanonicalNormalizedPathV280";
 
 constexpr std::uint32_t kPersistentStateMagic =
-    0x56373230;
+    0x56323830;
 
 constexpr std::uint32_t kPersistentStateVersion =
     1;
 
-constexpr int kAnchorCount =
-    3;
-
-constexpr int kInvalidAnchorSlot =
-    -1;
-
-constexpr int kOverflowLocation =
-    1;
-
-constexpr DWORD kTargetUid =
-    1;
+constexpr int kAnchorCount = 3;
+constexpr int kInvalidAnchorSlot = -1;
+constexpr int kOverflowLocation = 1;
+constexpr DWORD kTargetUid = 1;
 
 constexpr wchar_t kAnchorAExecutableName[] =
-    L"traypersistentanchoraprobev270.exe";
+    L"trayrestartanchoraprobev280.exe";
 
 constexpr wchar_t kAnchorBExecutableName[] =
-    L"traypersistentanchorbprobev270.exe";
+    L"trayrestartanchorbprobev280.exe";
 
 constexpr wchar_t kAnchorCExecutableName[] =
-    L"traypersistentanchorcprobev270.exe";
+    L"trayrestartanchorcprobev280.exe";
 
-constexpr const wchar_t* kAnchorExecutableNames[
-    kAnchorCount
-] = {
+constexpr const wchar_t* kAnchorExecutableNames[kAnchorCount] = {
     kAnchorAExecutableName,
     kAnchorBExecutableName,
     kAnchorCExecutableName,
 };
 
 constexpr wchar_t kTargetExecutableName[] =
-    L"trayuidpersistentrestoreprobev270.exe";
+    L"trayuidrestartrestoreprobev280.exe";
 
 constexpr wchar_t kHelperExecutableName[] =
-    L"traypersistentcollectionhelperv270.exe";
+    L"trayrestartcollectionhelperv280.exe";
 
 constexpr wchar_t kVersion1Marker[] =
     L"\\version-1.0.0\\";
@@ -145,432 +126,214 @@ constexpr wchar_t kVersion2Marker[] =
     L"\\version-2.0.0\\";
 
 using NotificationAreaIconManager_AddIcon_t =
-    void(__cdecl*)(
-        void* pThis,
-        void* trayNotifyData
-    );
+    void(__cdecl*)(void*, void*);
 
 using NotificationAreaIconManager_AddVisible_t =
-    void(__cdecl*)(
-        void* pThis,
-        void* iconImplementation
-    );
+    void(__cdecl*)(void*, void*);
 
 using NotificationAreaIconManager_MoveIcon_t =
-    void(__cdecl*)(
-        void* pThis,
-        void* iconArgumentStorage,
-        int location,
-        unsigned int index
-    );
+    void(__cdecl*)(void*, void*, int, unsigned int);
 
 using NotificationAreaIcon_QueryInterface_t =
-    int(__cdecl*)(
-        void* iconImplementation,
-        const GUID& interfaceId,
-        void** result
-    );
+    int(__cdecl*)(void*, const GUID&, void**);
 
 using TaskbarModel_GetOverflowIcons_t =
-    int(__cdecl*)(
-        void* pThis,
-        void** result
-    );
+    int(__cdecl*)(void*, void**);
 
 using TaskbarModel_MoveNotificationAreaIcon_t =
-    int(__cdecl*)(
-        void* pThis,
-        void* notificationAreaIconAbi,
-        int location,
-        unsigned int index
-    );
+    int(__cdecl*)(void*, void*, int, unsigned int);
 
 using Vector_GetAt_t =
-    HRESULT(STDMETHODCALLTYPE*)(
-        void* pThis,
-        unsigned int index,
-        void** value
-    );
+    HRESULT(STDMETHODCALLTYPE*)(void*, unsigned int, void**);
 
 using Vector_GetSize_t =
-    HRESULT(STDMETHODCALLTYPE*)(
-        void* pThis,
-        unsigned int* size
-    );
+    HRESULT(STDMETHODCALLTYPE*)(void*, unsigned int*);
 
 struct PersistedCanonicalState {
-    std::uint32_t magic =
-        0;
+    std::uint32_t magic = 0;
+    std::uint32_t version = 0;
 
-    std::uint32_t version =
-        0;
+    std::uint64_t firstTargetIdentity = 0;
 
-    std::uint64_t firstTargetIdentity =
-        0;
+    std::int32_t precedingSlot = kInvalidAnchorSlot;
+    std::int32_t followingSlot = kInvalidAnchorSlot;
 
-    std::int32_t precedingSlot =
-        kInvalidAnchorSlot;
+    std::uint32_t manualSavedTargetIndex = 0;
+    std::uint32_t firstSessionOverflowSize = 0;
 
-    std::int32_t followingSlot =
-        kInvalidAnchorSlot;
+    std::uint64_t manualUiOrderPosition = 0;
+    std::uint64_t firstSessionAnalyzerMoveAttempts = 0;
+    std::uint64_t firstSessionManualTargetMoveCalls = 0;
 
-    std::uint32_t manualSavedTargetIndex =
-        0;
-
-    std::uint32_t firstSessionOverflowSize =
-        0;
-
-    std::uint64_t manualUiOrderPosition =
-        0;
-
-    std::uint64_t firstSessionAnalyzerMoveAttempts =
-        0;
-
-    std::uint64_t firstSessionManualTargetMoveCalls =
-        0;
+    std::uint32_t firstExplorerProcessId = 0;
+    std::uint32_t reserved = 0;
 };
 
 struct UIOrderSnapshot {
-    bool valid =
-        false;
-
-    LONG status =
-        ERROR_SUCCESS;
-
+    bool valid = false;
+    LONG status = ERROR_SUCCESS;
     std::vector<std::uint64_t> entries;
 };
 
 struct AddIconContext {
-    bool active =
-        false;
-
-    unsigned long long callNumber =
-        0;
-
+    bool active = false;
     UIOrderSnapshot before;
 };
 
 struct OverflowPositions {
-    bool enumerated =
-        false;
+    bool enumerated = false;
+    HRESULT getterResult = E_FAIL;
+    HRESULT vectorQueryResult = E_FAIL;
+    HRESULT sizeResult = E_FAIL;
 
-    HRESULT getterResult =
-        E_FAIL;
+    unsigned int size = 0;
 
-    HRESULT vectorQueryResult =
-        E_FAIL;
+    bool anchorFound[kAnchorCount]{};
+    unsigned int anchorIndex[kAnchorCount]{};
 
-    HRESULT sizeResult =
-        E_FAIL;
-
-    unsigned int size =
-        0;
-
-    bool anchorFound[
-        kAnchorCount
-    ]{};
-
-    unsigned int anchorIndex[
-        kAnchorCount
-    ]{};
-
-    bool targetFound =
-        false;
-
-    unsigned int targetIndex =
-        0;
+    bool targetFound = false;
+    unsigned int targetIndex = 0;
 };
 
 struct HistoricalCandidate {
-    std::uint64_t identity =
-        0;
-
+    std::uint64_t identity = 0;
     std::wstring executablePath;
-
     std::wstring normalizedPath;
-
-    DWORD uid =
-        0;
-
-    bool uidValid =
-        false;
-
-    bool pathExists =
-        false;
-
-    unsigned long long uiOrderPosition =
-        0;
+    DWORD uid = 0;
+    bool uidValid = false;
+    bool pathExists = false;
+    unsigned long long uiOrderPosition = 0;
 };
 
 NotificationAreaIconManager_AddIcon_t
-    NotificationAreaIconManager_AddIcon_Original =
-        nullptr;
+    NotificationAreaIconManager_AddIcon_Original = nullptr;
 
 NotificationAreaIconManager_AddVisible_t
-    NotificationAreaIconManager_AddVisible_Original =
-        nullptr;
+    NotificationAreaIconManager_AddVisible_Original = nullptr;
 
 NotificationAreaIconManager_MoveIcon_t
-    NotificationAreaIconManager_MoveIcon =
-        nullptr;
+    NotificationAreaIconManager_MoveIcon = nullptr;
 
 NotificationAreaIcon_QueryInterface_t
-    NotificationAreaIcon_QueryInterface =
-        nullptr;
+    NotificationAreaIcon_QueryInterface = nullptr;
 
 TaskbarModel_GetOverflowIcons_t
-    TaskbarModel_GetOverflowIcons_Original =
-        nullptr;
+    TaskbarModel_GetOverflowIcons_Original = nullptr;
 
 TaskbarModel_MoveNotificationAreaIcon_t
-    TaskbarModel_MoveNotificationAreaIcon_Original =
-        nullptr;
+    TaskbarModel_MoveNotificationAreaIcon_Original = nullptr;
 
-const GUID* g_notificationAreaIconInterfaceId =
-    nullptr;
+const GUID* g_notificationAreaIconInterfaceId = nullptr;
+const GUID* g_notificationAreaIconVectorId = nullptr;
 
-const GUID* g_notificationAreaIconVectorId =
-    nullptr;
+std::atomic<void*> g_taskbarModel6 = nullptr;
 
-std::atomic<void*> g_taskbarModel6 =
-    nullptr;
+std::atomic<void*> g_anchorAbis[kAnchorCount]{};
+std::atomic<bool> g_anchorCaptured[kAnchorCount]{};
 
-std::atomic<void*> g_anchorAbis[
-    kAnchorCount
-]{};
+std::atomic<void*> g_firstTargetAbi = nullptr;
 
-std::atomic<std::uint64_t> g_anchorIdentities[
-    kAnchorCount
-]{};
+std::atomic<std::uint64_t> g_firstTargetIdentity = 0;
+std::atomic<std::uint64_t> g_secondTargetIdentity = 0;
+std::atomic<std::uint64_t> g_selectedHistoricalIdentity = 0;
 
-std::atomic<bool> g_anchorCaptured[
-    kAnchorCount
-]{};
+std::atomic<int> g_initialFirstAnchorSlot = kInvalidAnchorSlot;
+std::atomic<int> g_initialMiddleAnchorSlot = kInvalidAnchorSlot;
+std::atomic<int> g_initialLastAnchorSlot = kInvalidAnchorSlot;
 
-std::atomic<void*> g_firstTargetAbi =
-    nullptr;
+std::atomic<int> g_manualPrecedingSlot = kInvalidAnchorSlot;
+std::atomic<int> g_manualFollowingSlot = kInvalidAnchorSlot;
 
-std::atomic<std::uint64_t> g_firstTargetIdentity =
-    0;
+std::atomic<unsigned long long> g_analyzerMoveAttempts = 0;
+std::atomic<unsigned long long> g_manualTargetMoveCalls = 0;
+std::atomic<unsigned long long> g_manualRelationUpdates = 0;
+std::atomic<unsigned long long> g_helperIdentityCount = 0;
+std::atomic<unsigned long long> g_restoreDecisions = 0;
 
-std::atomic<std::uint64_t> g_secondTargetIdentity =
-    0;
+std::atomic<unsigned int> g_candidateCount = 0;
 
-std::atomic<std::uint64_t> g_selectedHistoricalIdentity =
-    0;
+std::atomic<unsigned int> g_firstOverflowSize = 0;
+std::atomic<unsigned int> g_secondOverflowSize = 0;
 
-std::atomic<int> g_initialFirstAnchorSlot =
-    kInvalidAnchorSlot;
+std::atomic<unsigned int> g_manualSavedTargetIndex = 0;
+std::atomic<unsigned int> g_secondMoveTargetIndex = 0;
 
-std::atomic<int> g_initialMiddleAnchorSlot =
-    kInvalidAnchorSlot;
+std::atomic<unsigned int> g_secondTargetIndexBefore = 0;
+std::atomic<unsigned int> g_secondTargetIndexAfter = 0;
 
-std::atomic<int> g_initialLastAnchorSlot =
-    kInvalidAnchorSlot;
+std::atomic<unsigned int> g_secondPrecedingIndexBefore = 0;
+std::atomic<unsigned int> g_secondFollowingIndexBefore = 0;
 
-std::atomic<int> g_manualPrecedingSlot =
-    kInvalidAnchorSlot;
+std::atomic<unsigned long long> g_manualUiOrderPosition = 0;
+std::atomic<unsigned long long> g_secondUiOrderPosition = 0;
 
-std::atomic<int> g_manualFollowingSlot =
-    kInvalidAnchorSlot;
+std::atomic<bool> g_initialRelationEstablished = false;
+std::atomic<bool> g_manualCanonicalRelationUpdated = false;
 
-std::atomic<unsigned long long> g_addIconCalls =
-    0;
+std::atomic<bool> g_persistentWriteSucceeded = false;
+std::atomic<bool> g_persistentImmediateReadbackSucceeded = false;
+std::atomic<bool> g_persistedStateLoadedAtInit = false;
 
-std::atomic<unsigned long long> g_visibleAddCalls =
-    0;
+std::atomic<bool> g_explorerProcessChanged = false;
 
-std::atomic<unsigned long long> g_overflowGetterCalls =
-    0;
+std::atomic<bool> g_uniqueCandidateObserved = false;
+std::atomic<bool> g_uniqueCandidateSelected = false;
 
-std::atomic<unsigned long long> g_analyzerMoveAttempts =
-    0;
-
-std::atomic<unsigned long long> g_manualTargetMoveCalls =
-    0;
-
-std::atomic<unsigned long long> g_manualRelationUpdates =
-    0;
-
-std::atomic<unsigned long long> g_restoreDecisions =
-    0;
-
-std::atomic<unsigned long long> g_helperIdentityCount =
-    0;
-
-std::atomic<unsigned int> g_candidateCount =
-    0;
-
-std::atomic<unsigned int> g_firstOverflowSize =
-    0;
-
-std::atomic<unsigned int> g_secondOverflowSize =
-    0;
-
-std::atomic<unsigned int> g_initialMoveTargetIndex =
-    0;
-
-std::atomic<unsigned int> g_manualSavedTargetIndex =
-    0;
-
-std::atomic<unsigned int> g_secondMoveTargetIndex =
-    0;
-
-std::atomic<unsigned int> g_secondTargetIndexBefore =
-    0;
-
-std::atomic<unsigned int> g_secondTargetIndexAfter =
-    0;
-
-std::atomic<unsigned int> g_secondPrecedingIndexBefore =
-    0;
-
-std::atomic<unsigned int> g_secondFollowingIndexBefore =
-    0;
-
-std::atomic<unsigned long long> g_initialUiOrderPosition =
-    0;
-
-std::atomic<unsigned long long> g_manualUiOrderPosition =
-    0;
-
-std::atomic<unsigned long long> g_secondUiOrderPosition =
-    0;
-
-std::atomic<bool> g_initialRelationEstablished =
-    false;
-
-std::atomic<bool> g_manualCanonicalRelationUpdated =
-    false;
-
-std::atomic<bool> g_persistentWriteSucceeded =
-    false;
-
-std::atomic<bool> g_persistentImmediateReadbackSucceeded =
-    false;
-
-std::atomic<bool> g_persistedStateLoadedAtInit =
-    false;
-
-std::atomic<bool> g_uniqueCandidateObserved =
-    false;
-
-std::atomic<bool> g_uniqueCandidateSelected =
-    false;
-
-std::atomic<bool> g_replacementRestoredToPersistedRelation =
-    false;
-
-std::atomic<bool> g_persistenceValidationCompleted =
-    false;
+std::atomic<bool> g_replacementRestoredToPersistedRelation = false;
+std::atomic<bool> g_restartPersistenceValidationCompleted = false;
 
 PersistedCanonicalState g_loadedPersistentState;
-
 std::wstring g_loadedNormalizedPath;
 
-thread_local unsigned int g_internalMoveDepth =
-    0;
-
+thread_local unsigned int g_internalMoveDepth = 0;
 thread_local AddIconContext g_addIconContext;
 
-std::wstring ToLower(
-    std::wstring value
-) {
+std::wstring ToLower(std::wstring value) {
     std::transform(
         value.begin(),
         value.end(),
         value.begin(),
-        [](
-            wchar_t character
-        ) {
-            return
-                static_cast<wchar_t>(
-                    std::towlower(
-                        character
-                    )
-                );
-        }
-    );
+        [](wchar_t c) {
+            return static_cast<wchar_t>(std::towlower(c));
+        });
 
     return value;
 }
 
-std::wstring NormalizeSlashes(
-    std::wstring path
-) {
-    std::replace(
-        path.begin(),
-        path.end(),
-        L'/',
-        L'\\'
-    );
-
+std::wstring NormalizeSlashes(std::wstring path) {
+    std::replace(path.begin(), path.end(), L'/', L'\\');
     return path;
 }
 
-bool ContainsText(
-    const wchar_t* text,
-    const wchar_t* expected
-) {
+bool ContainsText(const wchar_t* text, const wchar_t* expected) {
     return
         text &&
         expected &&
-        std::wcsstr(
-            text,
-            expected
-        ) !=
-        nullptr;
+        std::wcsstr(text, expected) != nullptr;
 }
 
 bool ContainsOrdinalIgnoreCase(
     const std::wstring& value,
-    const std::wstring& expected
-) {
+    const std::wstring& expected) {
     return
-        ToLower(
-            value
-        ).find(
-            ToLower(
-                expected
-            )
-        ) !=
+        ToLower(value).find(ToLower(expected)) !=
         std::wstring::npos;
 }
 
 bool EndsWithOrdinalIgnoreCase(
     const std::wstring& value,
-    const std::wstring& suffix
-) {
-    if (
-        value.size() <
-        suffix.size()
-    ) {
+    const std::wstring& suffix) {
+    if (value.size() < suffix.size()) {
         return false;
     }
 
     const std::size_t offset =
-        value.size() -
-        suffix.size();
+        value.size() - suffix.size();
 
-    for (
-        std::size_t index = 0;
-        index <
-            suffix.size();
-        index++
-    ) {
+    for (std::size_t i = 0; i < suffix.size(); i++) {
         if (
-            std::towlower(
-                value[
-                    offset +
-                    index
-                ]
-            ) !=
-            std::towlower(
-                suffix[
-                    index
-                ]
-            )
-        ) {
+            std::towlower(value[offset + i]) !=
+            std::towlower(suffix[i])) {
             return false;
         }
     }
@@ -580,33 +343,15 @@ bool EndsWithOrdinalIgnoreCase(
 
 bool StartsWithOrdinalIgnoreCase(
     const std::wstring& value,
-    const std::wstring& prefix
-) {
-    if (
-        value.size() <
-        prefix.size()
-    ) {
+    const std::wstring& prefix) {
+    if (value.size() < prefix.size()) {
         return false;
     }
 
-    for (
-        std::size_t index = 0;
-        index <
-            prefix.size();
-        index++
-    ) {
+    for (std::size_t i = 0; i < prefix.size(); i++) {
         if (
-            std::towlower(
-                value[
-                    index
-                ]
-            ) !=
-            std::towlower(
-                prefix[
-                    index
-                ]
-            )
-        ) {
+            std::towlower(value[i]) !=
+            std::towlower(prefix[i])) {
             return false;
         }
     }
@@ -614,63 +359,34 @@ bool StartsWithOrdinalIgnoreCase(
     return true;
 }
 
-bool IsVersionDirectoryName(
-    const std::wstring& directoryName
-) {
-    constexpr wchar_t kPrefix[] =
-        L"version-";
+bool IsVersionDirectoryName(const std::wstring& directoryName) {
+    constexpr wchar_t prefix[] = L"version-";
 
-    if (
-        !StartsWithOrdinalIgnoreCase(
-            directoryName,
-            kPrefix
-        )
-    ) {
+    if (!StartsWithOrdinalIgnoreCase(directoryName, prefix)) {
         return false;
     }
 
     const std::size_t prefixLength =
-        std::wcslen(
-            kPrefix
-        );
+        std::wcslen(prefix);
 
-    if (
-        directoryName.size() <=
-        prefixLength
-    ) {
+    if (directoryName.size() <= prefixLength) {
         return false;
     }
 
-    bool digitSeen =
-        false;
+    bool digitSeen = false;
 
     for (
-        std::size_t index = prefixLength;
-        index <
-            directoryName.size();
-        index++
-    ) {
-        const wchar_t character =
-            directoryName[
-                index
-            ];
+        std::size_t i = prefixLength;
+        i < directoryName.size();
+        i++) {
+        const wchar_t c = directoryName[i];
 
-        if (
-            character >=
-                L'0' &&
-            character <=
-                L'9'
-        ) {
-            digitSeen =
-                true;
-
+        if (c >= L'0' && c <= L'9') {
+            digitSeen = true;
             continue;
         }
 
-        if (
-            character ==
-            L'.'
-        ) {
+        if (c == L'.') {
             continue;
         }
 
@@ -681,262 +397,147 @@ bool IsVersionDirectoryName(
 }
 
 std::wstring NormalizeVersionedExecutablePath(
-    const std::wstring& executablePath
-) {
+    const std::wstring& executablePath) {
     std::wstring normalized =
-        ToLower(
-            NormalizeSlashes(
-                executablePath
-            )
-        );
+        ToLower(NormalizeSlashes(executablePath));
 
     const std::size_t fileSeparator =
-        normalized.find_last_of(
-            L'\\'
-        );
+        normalized.find_last_of(L'\\');
 
     if (
-        fileSeparator ==
-            std::wstring::npos ||
-        fileSeparator ==
-            0
-    ) {
+        fileSeparator == std::wstring::npos ||
+        fileSeparator == 0) {
         return normalized;
     }
 
     const std::size_t parentSeparator =
         normalized.find_last_of(
             L'\\',
-            fileSeparator -
-                1
-        );
+            fileSeparator - 1);
 
-    if (
-        parentSeparator ==
-        std::wstring::npos
-    ) {
+    if (parentSeparator == std::wstring::npos) {
         return normalized;
     }
 
     const std::size_t parentStart =
-        parentSeparator +
-        1;
+        parentSeparator + 1;
 
     const std::size_t parentLength =
-        fileSeparator -
-        parentStart;
+        fileSeparator - parentStart;
 
     const std::wstring parentDirectory =
         normalized.substr(
             parentStart,
-            parentLength
-        );
+            parentLength);
 
-    if (
-        !IsVersionDirectoryName(
-            parentDirectory
-        )
-    ) {
+    if (!IsVersionDirectoryName(parentDirectory)) {
         return normalized;
     }
 
     normalized.replace(
         parentStart,
         parentLength,
-        L"<version>"
-    );
+        L"<version>");
 
     return normalized;
 }
 
-bool FileExists(
-    const std::wstring& path
-) {
+bool FileExists(const std::wstring& path) {
     if (path.empty()) {
         return false;
     }
 
     const DWORD attributes =
-        GetFileAttributesW(
-            path.c_str()
-        );
+        GetFileAttributesW(path.c_str());
 
     return
-        attributes !=
-            INVALID_FILE_ATTRIBUTES &&
-        (
-            attributes &
-            FILE_ATTRIBUTE_DIRECTORY
-        ) ==
-            0;
+        attributes != INVALID_FILE_ATTRIBUTES &&
+        (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
 }
 
-bool IsValidAnchorSlot(
-    int slot
-) {
+bool IsValidAnchorSlot(int slot) {
     return
-        slot >=
-            0 &&
-        slot <
-            kAnchorCount;
+        slot >= 0 &&
+        slot < kAnchorCount;
 }
 
 bool IsValidPersistedState(
-    const PersistedCanonicalState& state
-) {
+    const PersistedCanonicalState& state) {
     return
-        state.magic ==
-            kPersistentStateMagic &&
-        state.version ==
-            kPersistentStateVersion &&
-        state.firstTargetIdentity !=
-            0 &&
-        IsValidAnchorSlot(
-            state.precedingSlot
-        ) &&
-        IsValidAnchorSlot(
-            state.followingSlot
-        ) &&
-        state.precedingSlot !=
-            state.followingSlot &&
-        state.firstSessionAnalyzerMoveAttempts ==
-            1 &&
-        state.firstSessionManualTargetMoveCalls >=
-            1;
+        state.magic == kPersistentStateMagic &&
+        state.version == kPersistentStateVersion &&
+        state.firstTargetIdentity != 0 &&
+        IsValidAnchorSlot(state.precedingSlot) &&
+        IsValidAnchorSlot(state.followingSlot) &&
+        state.precedingSlot != state.followingSlot &&
+        state.firstSessionAnalyzerMoveAttempts == 1 &&
+        state.firstSessionManualTargetMoveCalls >= 1 &&
+        state.firstExplorerProcessId != 0;
 }
 
 bool ReadPersistentState(
     PersistedCanonicalState* state,
     std::wstring* normalizedPath,
-    size_t* binaryBytes,
-    size_t* pathChars
-) {
-    if (
-        !state ||
-        !normalizedPath
-    ) {
+    size_t* binaryBytes = nullptr,
+    size_t* pathChars = nullptr) {
+    if (!state || !normalizedPath) {
         return false;
     }
 
-    *state =
-        {};
-
+    *state = {};
     normalizedPath->clear();
 
     const size_t bytes =
         Wh_GetBinaryValue(
             kPersistentStateValueName,
             state,
-            sizeof(
-                *state
-            )
-        );
+            sizeof(*state));
 
-    wchar_t pathBuffer[
-        2048
-    ]{};
+    wchar_t pathBuffer[2048]{};
 
     const size_t chars =
         Wh_GetStringValue(
             kPersistentPathValueName,
             pathBuffer,
-            ARRAYSIZE(
-                pathBuffer
-            )
-        );
+            ARRAYSIZE(pathBuffer));
 
     if (binaryBytes) {
-        *binaryBytes =
-            bytes;
+        *binaryBytes = bytes;
     }
 
     if (pathChars) {
-        *pathChars =
-            chars;
+        *pathChars = chars;
     }
 
     if (
-        bytes !=
-            sizeof(
-                *state
-            ) ||
-        chars ==
-            0 ||
-        !IsValidPersistedState(
-            *state
-        )
-    ) {
-        *state =
-            {};
-
-        normalizedPath->clear();
-
+        bytes != sizeof(*state) ||
+        chars == 0 ||
+        !IsValidPersistedState(*state)) {
+        *state = {};
         return false;
     }
 
-    *normalizedPath =
-        pathBuffer;
-
+    *normalizedPath = pathBuffer;
     return true;
 }
 
 void ResetPersistentStateForFreshPhase1() {
-    const BOOL binaryDeleteResult =
-        Wh_DeleteValue(
-            kPersistentStateValueName
-        );
+    Wh_DeleteValue(kPersistentStateValueName);
+    Wh_DeleteValue(kPersistentPathValueName);
 
-    const BOOL pathDeleteResult =
-        Wh_DeleteValue(
-            kPersistentPathValueName
-        );
-
-    g_loadedPersistentState =
-        {};
-
+    g_loadedPersistentState = {};
     g_loadedNormalizedPath.clear();
 
     g_persistedStateLoadedAtInit.store(
         false,
-        std::memory_order_release
-    );
-
-    g_firstTargetIdentity.store(
-        0,
-        std::memory_order_release
-    );
-
-    g_manualPrecedingSlot.store(
-        kInvalidAnchorSlot,
-        std::memory_order_release
-    );
-
-    g_manualFollowingSlot.store(
-        kInvalidAnchorSlot,
-        std::memory_order_release
-    );
-
-    g_manualSavedTargetIndex.store(
-        0,
-        std::memory_order_release
-    );
+        std::memory_order_release);
 
     Wh_Log(
-        L"PERSISTENCE_PHASE1_STORAGE_RESET "
-        L"binaryDeleteResult=%d "
-        L"pathDeleteResult=%d",
-        binaryDeleteResult
-            ? 1
-            : 0,
-        pathDeleteResult
-            ? 1
-            : 0
-    );
+        L"RESTART_PERSISTENCE_PHASE1_STORAGE_RESET");
 }
 
 bool PersistManualCanonicalState(
-    const std::wstring& normalizedPath
-) {
+    const std::wstring& normalizedPath) {
     PersistedCanonicalState state;
 
     state.magic =
@@ -947,104 +548,87 @@ bool PersistManualCanonicalState(
 
     state.firstTargetIdentity =
         g_firstTargetIdentity.load(
-            std::memory_order_acquire
-        );
+            std::memory_order_acquire);
 
     state.precedingSlot =
         g_manualPrecedingSlot.load(
-            std::memory_order_acquire
-        );
+            std::memory_order_acquire);
 
     state.followingSlot =
         g_manualFollowingSlot.load(
-            std::memory_order_acquire
-        );
+            std::memory_order_acquire);
 
     state.manualSavedTargetIndex =
         g_manualSavedTargetIndex.load(
-            std::memory_order_acquire
-        );
+            std::memory_order_acquire);
 
     state.firstSessionOverflowSize =
         g_firstOverflowSize.load(
-            std::memory_order_acquire
-        );
+            std::memory_order_acquire);
 
     state.manualUiOrderPosition =
         g_manualUiOrderPosition.load(
-            std::memory_order_acquire
-        );
+            std::memory_order_acquire);
 
     state.firstSessionAnalyzerMoveAttempts =
         g_analyzerMoveAttempts.load(
-            std::memory_order_acquire
-        );
+            std::memory_order_acquire);
 
     state.firstSessionManualTargetMoveCalls =
         g_manualTargetMoveCalls.load(
-            std::memory_order_acquire
-        );
+            std::memory_order_acquire);
 
-    const BOOL binaryWriteResult =
+    state.firstExplorerProcessId =
+        GetCurrentProcessId();
+
+    const BOOL binaryWrite =
         Wh_SetBinaryValue(
             kPersistentStateValueName,
             &state,
-            sizeof(
-                state
-            )
-        );
+            sizeof(state));
 
-    const BOOL pathWriteResult =
+    const BOOL pathWrite =
         Wh_SetStringValue(
             kPersistentPathValueName,
-            normalizedPath.c_str()
-        );
+            normalizedPath.c_str());
 
     const bool writeSucceeded =
-        binaryWriteResult &&
-        pathWriteResult;
+        binaryWrite &&
+        pathWrite;
 
     g_persistentWriteSucceeded.store(
         writeSucceeded,
-        std::memory_order_release
-    );
+        std::memory_order_release);
 
     PersistedCanonicalState readbackState;
     std::wstring readbackPath;
 
-    size_t readbackBytes =
-        0;
-
-    size_t readbackChars =
-        0;
+    size_t readbackBytes = 0;
+    size_t readbackChars = 0;
 
     const bool readbackSucceeded =
         ReadPersistentState(
             &readbackState,
             &readbackPath,
             &readbackBytes,
-            &readbackChars
-        ) &&
+            &readbackChars) &&
         readbackState.firstTargetIdentity ==
             state.firstTargetIdentity &&
         readbackState.precedingSlot ==
             state.precedingSlot &&
         readbackState.followingSlot ==
             state.followingSlot &&
-        readbackState.manualSavedTargetIndex ==
-            state.manualSavedTargetIndex &&
+        readbackState.firstExplorerProcessId ==
+            state.firstExplorerProcessId &&
         readbackPath ==
             normalizedPath;
 
     g_persistentImmediateReadbackSucceeded.store(
         readbackSucceeded,
-        std::memory_order_release
-    );
+        std::memory_order_release);
 
     Wh_Log(
-        L"PERSISTENCE_STATE_WRITE "
-        L"binaryWriteResult=%d "
-        L"pathWriteResult=%d "
+        L"RESTART_PERSISTENCE_STATE_WRITE "
         L"writeSucceeded=%d "
         L"readbackSucceeded=%d "
         L"readbackBytes=%llu "
@@ -1054,40 +638,24 @@ bool PersistManualCanonicalState(
         L"followingSlot=%d "
         L"manualSavedTargetIndex=%u "
         L"firstSessionOverflowSize=%u "
-        L"manualUiOrderPosition=%llu "
-        L"firstSessionAnalyzerMoveAttempts=%llu "
-        L"firstSessionManualTargetMoveCalls=%llu "
+        L"firstSessionAnalyzerMoves=%llu "
+        L"firstSessionManualMoves=%llu "
+        L"firstExplorerProcessId=%lu "
         L"normalizedPath=\"%s\"",
-        binaryWriteResult
-            ? 1
-            : 0,
-        pathWriteResult
-            ? 1
-            : 0,
-        writeSucceeded
-            ? 1
-            : 0,
-        readbackSucceeded
-            ? 1
-            : 0,
+        writeSucceeded ? 1 : 0,
+        readbackSucceeded ? 1 : 0,
+        static_cast<unsigned long long>(readbackBytes),
+        static_cast<unsigned long long>(readbackChars),
         static_cast<unsigned long long>(
-            readbackBytes
-        ),
-        static_cast<unsigned long long>(
-            readbackChars
-        ),
-        static_cast<unsigned long long>(
-            state.firstTargetIdentity
-        ),
+            state.firstTargetIdentity),
         state.precedingSlot,
         state.followingSlot,
         state.manualSavedTargetIndex,
         state.firstSessionOverflowSize,
-        state.manualUiOrderPosition,
         state.firstSessionAnalyzerMoveAttempts,
         state.firstSessionManualTargetMoveCalls,
-        normalizedPath.c_str()
-    );
+        state.firstExplorerProcessId,
+        normalizedPath.c_str());
 
     return
         writeSucceeded &&
@@ -1098,90 +666,79 @@ void LoadPersistentStateAtInit() {
     PersistedCanonicalState state;
     std::wstring normalizedPath;
 
-    size_t binaryBytes =
-        0;
-
-    size_t pathChars =
-        0;
+    size_t binaryBytes = 0;
+    size_t pathChars = 0;
 
     const bool loaded =
         ReadPersistentState(
             &state,
             &normalizedPath,
             &binaryBytes,
-            &pathChars
-        );
+            &pathChars);
 
     if (loaded) {
-        g_loadedPersistentState =
-            state;
-
-        g_loadedNormalizedPath =
-            normalizedPath;
+        g_loadedPersistentState = state;
+        g_loadedNormalizedPath = normalizedPath;
 
         g_persistedStateLoadedAtInit.store(
             true,
-            std::memory_order_release
-        );
+            std::memory_order_release);
 
         g_firstTargetIdentity.store(
             state.firstTargetIdentity,
-            std::memory_order_release
-        );
+            std::memory_order_release);
 
         g_manualPrecedingSlot.store(
             state.precedingSlot,
-            std::memory_order_release
-        );
+            std::memory_order_release);
 
         g_manualFollowingSlot.store(
             state.followingSlot,
-            std::memory_order_release
-        );
+            std::memory_order_release);
 
         g_manualSavedTargetIndex.store(
             state.manualSavedTargetIndex,
-            std::memory_order_release
-        );
+            std::memory_order_release);
 
         g_firstOverflowSize.store(
             state.firstSessionOverflowSize,
-            std::memory_order_release
-        );
+            std::memory_order_release);
 
         g_manualUiOrderPosition.store(
             state.manualUiOrderPosition,
-            std::memory_order_release
-        );
+            std::memory_order_release);
+
+        g_explorerProcessChanged.store(
+            state.firstExplorerProcessId !=
+                GetCurrentProcessId(),
+            std::memory_order_release);
     }
 
     Wh_Log(
-        L"PERSISTENCE_STATE_LOAD_AT_INIT "
+        L"RESTART_PERSISTENCE_STATE_LOAD_AT_INIT "
         L"loaded=%d "
         L"binaryBytes=%llu "
         L"pathChars=%llu "
+        L"persistedExplorerPid=%lu "
+        L"currentExplorerPid=%lu "
+        L"explorerProcessChanged=%d "
         L"firstTargetIdentity=%llu "
         L"precedingSlot=%d "
         L"followingSlot=%d "
-        L"manualSavedTargetIndex=%u "
-        L"firstSessionOverflowSize=%u "
-        L"firstSessionAnalyzerMoveAttempts=%llu "
-        L"firstSessionManualTargetMoveCalls=%llu "
-        L"normalizedPath=\"%s\"",
-        loaded
+        L"manualSavedTargetIndex=%u",
+        loaded ? 1 : 0,
+        static_cast<unsigned long long>(binaryBytes),
+        static_cast<unsigned long long>(pathChars),
+        loaded ? state.firstExplorerProcessId : 0,
+        GetCurrentProcessId(),
+        g_explorerProcessChanged.load(
+            std::memory_order_acquire)
             ? 1
             : 0,
         static_cast<unsigned long long>(
-            binaryBytes
-        ),
-        static_cast<unsigned long long>(
-            pathChars
-        ),
-        static_cast<unsigned long long>(
             loaded
                 ? state.firstTargetIdentity
-                : 0
-        ),
+                : 0),
         loaded
             ? state.precedingSlot
             : kInvalidAnchorSlot,
@@ -1190,60 +747,24 @@ void LoadPersistentStateAtInit() {
             : kInvalidAnchorSlot,
         loaded
             ? state.manualSavedTargetIndex
-            : 0,
-        loaded
-            ? state.firstSessionOverflowSize
-            : 0,
-        loaded
-            ? state.firstSessionAnalyzerMoveAttempts
-            : 0,
-        loaded
-            ? state.firstSessionManualTargetMoveCalls
-            : 0,
-        loaded
-            ? normalizedPath.c_str()
-            : L""
-    );
+            : 0);
 }
 
 bool IsNotificationAreaIconQueryInterfaceSymbol(
-    const wchar_t* symbol
-) {
+    const wchar_t* symbol) {
     return
-        ContainsText(
-            symbol,
-            L"root_implements<"
-        ) &&
-        ContainsText(
-            symbol,
-            L"NotificationAreaIcon2"
-        ) &&
-        ContainsText(
-            symbol,
-            L">::query_interface("
-        ) &&
-        ContainsText(
-            symbol,
-            L"winrt::guid const &"
-        ) &&
-        ContainsText(
-            symbol,
-            L"void * *"
-        ) &&
-        !ContainsText(
-            symbol,
-            L"query_interface_common"
-        ) &&
-        !ContainsText(
-            symbol,
-            L"query_interface_tearoff"
-        );
+        ContainsText(symbol, L"root_implements<") &&
+        ContainsText(symbol, L"NotificationAreaIcon2") &&
+        ContainsText(symbol, L">::query_interface(") &&
+        ContainsText(symbol, L"winrt::guid const &") &&
+        ContainsText(symbol, L"void * *") &&
+        !ContainsText(symbol, L"query_interface_common") &&
+        !ContainsText(symbol, L"query_interface_tearoff");
 }
 
 bool IsNotificationAreaIconIidSymbol(
-    const wchar_t* symbol
-) {
-    constexpr wchar_t kExpectedSymbol[] =
+    const wchar_t* symbol) {
+    constexpr wchar_t expected[] =
         L"struct guid::guid const "
         L"winrt::impl::guid_v<struct "
         L"winrt::WindowsUdk::UI::Shell::"
@@ -1251,17 +772,12 @@ bool IsNotificationAreaIconIidSymbol(
 
     return
         symbol &&
-        std::wcscmp(
-            symbol,
-            kExpectedSymbol
-        ) ==
-            0;
+        std::wcscmp(symbol, expected) == 0;
 }
 
 bool IsNotificationAreaIconVectorIidSymbol(
-    const wchar_t* symbol
-) {
-    constexpr wchar_t kExpectedSymbol[] =
+    const wchar_t* symbol) {
+    constexpr wchar_t expected[] =
         L"struct guid::guid const "
         L"winrt::impl::guid_v<struct "
         L"winrt::Windows::Foundation::Collections::"
@@ -1271,17 +787,12 @@ bool IsNotificationAreaIconVectorIidSymbol(
 
     return
         symbol &&
-        std::wcscmp(
-            symbol,
-            kExpectedSymbol
-        ) ==
-            0;
+        std::wcscmp(symbol, expected) == 0;
 }
 
 bool IsManagerMoveIconSymbol(
-    const wchar_t* symbol
-) {
-    constexpr wchar_t kExpectedSymbol[] =
+    const wchar_t* symbol) {
+    constexpr wchar_t expected[] =
         L"public: void __cdecl "
         L"NotificationAreaIconManager2::MoveIcon("
         L"struct winrt::WindowsUdk::UI::Shell::"
@@ -1292,41 +803,23 @@ bool IsManagerMoveIconSymbol(
 
     return
         symbol &&
-        std::wcscmp(
-            symbol,
-            kExpectedSymbol
-        ) ==
-            0;
+        std::wcscmp(symbol, expected) == 0;
 }
 
-bool ResolveRequiredSymbols(
-    HMODULE taskbarModule
-) {
+bool ResolveRequiredSymbols(HMODULE taskbarModule) {
     WH_FIND_SYMBOL_OPTIONS options{};
-
-    options.optionsSize =
-        sizeof(options);
-
-    options.symbolServer =
-        nullptr;
-
-    options.noUndecoratedSymbols =
-        FALSE;
+    options.optionsSize = sizeof(options);
+    options.noUndecoratedSymbols = FALSE;
 
     WH_FIND_SYMBOL symbol{};
 
-    HANDLE symbolSearch =
+    HANDLE search =
         Wh_FindFirstSymbol(
             taskbarModule,
             &options,
-            &symbol
-        );
+            &symbol);
 
-    if (!symbolSearch) {
-        Wh_Log(
-            L"Wh_FindFirstSymbol failed"
-        );
-
+    if (!search) {
         return false;
     }
 
@@ -1334,246 +827,132 @@ bool ResolveRequiredSymbols(
         if (
             !NotificationAreaIcon_QueryInterface &&
             IsNotificationAreaIconQueryInterfaceSymbol(
-                symbol.symbol
-            )
-        ) {
+                symbol.symbol)) {
             NotificationAreaIcon_QueryInterface =
                 reinterpret_cast<
-                    NotificationAreaIcon_QueryInterface_t
-                >(
-                    symbol.address
-                );
+                    NotificationAreaIcon_QueryInterface_t>(
+                    symbol.address);
         }
 
         if (
             !g_notificationAreaIconInterfaceId &&
             IsNotificationAreaIconIidSymbol(
-                symbol.symbol
-            )
-        ) {
+                symbol.symbol)) {
             g_notificationAreaIconInterfaceId =
                 reinterpret_cast<const GUID*>(
-                    symbol.address
-                );
+                    symbol.address);
         }
 
         if (
             !g_notificationAreaIconVectorId &&
             IsNotificationAreaIconVectorIidSymbol(
-                symbol.symbol
-            )
-        ) {
+                symbol.symbol)) {
             g_notificationAreaIconVectorId =
                 reinterpret_cast<const GUID*>(
-                    symbol.address
-                );
+                    symbol.address);
         }
 
         if (
             !NotificationAreaIconManager_MoveIcon &&
             IsManagerMoveIconSymbol(
-                symbol.symbol
-            )
-        ) {
+                symbol.symbol)) {
             NotificationAreaIconManager_MoveIcon =
                 reinterpret_cast<
-                    NotificationAreaIconManager_MoveIcon_t
-                >(
-                    symbol.address
-                );
+                    NotificationAreaIconManager_MoveIcon_t>(
+                    symbol.address);
         }
 
         if (
             NotificationAreaIcon_QueryInterface &&
             g_notificationAreaIconInterfaceId &&
             g_notificationAreaIconVectorId &&
-            NotificationAreaIconManager_MoveIcon
-        ) {
+            NotificationAreaIconManager_MoveIcon) {
             break;
         }
-    } while (
-        Wh_FindNextSymbol(
-            symbolSearch,
-            &symbol
-        )
-    );
+    } while (Wh_FindNextSymbol(search, &symbol));
 
-    Wh_FindCloseSymbol(
-        symbolSearch
-    );
+    Wh_FindCloseSymbol(search);
 
-    if (
-        !NotificationAreaIcon_QueryInterface ||
-        !g_notificationAreaIconInterfaceId ||
-        !g_notificationAreaIconVectorId ||
-        !NotificationAreaIconManager_MoveIcon
-    ) {
-        Wh_Log(
-            L"PERSISTENCE_REQUIRED_SYMBOL_MISSING"
-        );
-
-        return false;
-    }
-
-    Wh_Log(
-        L"PERSISTENCE_SUPPORT_READY "
-        L"queryFunction=%p "
-        L"iconInterfaceId=%p "
-        L"vectorInterfaceId=%p "
-        L"managerMoveFunction=%p",
-        NotificationAreaIcon_QueryInterface,
-        g_notificationAreaIconInterfaceId,
-        g_notificationAreaIconVectorId,
-        NotificationAreaIconManager_MoveIcon
-    );
-
-    return true;
+    return
+        NotificationAreaIcon_QueryInterface &&
+        g_notificationAreaIconInterfaceId &&
+        g_notificationAreaIconVectorId &&
+        NotificationAreaIconManager_MoveIcon;
 }
 
 UIOrderSnapshot CaptureUIOrderSnapshot() {
     UIOrderSnapshot snapshot;
 
-    for (
-        int attempt = 0;
-        attempt <
-            3;
-        attempt++
-    ) {
-        DWORD registryType =
-            REG_NONE;
+    DWORD type = REG_NONE;
+    DWORD bytes = 0;
 
-        DWORD requiredBytes =
-            0;
+    LONG status =
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            kNotifyIconSettingsPath,
+            kUIOrderListValueName,
+            RRF_RT_REG_BINARY,
+            &type,
+            nullptr,
+            &bytes);
 
-        LONG status =
-            RegGetValueW(
-                HKEY_CURRENT_USER,
-                kNotifyIconSettingsPath,
-                kUIOrderListValueName,
-                RRF_RT_REG_BINARY,
-                &registryType,
-                nullptr,
-                &requiredBytes
-            );
+    snapshot.status = status;
 
-        snapshot.status =
-            status;
-
-        if (
-            status !=
-            ERROR_SUCCESS
-        ) {
-            return snapshot;
-        }
-
-        std::vector<BYTE> data(
-            requiredBytes
-        );
-
-        DWORD actualBytes =
-            requiredBytes;
-
-        status =
-            RegGetValueW(
-                HKEY_CURRENT_USER,
-                kNotifyIconSettingsPath,
-                kUIOrderListValueName,
-                RRF_RT_REG_BINARY,
-                &registryType,
-                data.empty()
-                    ? nullptr
-                    : data.data(),
-                &actualBytes
-            );
-
-        if (
-            status ==
-            ERROR_MORE_DATA
-        ) {
-            continue;
-        }
-
-        snapshot.status =
-            status;
-
-        if (
-            status !=
-            ERROR_SUCCESS
-        ) {
-            return snapshot;
-        }
-
-        if (
-            actualBytes %
-                sizeof(
-                    std::uint64_t
-                ) !=
-            0
-        ) {
-            snapshot.status =
-                ERROR_INVALID_DATA;
-
-            return snapshot;
-        }
-
-        snapshot.entries.resize(
-            actualBytes /
-            sizeof(
-                std::uint64_t
-            )
-        );
-
-        if (
-            actualBytes !=
-            0
-        ) {
-            std::memcpy(
-                snapshot.entries.data(),
-                data.data(),
-                actualBytes
-            );
-        }
-
-        snapshot.valid =
-            true;
-
+    if (status != ERROR_SUCCESS) {
         return snapshot;
     }
 
-    snapshot.status =
-        ERROR_MORE_DATA;
+    std::vector<BYTE> data(bytes);
 
+    status =
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            kNotifyIconSettingsPath,
+            kUIOrderListValueName,
+            RRF_RT_REG_BINARY,
+            &type,
+            data.data(),
+            &bytes);
+
+    snapshot.status = status;
+
+    if (
+        status != ERROR_SUCCESS ||
+        bytes % sizeof(std::uint64_t) != 0) {
+        return snapshot;
+    }
+
+    snapshot.entries.resize(
+        bytes / sizeof(std::uint64_t));
+
+    if (bytes) {
+        std::memcpy(
+            snapshot.entries.data(),
+            data.data(),
+            bytes);
+    }
+
+    snapshot.valid = true;
     return snapshot;
 }
 
 std::vector<std::uint64_t> FindAddedIdentities(
     const UIOrderSnapshot& before,
-    const UIOrderSnapshot& after
-) {
+    const UIOrderSnapshot& after) {
     std::vector<std::uint64_t> added;
 
-    if (
-        !before.valid ||
-        !after.valid
-    ) {
+    if (!before.valid || !after.valid) {
         return added;
     }
 
-    for (
-        std::uint64_t identity :
-        after.entries
-    ) {
+    for (std::uint64_t identity : after.entries) {
         if (
             std::find(
                 before.entries.begin(),
                 before.entries.end(),
-                identity
-            ) ==
-            before.entries.end()
-        ) {
-            added.push_back(
-                identity
-            );
+                identity) ==
+            before.entries.end()) {
+            added.push_back(identity);
         }
     }
 
@@ -1582,23 +961,18 @@ std::vector<std::uint64_t> FindAddedIdentities(
 
 unsigned long long FindOneBasedPosition(
     const UIOrderSnapshot& snapshot,
-    std::uint64_t identity
-) {
+    std::uint64_t identity) {
     if (!snapshot.valid) {
         return 0;
     }
 
-    const auto iterator =
+    const auto it =
         std::find(
             snapshot.entries.begin(),
             snapshot.entries.end(),
-            identity
-        );
+            identity);
 
-    if (
-        iterator ==
-        snapshot.entries.end()
-    ) {
+    if (it == snapshot.entries.end()) {
         return 0;
     }
 
@@ -1606,34 +980,23 @@ unsigned long long FindOneBasedPosition(
         static_cast<unsigned long long>(
             std::distance(
                 snapshot.entries.begin(),
-                iterator
-            )
-        ) +
+                it)) +
         1;
 }
 
 std::wstring MakeTrayEntrySubkey(
-    std::uint64_t identity
-) {
+    std::uint64_t identity) {
     return
-        std::wstring(
-            kNotifyIconSettingsPath
-        ) +
+        std::wstring(kNotifyIconSettingsPath) +
         L"\\" +
-        std::to_wstring(
-            identity
-        );
+        std::to_wstring(identity);
 }
 
 std::wstring QueryStringValue(
     const std::wstring& subkey,
-    const wchar_t* valueName
-) {
-    DWORD registryType =
-        REG_NONE;
-
-    DWORD requiredBytes =
-        0;
+    const wchar_t* valueName) {
+    DWORD type = REG_NONE;
+    DWORD bytes = 0;
 
     LONG status =
         RegGetValueW(
@@ -1642,29 +1005,19 @@ std::wstring QueryStringValue(
             valueName,
             RRF_RT_REG_SZ |
                 RRF_RT_REG_EXPAND_SZ,
-            &registryType,
+            &type,
             nullptr,
-            &requiredBytes
-        );
+            &bytes);
 
     if (
-        status !=
-            ERROR_SUCCESS ||
-        requiredBytes ==
-            0
-    ) {
+        status != ERROR_SUCCESS ||
+        bytes == 0) {
         return L"";
     }
 
     std::vector<wchar_t> buffer(
-        requiredBytes /
-            sizeof(wchar_t) +
-        1,
-        L'\0'
-    );
-
-    DWORD actualBytes =
-        requiredBytes;
+        bytes / sizeof(wchar_t) + 1,
+        L'\0');
 
     status =
         RegGetValueW(
@@ -1673,44 +1026,24 @@ std::wstring QueryStringValue(
             valueName,
             RRF_RT_REG_SZ |
                 RRF_RT_REG_EXPAND_SZ,
-            &registryType,
+            &type,
             buffer.data(),
-            &actualBytes
-        );
+            &bytes);
 
-    if (
-        status !=
-        ERROR_SUCCESS
-    ) {
+    if (status != ERROR_SUCCESS) {
         return L"";
     }
 
-    buffer.back() =
-        L'\0';
-
-    return
-        std::wstring(
-            buffer.data()
-        );
+    return std::wstring(buffer.data());
 }
 
 bool QueryDwordValue(
     const std::wstring& subkey,
     const wchar_t* valueName,
-    DWORD* value
-) {
-    if (!value) {
-        return false;
-    }
-
-    DWORD registryType =
-        REG_NONE;
-
-    DWORD result =
-        0;
-
-    DWORD resultBytes =
-        sizeof(result);
+    DWORD* value) {
+    DWORD type = REG_NONE;
+    DWORD bytes = sizeof(DWORD);
+    DWORD result = 0;
 
     const LONG status =
         RegGetValueW(
@@ -1718,151 +1051,99 @@ bool QueryDwordValue(
             subkey.c_str(),
             valueName,
             RRF_RT_REG_DWORD,
-            &registryType,
+            &type,
             &result,
-            &resultBytes
-        );
+            &bytes);
 
     if (
-        status !=
-            ERROR_SUCCESS ||
-        registryType !=
-            REG_DWORD ||
-        resultBytes !=
-            sizeof(result)
-    ) {
+        status != ERROR_SUCCESS ||
+        type != REG_DWORD) {
         return false;
     }
 
-    *value =
-        result;
-
+    *value = result;
     return true;
 }
 
 std::wstring QueryExecutablePath(
-    std::uint64_t identity
-) {
+    std::uint64_t identity) {
     return
         QueryStringValue(
-            MakeTrayEntrySubkey(
-                identity
-            ),
-            L"ExecutablePath"
-        );
+            MakeTrayEntrySubkey(identity),
+            L"ExecutablePath");
 }
 
 bool QueryIdentityUid(
     std::uint64_t identity,
-    DWORD* uid
-) {
+    DWORD* uid) {
     return
         QueryDwordValue(
-            MakeTrayEntrySubkey(
-                identity
-            ),
+            MakeTrayEntrySubkey(identity),
             L"UID",
-            uid
-        );
+            uid);
 }
 
 bool IsExecutableIdentity(
     std::uint64_t identity,
-    const wchar_t* executableName
-) {
+    const wchar_t* executableName) {
     return
         EndsWithOrdinalIgnoreCase(
-            QueryExecutablePath(
-                identity
-            ),
-            executableName
-        );
+            QueryExecutablePath(identity),
+            executableName);
 }
 
 int GetAnchorSlotForIdentity(
-    std::uint64_t identity
-) {
-    for (
-        int slot = 0;
-        slot <
-            kAnchorCount;
-        slot++
-    ) {
+    std::uint64_t identity) {
+    for (int slot = 0; slot < kAnchorCount; slot++) {
         if (
             IsExecutableIdentity(
                 identity,
-                kAnchorExecutableNames[
-                    slot
-                ]
-            )
-        ) {
+                kAnchorExecutableNames[slot])) {
             return slot;
         }
     }
 
-    return
-        kInvalidAnchorSlot;
+    return kInvalidAnchorSlot;
 }
 
-bool IsHelperIdentity(
-    std::uint64_t identity
-) {
-    return
-        IsExecutableIdentity(
-            identity,
-            kHelperExecutableName
-        );
-}
-
-bool IsTargetIdentity(
-    std::uint64_t identity
-) {
+bool IsTargetIdentity(std::uint64_t identity) {
     if (
         !IsExecutableIdentity(
             identity,
-            kTargetExecutableName
-        )
-    ) {
+            kTargetExecutableName)) {
         return false;
     }
 
-    DWORD uid =
-        0;
+    DWORD uid = 0;
 
     return
-        QueryIdentityUid(
-            identity,
-            &uid
-        ) &&
-        uid ==
-            kTargetUid;
+        QueryIdentityUid(identity, &uid) &&
+        uid == kTargetUid;
 }
 
-int GetTargetPhase(
-    std::uint64_t identity
-) {
+bool IsHelperIdentity(std::uint64_t identity) {
+    return
+        IsExecutableIdentity(
+            identity,
+            kHelperExecutableName);
+}
+
+int GetTargetPhase(std::uint64_t identity) {
     const std::wstring path =
         NormalizeSlashes(
-            QueryExecutablePath(
-                identity
-            )
-        );
+            QueryExecutablePath(identity));
 
     if (
         ContainsOrdinalIgnoreCase(
             path,
-            kVersion1Marker
-        )
-    ) {
+            kVersion1Marker)) {
         return 1;
     }
 
     if (
         ContainsOrdinalIgnoreCase(
             path,
-            kVersion2Marker
-        )
-    ) {
+            kVersion2Marker)) {
         return 2;
     }
 
@@ -1871,52 +1152,34 @@ int GetTargetPhase(
 
 bool IsSameComObject(
     void* left,
-    void* right
-) {
-    if (
-        !left ||
-        !right
-    ) {
+    void* right) {
+    if (!left || !right) {
         return false;
     }
 
-    IUnknown* leftUnknown =
-        nullptr;
-
-    IUnknown* rightUnknown =
-        nullptr;
+    IUnknown* leftUnknown = nullptr;
+    IUnknown* rightUnknown = nullptr;
 
     const HRESULT leftResult =
-        reinterpret_cast<IUnknown*>(
-            left
-        )->QueryInterface(
-            IID_IUnknown,
-            reinterpret_cast<void**>(
-                &leftUnknown
-            )
-        );
+        reinterpret_cast<IUnknown*>(left)
+            ->QueryInterface(
+                IID_IUnknown,
+                reinterpret_cast<void**>(
+                    &leftUnknown));
 
     const HRESULT rightResult =
-        reinterpret_cast<IUnknown*>(
-            right
-        )->QueryInterface(
-            IID_IUnknown,
-            reinterpret_cast<void**>(
-                &rightUnknown
-            )
-        );
+        reinterpret_cast<IUnknown*>(right)
+            ->QueryInterface(
+                IID_IUnknown,
+                reinterpret_cast<void**>(
+                    &rightUnknown));
 
     const bool same =
-        SUCCEEDED(
-            leftResult
-        ) &&
-        SUCCEEDED(
-            rightResult
-        ) &&
+        SUCCEEDED(leftResult) &&
+        SUCCEEDED(rightResult) &&
         leftUnknown &&
         rightUnknown &&
-        leftUnknown ==
-            rightUnknown;
+        leftUnknown == rightUnknown;
 
     if (leftUnknown) {
         leftUnknown->Release();
@@ -1930,198 +1193,115 @@ bool IsSameComObject(
 }
 
 OverflowPositions QueryOverflowPositions(
-    void* targetAbi
-) {
+    void* targetAbi) {
     OverflowPositions positions;
 
-    void* taskbarModel6 =
+    void* taskbarModel =
         g_taskbarModel6.load(
-            std::memory_order_acquire
-        );
+            std::memory_order_acquire);
 
     if (
-        !taskbarModel6 ||
+        !taskbarModel ||
         !targetAbi ||
         !TaskbarModel_GetOverflowIcons_Original ||
-        !g_notificationAreaIconVectorId
-    ) {
+        !g_notificationAreaIconVectorId) {
         return positions;
     }
 
-    void* anchorAbis[
-        kAnchorCount
-    ]{};
-
-    for (
-        int slot = 0;
-        slot <
-            kAnchorCount;
-        slot++
-    ) {
-        anchorAbis[
-            slot
-        ] =
-            g_anchorAbis[
-                slot
-            ].load(
-                std::memory_order_acquire
-            );
-    }
-
-    void* collectionAbi =
-        nullptr;
+    void* collectionAbi = nullptr;
 
     positions.getterResult =
         static_cast<HRESULT>(
             TaskbarModel_GetOverflowIcons_Original(
-                taskbarModel6,
-                &collectionAbi
-            )
-        );
+                taskbarModel,
+                &collectionAbi));
 
     if (
-        FAILED(
-            positions.getterResult
-        ) ||
-        !collectionAbi
-    ) {
+        FAILED(positions.getterResult) ||
+        !collectionAbi) {
         return positions;
     }
 
-    void* vectorAbi =
-        nullptr;
+    void* vectorAbi = nullptr;
 
     positions.vectorQueryResult =
-        reinterpret_cast<IUnknown*>(
-            collectionAbi
-        )->QueryInterface(
-            *g_notificationAreaIconVectorId,
-            &vectorAbi
-        );
+        reinterpret_cast<IUnknown*>(collectionAbi)
+            ->QueryInterface(
+                *g_notificationAreaIconVectorId,
+                &vectorAbi);
 
     if (
-        FAILED(
-            positions.vectorQueryResult
-        ) ||
-        !vectorAbi
-    ) {
+        FAILED(positions.vectorQueryResult) ||
+        !vectorAbi) {
         reinterpret_cast<IUnknown*>(
-            collectionAbi
-        )->Release();
+            collectionAbi)->Release();
 
         return positions;
     }
 
     void** vtable =
-        *reinterpret_cast<void***>(
-            vectorAbi
-        );
-
-    if (!vtable) {
-        reinterpret_cast<IUnknown*>(
-            vectorAbi
-        )->Release();
-
-        reinterpret_cast<IUnknown*>(
-            collectionAbi
-        )->Release();
-
-        return positions;
-    }
+        *reinterpret_cast<void***>(vectorAbi);
 
     Vector_GetAt_t getAt =
         reinterpret_cast<Vector_GetAt_t>(
-            vtable[
-                6
-            ]
-        );
+            vtable[6]);
 
     Vector_GetSize_t getSize =
         reinterpret_cast<Vector_GetSize_t>(
-            vtable[
-                7
-            ]
-        );
+            vtable[7]);
 
     positions.sizeResult =
         getSize(
             vectorAbi,
-            &positions.size
-        );
+            &positions.size);
 
-    if (
-        FAILED(
-            positions.sizeResult
-        )
-    ) {
+    if (FAILED(positions.sizeResult)) {
         reinterpret_cast<IUnknown*>(
-            vectorAbi
-        )->Release();
+            vectorAbi)->Release();
 
         reinterpret_cast<IUnknown*>(
-            collectionAbi
-        )->Release();
+            collectionAbi)->Release();
 
         return positions;
     }
 
-    positions.enumerated =
-        true;
+    positions.enumerated = true;
+
+    void* anchors[kAnchorCount]{};
+
+    for (int slot = 0; slot < kAnchorCount; slot++) {
+        anchors[slot] =
+            g_anchorAbis[slot].load(
+                std::memory_order_acquire);
+    }
 
     for (
         unsigned int index = 0;
-        index <
-            positions.size;
-        index++
-    ) {
-        void* itemAbi =
-            nullptr;
+        index < positions.size;
+        index++) {
+        void* itemAbi = nullptr;
 
-        const HRESULT getAtResult =
+        const HRESULT result =
             getAt(
                 vectorAbi,
                 index,
-                &itemAbi
-            );
+                &itemAbi);
 
         if (
-            FAILED(
-                getAtResult
-            ) ||
-            !itemAbi
-        ) {
+            FAILED(result) ||
+            !itemAbi) {
             continue;
         }
 
-        for (
-            int slot = 0;
-            slot <
-                kAnchorCount;
-            slot++
-        ) {
+        for (int slot = 0; slot < kAnchorCount; slot++) {
             if (
-                anchorAbis[
-                    slot
-                ] &&
-                !positions.anchorFound[
-                    slot
-                ] &&
+                anchors[slot] &&
+                !positions.anchorFound[slot] &&
                 IsSameComObject(
                     itemAbi,
-                    anchorAbis[
-                        slot
-                    ]
-                )
-            ) {
-                positions.anchorFound[
-                    slot
-                ] =
-                    true;
-
-                positions.anchorIndex[
-                    slot
-                ] =
-                    index;
+                    anchors[slot])) {
+                positions.anchorFound[slot] = true;
+                positions.anchorIndex[slot] = index;
             }
         }
 
@@ -2129,28 +1309,20 @@ OverflowPositions QueryOverflowPositions(
             !positions.targetFound &&
             IsSameComObject(
                 itemAbi,
-                targetAbi
-            )
-        ) {
-            positions.targetFound =
-                true;
-
-            positions.targetIndex =
-                index;
+                targetAbi)) {
+            positions.targetFound = true;
+            positions.targetIndex = index;
         }
 
         reinterpret_cast<IUnknown*>(
-            itemAbi
-        )->Release();
+            itemAbi)->Release();
     }
 
     reinterpret_cast<IUnknown*>(
-        vectorAbi
-    )->Release();
+        vectorAbi)->Release();
 
     reinterpret_cast<IUnknown*>(
-        collectionAbi
-    )->Release();
+        collectionAbi)->Release();
 
     return positions;
 }
@@ -2158,233 +1330,120 @@ OverflowPositions QueryOverflowPositions(
 bool GetAnchorPosition(
     const OverflowPositions& positions,
     int slot,
-    unsigned int* index
-) {
+    unsigned int* index) {
     if (
-        !IsValidAnchorSlot(
-            slot
-        ) ||
-        !positions.anchorFound[
-            slot
-        ]
-    ) {
+        !IsValidAnchorSlot(slot) ||
+        !positions.anchorFound[slot]) {
         return false;
     }
 
-    if (index) {
-        *index =
-            positions.anchorIndex[
-                slot
-            ];
-    }
-
+    *index = positions.anchorIndex[slot];
     return true;
 }
 
 bool AllAnchorsCaptured() {
-    for (
-        int slot = 0;
-        slot <
-            kAnchorCount;
-        slot++
-    ) {
+    for (int slot = 0; slot < kAnchorCount; slot++) {
         if (
-            !g_anchorCaptured[
-                slot
-            ].load(
-                std::memory_order_acquire
-            )
-        ) {
+            !g_anchorCaptured[slot].load(
+                std::memory_order_acquire)) {
             return false;
         }
     }
 
     return true;
-}
-
-unsigned int ClampVectorIndex(
-    unsigned int index,
-    unsigned int size
-) {
-    if (
-        size ==
-        0
-    ) {
-        return 0;
-    }
-
-    return
-        std::min(
-            index,
-            size -
-                1
-        );
 }
 
 unsigned int CalculateImmediatelyAfterIndex(
     unsigned int anchorIndex,
     unsigned int targetIndex,
-    unsigned int size
-) {
-    const unsigned int desiredIndex =
-        targetIndex <
-                anchorIndex
-            ? anchorIndex
-            : anchorIndex +
-                1;
+    unsigned int size) {
+    if (!size) {
+        return 0;
+    }
 
-    return
-        ClampVectorIndex(
-            desiredIndex,
-            size
-        );
+    unsigned int desired =
+        targetIndex < anchorIndex
+            ? anchorIndex
+            : anchorIndex + 1;
+
+    return std::min(
+        desired,
+        size - 1);
 }
 
 bool IsTargetDirectlyBetween(
     const OverflowPositions& positions,
     int precedingSlot,
-    int followingSlot
-) {
-    if (
-        !positions.targetFound
-    ) {
+    int followingSlot) {
+    if (!positions.targetFound) {
         return false;
     }
 
-    unsigned int precedingIndex =
-        0;
-
-    unsigned int followingIndex =
-        0;
+    unsigned int precedingIndex = 0;
+    unsigned int followingIndex = 0;
 
     if (
         !GetAnchorPosition(
             positions,
             precedingSlot,
-            &precedingIndex
-        ) ||
+            &precedingIndex) ||
         !GetAnchorPosition(
             positions,
             followingSlot,
-            &followingIndex
-        )
-    ) {
+            &followingIndex)) {
         return false;
     }
 
     return
-        precedingIndex +
-                1 ==
+        precedingIndex + 1 ==
             positions.targetIndex &&
-        positions.targetIndex +
-                1 ==
+        positions.targetIndex + 1 ==
             followingIndex;
 }
 
 bool EstablishInitialAnchorOrder(
-    const OverflowPositions& positions
-) {
-    for (
-        int slot = 0;
-        slot <
-            kAnchorCount;
-        slot++
-    ) {
-        if (
-            !positions.anchorFound[
-                slot
-            ]
-        ) {
+    const OverflowPositions& positions) {
+    for (int slot = 0; slot < kAnchorCount; slot++) {
+        if (!positions.anchorFound[slot]) {
             return false;
         }
     }
 
     std::array<
-        std::pair<
-            unsigned int,
-            int
-        >,
-        kAnchorCount
-    > ordered = {{
-        {
-            positions.anchorIndex[
-                0
-            ],
-            0
-        },
-        {
-            positions.anchorIndex[
-                1
-            ],
-            1
-        },
-        {
-            positions.anchorIndex[
-                2
-            ],
-            2
-        },
-    }};
+        std::pair<unsigned int, int>,
+        kAnchorCount>
+        ordered{{
+            {positions.anchorIndex[0], 0},
+            {positions.anchorIndex[1], 1},
+            {positions.anchorIndex[2], 2},
+        }};
 
     std::sort(
         ordered.begin(),
-        ordered.end(),
-        [](
-            const auto& left,
-            const auto& right
-        ) {
-            return
-                left.first <
-                right.first;
-        }
-    );
+        ordered.end());
 
     g_initialFirstAnchorSlot.store(
-        ordered[
-            0
-        ].second,
-        std::memory_order_release
-    );
+        ordered[0].second,
+        std::memory_order_release);
 
     g_initialMiddleAnchorSlot.store(
-        ordered[
-            1
-        ].second,
-        std::memory_order_release
-    );
+        ordered[1].second,
+        std::memory_order_release);
 
     g_initialLastAnchorSlot.store(
-        ordered[
-            2
-        ].second,
-        std::memory_order_release
-    );
+        ordered[2].second,
+        std::memory_order_release);
 
     Wh_Log(
-        L"PERSISTENCE_INITIAL_ANCHOR_ORDER "
-        L"firstSlot=%d "
-        L"middleSlot=%d "
-        L"lastSlot=%d "
+        L"RESTART_PERSISTENCE_INITIAL_ANCHOR_ORDER "
+        L"firstSlot=%d middleSlot=%d lastSlot=%d "
         L"indices=%u,%u,%u",
-        ordered[
-            0
-        ].second,
-        ordered[
-            1
-        ].second,
-        ordered[
-            2
-        ].second,
-        ordered[
-            0
-        ].first,
-        ordered[
-            1
-        ].first,
-        ordered[
-            2
-        ].first
-    );
+        ordered[0].second,
+        ordered[1].second,
+        ordered[2].second,
+        ordered[0].first,
+        ordered[1].first,
+        ordered[2].first);
 
     return true;
 }
@@ -2392,8 +1451,7 @@ bool EstablishInitialAnchorOrder(
 std::vector<HistoricalCandidate>
 FindHistoricalCandidates(
     std::uint64_t currentIdentity,
-    const std::wstring& currentNormalizedPath
-) {
+    const std::wstring& currentNormalizedPath) {
     std::vector<HistoricalCandidate> candidates;
 
     const UIOrderSnapshot snapshot =
@@ -2404,262 +1462,158 @@ FindHistoricalCandidates(
     }
 
     for (
-        std::size_t index = 0;
-        index <
-            snapshot.entries.size();
-        index++
-    ) {
+        std::size_t i = 0;
+        i < snapshot.entries.size();
+        i++) {
         const std::uint64_t identity =
-            snapshot.entries[
-                index
-            ];
+            snapshot.entries[i];
 
-        if (
-            identity ==
-            currentIdentity
-        ) {
+        if (identity == currentIdentity) {
             continue;
         }
 
-        const std::wstring executablePath =
-            QueryExecutablePath(
-                identity
-            );
+        const std::wstring path =
+            QueryExecutablePath(identity);
 
         if (
-            executablePath.empty() ||
+            path.empty() ||
             !EndsWithOrdinalIgnoreCase(
-                executablePath,
-                kTargetExecutableName
-            )
-        ) {
+                path,
+                kTargetExecutableName)) {
             continue;
         }
 
-        DWORD uid =
-            0;
-
-        const bool uidValid =
-            QueryIdentityUid(
-                identity,
-                &uid
-            );
+        DWORD uid = 0;
 
         if (
-            !uidValid ||
-            uid !=
-                kTargetUid
-        ) {
+            !QueryIdentityUid(identity, &uid) ||
+            uid != kTargetUid) {
             continue;
         }
 
-        const std::wstring normalizedPath =
-            NormalizeVersionedExecutablePath(
-                executablePath
-            );
+        const std::wstring normalized =
+            NormalizeVersionedExecutablePath(path);
 
-        if (
-            normalizedPath !=
-            currentNormalizedPath
-        ) {
+        if (normalized != currentNormalizedPath) {
             continue;
         }
 
         HistoricalCandidate candidate;
-
-        candidate.identity =
-            identity;
-
-        candidate.executablePath =
-            executablePath;
-
-        candidate.normalizedPath =
-            normalizedPath;
-
-        candidate.uid =
-            uid;
-
-        candidate.uidValid =
-            uidValid;
-
-        candidate.pathExists =
-            FileExists(
-                executablePath
-            );
-
-        candidate.uiOrderPosition =
-            static_cast<unsigned long long>(
-                index
-            ) +
-            1;
+        candidate.identity = identity;
+        candidate.executablePath = path;
+        candidate.normalizedPath = normalized;
+        candidate.uid = uid;
+        candidate.uidValid = true;
+        candidate.pathExists = FileExists(path);
+        candidate.uiOrderPosition = i + 1;
 
         candidates.push_back(
-            std::move(
-                candidate
-            )
-        );
+            std::move(candidate));
     }
 
     return candidates;
 }
 
 void CaptureAnchorInterface(
-    int anchorSlot,
-    std::uint64_t identity,
-    void* iconImplementation
-) {
-    if (
-        !IsValidAnchorSlot(
-            anchorSlot
-        )
-    ) {
+    int slot,
+    void* iconImplementation) {
+    if (!IsValidAnchorSlot(slot)) {
         return;
     }
 
-    void* queriedAbi =
-        nullptr;
+    void* abi = nullptr;
 
-    const HRESULT queryResult =
+    const HRESULT result =
         static_cast<HRESULT>(
             NotificationAreaIcon_QueryInterface(
                 iconImplementation,
                 *g_notificationAreaIconInterfaceId,
-                &queriedAbi
-            )
-        );
+                &abi));
 
     if (
-        FAILED(
-            queryResult
-        ) ||
-        !queriedAbi
-    ) {
+        FAILED(result) ||
+        !abi) {
         return;
     }
 
-    void* expected =
-        nullptr;
+    void* expected = nullptr;
 
     if (
-        g_anchorAbis[
-            anchorSlot
-        ].compare_exchange_strong(
+        g_anchorAbis[slot].compare_exchange_strong(
             expected,
-            queriedAbi,
-            std::memory_order_acq_rel
-        )
-    ) {
-        g_anchorIdentities[
-            anchorSlot
-        ].store(
-            identity,
-            std::memory_order_release
-        );
-
-        g_anchorCaptured[
-            anchorSlot
-        ].store(
+            abi,
+            std::memory_order_acq_rel)) {
+        g_anchorCaptured[slot].store(
             true,
-            std::memory_order_release
-        );
+            std::memory_order_release);
 
         Wh_Log(
-            L"PERSISTENCE_ANCHOR_CAPTURED "
-            L"slot=%d "
-            L"id=%llu "
-            L"abi=%p",
-            anchorSlot,
-            static_cast<unsigned long long>(
-                identity
-            ),
-            queriedAbi
-        );
+            L"RESTART_PERSISTENCE_ANCHOR_CAPTURED "
+            L"slot=%d abi=%p",
+            slot,
+            abi);
 
         return;
     }
 
     reinterpret_cast<IUnknown*>(
-        queriedAbi
-    )->Release();
+        abi)->Release();
 }
 
 void HandleFirstTarget(
-    void* pThis,
+    void* manager,
     std::uint64_t identity,
-    void* iconImplementation
-) {
+    void* implementation) {
     ResetPersistentStateForFreshPhase1();
 
     if (!AllAnchorsCaptured()) {
-        Wh_Log(
-            L"PERSISTENCE_PHASE1_SKIPPED "
-            L"reason=\"anchors-not-captured\""
-        );
-
         return;
     }
 
-    void* targetAbi =
-        nullptr;
+    void* targetAbi = nullptr;
 
-    const HRESULT queryResult =
+    const HRESULT query =
         static_cast<HRESULT>(
             NotificationAreaIcon_QueryInterface(
-                iconImplementation,
+                implementation,
                 *g_notificationAreaIconInterfaceId,
-                &targetAbi
-            )
-        );
+                &targetAbi));
 
     if (
-        FAILED(
-            queryResult
-        ) ||
-        !targetAbi
-    ) {
+        FAILED(query) ||
+        !targetAbi) {
         return;
     }
 
     g_firstTargetAbi.store(
         targetAbi,
-        std::memory_order_release
-    );
+        std::memory_order_release);
 
     const OverflowPositions before =
-        QueryOverflowPositions(
-            targetAbi
-        );
+        QueryOverflowPositions(targetAbi);
 
     if (
         !before.enumerated ||
         !before.targetFound ||
-        !EstablishInitialAnchorOrder(
-            before
-        )
-    ) {
+        !EstablishInitialAnchorOrder(before)) {
         return;
     }
 
-    const int precedingSlot =
+    const int preceding =
         g_initialFirstAnchorSlot.load(
-            std::memory_order_acquire
-        );
+            std::memory_order_acquire);
 
-    const int followingSlot =
+    const int following =
         g_initialMiddleAnchorSlot.load(
-            std::memory_order_acquire
-        );
+            std::memory_order_acquire);
 
-    unsigned int precedingIndex =
-        0;
+    unsigned int precedingIndex = 0;
 
     if (
         !GetAnchorPosition(
             before,
-            precedingSlot,
-            &precedingIndex
-        )
-    ) {
+            preceding,
+            &precedingIndex)) {
         return;
     }
 
@@ -2667,711 +1621,440 @@ void HandleFirstTarget(
         CalculateImmediatelyAfterIndex(
             precedingIndex,
             before.targetIndex,
-            before.size
-        );
+            before.size);
 
     g_firstTargetIdentity.store(
         identity,
-        std::memory_order_release
-    );
+        std::memory_order_release);
 
     g_firstOverflowSize.store(
         before.size,
-        std::memory_order_release
-    );
-
-    g_initialMoveTargetIndex.store(
-        desiredIndex,
-        std::memory_order_release
-    );
+        std::memory_order_release);
 
     const unsigned long long moveNumber =
         g_analyzerMoveAttempts.fetch_add(
             1,
-            std::memory_order_relaxed
-        ) +
+            std::memory_order_relaxed) +
         1;
 
     Wh_Log(
-        L"PERSISTENCE_INITIAL_MOVE_BEGIN "
-        L"move=%llu "
-        L"id=%llu "
-        L"overflowSize=%u "
-        L"targetIndexBefore=%u "
-        L"computedTargetIndex=%u",
+        L"RESTART_PERSISTENCE_INITIAL_MOVE_BEGIN "
+        L"move=%llu pid=%lu "
+        L"targetIndexBefore=%u computedTargetIndex=%u",
         moveNumber,
-        static_cast<unsigned long long>(
-            identity
-        ),
-        before.size,
+        GetCurrentProcessId(),
         before.targetIndex,
-        desiredIndex
-    );
+        desiredIndex);
 
-    void* iconArgumentStorage =
-        targetAbi;
+    void* storage = targetAbi;
 
     g_internalMoveDepth++;
 
     NotificationAreaIconManager_MoveIcon(
-        pThis,
-        &iconArgumentStorage,
+        manager,
+        &storage,
         kOverflowLocation,
-        desiredIndex
-    );
+        desiredIndex);
 
     g_internalMoveDepth--;
 
     const OverflowPositions after =
-        QueryOverflowPositions(
-            targetAbi
-        );
+        QueryOverflowPositions(targetAbi);
 
     const bool relationEstablished =
         IsTargetDirectlyBetween(
             after,
-            precedingSlot,
-            followingSlot
-        );
+            preceding,
+            following);
 
-    const bool moveObserved =
+    const bool moved =
         after.targetFound &&
-        before.targetIndex !=
-            after.targetIndex;
-
-    const UIOrderSnapshot snapshot =
-        CaptureUIOrderSnapshot();
-
-    g_initialUiOrderPosition.store(
-        FindOneBasedPosition(
-            snapshot,
-            identity
-        ),
-        std::memory_order_release
-    );
+        after.targetIndex != before.targetIndex;
 
     g_initialRelationEstablished.store(
-        relationEstablished &&
-            moveObserved,
-        std::memory_order_release
-    );
+        moved &&
+            relationEstablished,
+        std::memory_order_release);
 
     Wh_Log(
-        L"PERSISTENCE_INITIAL_MOVE_COMPLETE "
-        L"move=%llu "
-        L"targetIndex=%u "
-        L"moveObserved=%d "
-        L"relationEstablished=%d",
+        L"RESTART_PERSISTENCE_INITIAL_MOVE_COMPLETE "
+        L"move=%llu targetIndex=%u "
+        L"moveObserved=%d relationEstablished=%d",
         moveNumber,
         after.targetIndex,
-        moveObserved
-            ? 1
-            : 0,
-        relationEstablished
-            ? 1
-            : 0
-    );
+        moved ? 1 : 0,
+        relationEstablished ? 1 : 0);
 
     Wh_Log(
-        L"PERSISTENCE_USER_ACTION_READY "
+        L"RESTART_PERSISTENCE_USER_ACTION_READY "
         L"expectedManualPrecedingSlot=%d "
         L"expectedManualFollowingSlot=%d",
         g_initialMiddleAnchorSlot.load(
-            std::memory_order_acquire
-        ),
+            std::memory_order_acquire),
         g_initialLastAnchorSlot.load(
-            std::memory_order_acquire
-        )
-    );
+            std::memory_order_acquire));
 }
 
 int __cdecl
 TaskbarModel_MoveNotificationAreaIcon_Hook(
     void* pThis,
-    void* notificationAreaIconAbi,
+    void* iconAbi,
     int location,
-    unsigned int index
-) {
-    void* firstTargetAbi =
+    unsigned int index) {
+    void* tracked =
         g_firstTargetAbi.load(
-            std::memory_order_acquire
-        );
+            std::memory_order_acquire);
 
-    const bool trackedTarget =
-        firstTargetAbi &&
-        notificationAreaIconAbi &&
+    const bool isTracked =
+        tracked &&
+        iconAbi &&
         IsSameComObject(
-            notificationAreaIconAbi,
-            firstTargetAbi
-        );
+            tracked,
+            iconAbi);
 
-    const int originalResult =
+    const int result =
         TaskbarModel_MoveNotificationAreaIcon_Original(
             pThis,
-            notificationAreaIconAbi,
+            iconAbi,
             location,
-            index
-        );
+            index);
 
-    if (!trackedTarget) {
-        return originalResult;
+    if (!isTracked) {
+        return result;
     }
 
-    const unsigned long long manualMoveNumber =
+    const unsigned long long manualMove =
         g_manualTargetMoveCalls.fetch_add(
             1,
-            std::memory_order_relaxed
-        ) +
+            std::memory_order_relaxed) +
         1;
 
     const OverflowPositions after =
-        QueryOverflowPositions(
-            firstTargetAbi
-        );
+        QueryOverflowPositions(tracked);
 
-    const int expectedPrecedingSlot =
+    const int preceding =
         g_initialMiddleAnchorSlot.load(
-            std::memory_order_acquire
-        );
+            std::memory_order_acquire);
 
-    const int expectedFollowingSlot =
+    const int following =
         g_initialLastAnchorSlot.load(
-            std::memory_order_acquire
-        );
+            std::memory_order_acquire);
 
-    const bool expectedRelation =
+    const bool relation =
         SUCCEEDED(
-            static_cast<HRESULT>(
-                originalResult
-            )
-        ) &&
-        location ==
-            kOverflowLocation &&
+            static_cast<HRESULT>(result)) &&
+        location == kOverflowLocation &&
         IsTargetDirectlyBetween(
             after,
-            expectedPrecedingSlot,
-            expectedFollowingSlot
-        );
+            preceding,
+            following);
 
     Wh_Log(
-        L"PERSISTENCE_USER_MOVE_COMPLETE "
-        L"manualMove=%llu "
-        L"result=0x%08X "
-        L"location=%d "
-        L"requestedIndex=%u "
-        L"targetIndex=%u "
-        L"expectedRelation=%d "
+        L"RESTART_PERSISTENCE_USER_MOVE_COMPLETE "
+        L"manualMove=%llu result=0x%08X "
+        L"targetIndex=%u expectedRelation=%d "
         L"analyzerMoveAttempts=%llu",
-        manualMoveNumber,
+        manualMove,
         static_cast<unsigned int>(
-            static_cast<HRESULT>(
-                originalResult
-            )
-        ),
-        location,
-        index,
+            static_cast<HRESULT>(result)),
         after.targetIndex,
-        expectedRelation
-            ? 1
-            : 0,
+        relation ? 1 : 0,
         g_analyzerMoveAttempts.load(
-            std::memory_order_acquire
-        )
-    );
+            std::memory_order_acquire));
 
-    if (!expectedRelation) {
-        return originalResult;
+    if (!relation) {
+        return result;
     }
 
     g_manualPrecedingSlot.store(
-        expectedPrecedingSlot,
-        std::memory_order_release
-    );
+        preceding,
+        std::memory_order_release);
 
     g_manualFollowingSlot.store(
-        expectedFollowingSlot,
-        std::memory_order_release
-    );
+        following,
+        std::memory_order_release);
 
     g_manualSavedTargetIndex.store(
         after.targetIndex,
-        std::memory_order_release
-    );
+        std::memory_order_release);
 
     const UIOrderSnapshot snapshot =
         CaptureUIOrderSnapshot();
 
-    const unsigned long long manualUiOrderPosition =
+    g_manualUiOrderPosition.store(
         FindOneBasedPosition(
             snapshot,
             g_firstTargetIdentity.load(
-                std::memory_order_acquire
-            )
-        );
-
-    g_manualUiOrderPosition.store(
-        manualUiOrderPosition,
-        std::memory_order_release
-    );
+                std::memory_order_acquire)),
+        std::memory_order_release);
 
     g_manualRelationUpdates.fetch_add(
         1,
-        std::memory_order_relaxed
-    );
+        std::memory_order_relaxed);
 
     g_manualCanonicalRelationUpdated.store(
         true,
-        std::memory_order_release
-    );
+        std::memory_order_release);
 
-    const std::wstring normalizedPath =
+    const std::wstring normalized =
         NormalizeVersionedExecutablePath(
             QueryExecutablePath(
                 g_firstTargetIdentity.load(
-                    std::memory_order_acquire
-                )
-            )
-        );
+                    std::memory_order_acquire)));
 
-    const bool persistenceResult =
+    const bool persisted =
         PersistManualCanonicalState(
-            normalizedPath
-        );
+            normalized);
 
     Wh_Log(
-        L"PERSISTENCE_CANONICAL_UPDATED_AND_SAVED "
-        L"precedingSlot=%d "
-        L"followingSlot=%d "
-        L"savedTargetIndex=%u "
-        L"uiOrderPosition=%llu "
-        L"persistenceResult=%d",
-        expectedPrecedingSlot,
-        expectedFollowingSlot,
+        L"RESTART_PERSISTENCE_CANONICAL_SAVED "
+        L"precedingSlot=%d followingSlot=%d "
+        L"savedTargetIndex=%u persisted=%d",
+        preceding,
+        following,
         after.targetIndex,
-        manualUiOrderPosition,
-        persistenceResult
-            ? 1
-            : 0
-    );
+        persisted ? 1 : 0);
 
-    return originalResult;
+    return result;
 }
 
 void LogFinalValidation(
     const HistoricalCandidate& candidate,
     const OverflowPositions& before,
     const OverflowPositions& after,
-    const std::wstring& currentNormalizedPath
-) {
-    const bool persistedPathMatchesCurrent =
-        !g_loadedNormalizedPath.empty() &&
-        g_loadedNormalizedPath ==
-            currentNormalizedPath;
+    const std::wstring& currentNormalizedPath) {
+    const bool explorerChanged =
+        g_loadedPersistentState.firstExplorerProcessId !=
+            GetCurrentProcessId();
 
-    const bool candidateMatchesPersistedFirst =
+    const bool pathMatches =
+        currentNormalizedPath ==
+            g_loadedNormalizedPath;
+
+    const bool candidateMatches =
         candidate.identity ==
-        g_loadedPersistentState.firstTargetIdentity;
+            g_loadedPersistentState.firstTargetIdentity;
 
     const bool collectionChanged =
         g_loadedPersistentState.firstSessionOverflowSize !=
-        g_secondOverflowSize.load(
-            std::memory_order_acquire
-        );
+            g_secondOverflowSize.load(
+                std::memory_order_acquire);
 
     const bool numericIndexInvalidated =
         g_loadedPersistentState.manualSavedTargetIndex !=
-        g_secondMoveTargetIndex.load(
-            std::memory_order_acquire
-        );
+            g_secondMoveTargetIndex.load(
+                std::memory_order_acquire);
 
-    const bool replacementBetweenPersistedAnchors =
+    const bool correctRelation =
         IsTargetDirectlyBetween(
             after,
             g_loadedPersistentState.precedingSlot,
-            g_loadedPersistentState.followingSlot
-        );
+            g_loadedPersistentState.followingSlot);
 
-    const bool exactlyOneSecondSessionAnalyzerMove =
+    const bool oneSecondSessionMove =
         g_analyzerMoveAttempts.load(
-            std::memory_order_acquire
-        ) ==
+            std::memory_order_acquire) ==
         1;
 
-    const bool validationCompleted =
+    const bool validation =
         g_persistedStateLoadedAtInit.load(
-            std::memory_order_acquire
-        ) &&
-        IsValidPersistedState(
-            g_loadedPersistentState
-        ) &&
-        persistedPathMatchesCurrent &&
-        g_loadedPersistentState.firstSessionAnalyzerMoveAttempts ==
-            1 &&
-        g_loadedPersistentState.firstSessionManualTargetMoveCalls >=
-            1 &&
+            std::memory_order_acquire) &&
+        explorerChanged &&
+        pathMatches &&
         g_candidateCount.load(
-            std::memory_order_acquire
-        ) ==
+            std::memory_order_acquire) ==
             1 &&
-        candidateMatchesPersistedFirst &&
+        candidateMatches &&
         !candidate.pathExists &&
         g_uniqueCandidateObserved.load(
-            std::memory_order_acquire
-        ) &&
+            std::memory_order_acquire) &&
         g_uniqueCandidateSelected.load(
-            std::memory_order_acquire
-        ) &&
+            std::memory_order_acquire) &&
         g_helperIdentityCount.load(
-            std::memory_order_acquire
-        ) ==
+            std::memory_order_acquire) ==
             3 &&
         collectionChanged &&
         numericIndexInvalidated &&
-        replacementBetweenPersistedAnchors &&
+        correctRelation &&
         g_replacementRestoredToPersistedRelation.load(
-            std::memory_order_acquire
-        ) &&
+            std::memory_order_acquire) &&
         g_restoreDecisions.load(
-            std::memory_order_acquire
-        ) ==
+            std::memory_order_acquire) ==
             1 &&
-        exactlyOneSecondSessionAnalyzerMove;
+        oneSecondSessionMove;
 
-    g_persistenceValidationCompleted.store(
-        validationCompleted,
-        std::memory_order_release
-    );
+    g_restartPersistenceValidationCompleted.store(
+        validation,
+        std::memory_order_release);
 
     Wh_Log(
-        L"PERSISTENCE_RESULT "
+        L"RESTART_PERSISTENCE_RESULT "
         L"persistedStateLoadedAtInit=%d "
+        L"persistedExplorerPid=%lu "
+        L"currentExplorerPid=%lu "
+        L"explorerProcessChanged=%d "
         L"persistedFirstTargetIdentity=%llu "
-        L"persistedPrecedingSlot=%d "
-        L"persistedFollowingSlot=%d "
-        L"persistedManualSavedTargetIndex=%u "
-        L"persistedFirstSessionOverflowSize=%u "
-        L"persistedFirstSessionAnalyzerMoves=%llu "
-        L"persistedFirstSessionManualMoves=%llu "
-        L"persistedPathMatchesCurrent=%d "
-        L"candidateCount=%u "
         L"candidateIdentity=%llu "
         L"candidateMatchesPersistedFirst=%d "
-        L"candidatePathExists=%d "
-        L"uniqueCandidateObserved=%d "
-        L"uniqueCandidateSelected=%d "
+        L"persistedPathMatchesCurrent=%d "
+        L"candidateCount=%u "
         L"helperCount=%llu "
+        L"persistedFirstOverflowSize=%u "
         L"secondOverflowSize=%u "
         L"collectionChanged=%d "
         L"persistedManualSavedTargetIndex=%u "
         L"secondMoveTargetIndex=%u "
         L"numericIndexInvalidated=%d "
-        L"secondTargetIndexBefore=%u "
-        L"secondTargetIndexAfter=%u "
         L"replacementBetweenPersistedAnchors=%d "
         L"replacementRestoredToPersistedRelation=%d "
         L"restoreDecisions=%llu "
         L"secondSessionAnalyzerMoveAttempts=%llu "
-        L"exactlyOneSecondSessionAnalyzerMove=%d "
-        L"persistenceValidationCompleted=%d",
+        L"restartPersistenceValidationCompleted=%d",
         g_persistedStateLoadedAtInit.load(
-            std::memory_order_acquire
-        )
+            std::memory_order_acquire)
             ? 1
             : 0,
+        g_loadedPersistentState.firstExplorerProcessId,
+        GetCurrentProcessId(),
+        explorerChanged ? 1 : 0,
         static_cast<unsigned long long>(
-            g_loadedPersistentState.firstTargetIdentity
-        ),
-        g_loadedPersistentState.precedingSlot,
-        g_loadedPersistentState.followingSlot,
-        g_loadedPersistentState.manualSavedTargetIndex,
+            g_loadedPersistentState.firstTargetIdentity),
+        static_cast<unsigned long long>(
+            candidate.identity),
+        candidateMatches ? 1 : 0,
+        pathMatches ? 1 : 0,
+        g_candidateCount.load(
+            std::memory_order_acquire),
+        g_helperIdentityCount.load(
+            std::memory_order_acquire),
         g_loadedPersistentState.firstSessionOverflowSize,
-        g_loadedPersistentState.firstSessionAnalyzerMoveAttempts,
-        g_loadedPersistentState.firstSessionManualTargetMoveCalls,
-        persistedPathMatchesCurrent
-            ? 1
-            : 0,
-        g_candidateCount.load(
-            std::memory_order_acquire
-        ),
-        static_cast<unsigned long long>(
-            candidate.identity
-        ),
-        candidateMatchesPersistedFirst
-            ? 1
-            : 0,
-        candidate.pathExists
-            ? 1
-            : 0,
-        g_uniqueCandidateObserved.load(
-            std::memory_order_acquire
-        )
-            ? 1
-            : 0,
-        g_uniqueCandidateSelected.load(
-            std::memory_order_acquire
-        )
-            ? 1
-            : 0,
-        g_helperIdentityCount.load(
-            std::memory_order_acquire
-        ),
         g_secondOverflowSize.load(
-            std::memory_order_acquire
-        ),
-        collectionChanged
-            ? 1
-            : 0,
+            std::memory_order_acquire),
+        collectionChanged ? 1 : 0,
         g_loadedPersistentState.manualSavedTargetIndex,
         g_secondMoveTargetIndex.load(
-            std::memory_order_acquire
-        ),
-        numericIndexInvalidated
-            ? 1
-            : 0,
-        before.targetIndex,
-        after.targetIndex,
-        replacementBetweenPersistedAnchors
-            ? 1
-            : 0,
+            std::memory_order_acquire),
+        numericIndexInvalidated ? 1 : 0,
+        correctRelation ? 1 : 0,
         g_replacementRestoredToPersistedRelation.load(
-            std::memory_order_acquire
-        )
+            std::memory_order_acquire)
             ? 1
             : 0,
         g_restoreDecisions.load(
-            std::memory_order_acquire
-        ),
+            std::memory_order_acquire),
         g_analyzerMoveAttempts.load(
-            std::memory_order_acquire
-        ),
-        exactlyOneSecondSessionAnalyzerMove
-            ? 1
-            : 0,
-        validationCompleted
-            ? 1
-            : 0
-    );
+            std::memory_order_acquire),
+        validation ? 1 : 0);
 
-    Wh_Log(
-        L"PERSISTENCE_SUMMARY "
-        L"firstTargetIdentity=%llu "
-        L"secondTargetIdentity=%llu "
-        L"selectedHistoricalIdentity=%llu "
-        L"persistedPrecedingSlot=%d "
-        L"persistedFollowingSlot=%d "
-        L"persistedManualSavedTargetIndex=%u "
-        L"secondMoveTargetIndex=%u "
-        L"secondPrecedingIndexBefore=%u "
-        L"secondFollowingIndexBefore=%u "
-        L"secondUiOrderPosition=%llu "
-        L"helperCount=%llu "
-        L"candidateCount=%u "
-        L"restoreDecisions=%llu "
-        L"secondSessionAnalyzerMoveAttempts=%llu "
-        L"persistenceValidationCompleted=%d",
-        static_cast<unsigned long long>(
-            g_loadedPersistentState.firstTargetIdentity
-        ),
-        static_cast<unsigned long long>(
-            g_secondTargetIdentity.load(
-                std::memory_order_acquire
-            )
-        ),
-        static_cast<unsigned long long>(
-            g_selectedHistoricalIdentity.load(
-                std::memory_order_acquire
-            )
-        ),
-        g_loadedPersistentState.precedingSlot,
-        g_loadedPersistentState.followingSlot,
-        g_loadedPersistentState.manualSavedTargetIndex,
-        g_secondMoveTargetIndex.load(
-            std::memory_order_acquire
-        ),
-        g_secondPrecedingIndexBefore.load(
-            std::memory_order_acquire
-        ),
-        g_secondFollowingIndexBefore.load(
-            std::memory_order_acquire
-        ),
-        g_secondUiOrderPosition.load(
-            std::memory_order_acquire
-        ),
-        g_helperIdentityCount.load(
-            std::memory_order_acquire
-        ),
-        g_candidateCount.load(
-            std::memory_order_acquire
-        ),
-        g_restoreDecisions.load(
-            std::memory_order_acquire
-        ),
-        g_analyzerMoveAttempts.load(
-            std::memory_order_acquire
-        ),
-        validationCompleted
-            ? 1
-            : 0
-    );
+    if (validation) {
+        Wh_DeleteValue(
+            kPersistentStateValueName);
 
-    if (validationCompleted) {
-        const BOOL binaryDeleteResult =
-            Wh_DeleteValue(
-                kPersistentStateValueName
-            );
-
-        const BOOL pathDeleteResult =
-            Wh_DeleteValue(
-                kPersistentPathValueName
-            );
+        Wh_DeleteValue(
+            kPersistentPathValueName);
 
         Wh_Log(
-            L"PERSISTENCE_TEST_STORAGE_CLEANUP "
-            L"binaryDeleteResult=%d "
-            L"pathDeleteResult=%d",
-            binaryDeleteResult
-                ? 1
-                : 0,
-            pathDeleteResult
-                ? 1
-                : 0
-        );
+            L"RESTART_PERSISTENCE_TEST_STORAGE_CLEANUP completed=1");
     }
 }
 
 void HandleReplacementTarget(
-    void* pThis,
+    void* manager,
     std::uint64_t identity,
-    void* iconImplementation
-) {
+    void* implementation) {
     if (
         !g_persistedStateLoadedAtInit.load(
-            std::memory_order_acquire
-        )
-    ) {
+            std::memory_order_acquire) ||
+        !g_explorerProcessChanged.load(
+            std::memory_order_acquire) ||
+        !AllAnchorsCaptured()) {
         Wh_Log(
-            L"PERSISTENCE_REPLACEMENT_REJECTED "
-            L"reason=\"persistent-state-not-loaded-at-init\""
-        );
+            L"RESTART_PERSISTENCE_REPLACEMENT_REJECTED "
+            L"stateLoaded=%d explorerProcessChanged=%d anchors=%d",
+            g_persistedStateLoadedAtInit.load(
+                std::memory_order_acquire)
+                ? 1
+                : 0,
+            g_explorerProcessChanged.load(
+                std::memory_order_acquire)
+                ? 1
+                : 0,
+            AllAnchorsCaptured() ? 1 : 0);
 
         return;
     }
 
-    if (!AllAnchorsCaptured()) {
-        Wh_Log(
-            L"PERSISTENCE_REPLACEMENT_REJECTED "
-            L"reason=\"phase2-anchors-not-captured\""
-        );
+    void* targetAbi = nullptr;
 
-        return;
-    }
-
-    void* targetAbi =
-        nullptr;
-
-    const HRESULT queryResult =
+    const HRESULT query =
         static_cast<HRESULT>(
             NotificationAreaIcon_QueryInterface(
-                iconImplementation,
+                implementation,
                 *g_notificationAreaIconInterfaceId,
-                &targetAbi
-            )
-        );
+                &targetAbi));
 
     if (
-        FAILED(
-            queryResult
-        ) ||
-        !targetAbi
-    ) {
+        FAILED(query) ||
+        !targetAbi) {
         return;
     }
 
     const OverflowPositions before =
-        QueryOverflowPositions(
-            targetAbi
-        );
+        QueryOverflowPositions(targetAbi);
 
     if (
         !before.enumerated ||
-        !before.targetFound
-    ) {
+        !before.targetFound) {
         reinterpret_cast<IUnknown*>(
-            targetAbi
-        )->Release();
+            targetAbi)->Release();
 
         return;
     }
 
     g_secondTargetIdentity.store(
         identity,
-        std::memory_order_release
-    );
+        std::memory_order_release);
 
     g_secondOverflowSize.store(
         before.size,
-        std::memory_order_release
-    );
+        std::memory_order_release);
 
     g_secondTargetIndexBefore.store(
         before.targetIndex,
-        std::memory_order_release
-    );
+        std::memory_order_release);
 
-    const std::wstring currentNormalizedPath =
+    const std::wstring normalized =
         NormalizeVersionedExecutablePath(
-            QueryExecutablePath(
-                identity
-            )
-        );
+            QueryExecutablePath(identity));
 
-    const std::vector<HistoricalCandidate> candidates =
+    const auto candidates =
         FindHistoricalCandidates(
             identity,
-            currentNormalizedPath
-        );
+            normalized);
 
     g_candidateCount.store(
         static_cast<unsigned int>(
-            candidates.size()
-        ),
-        std::memory_order_release
-    );
+            candidates.size()),
+        std::memory_order_release);
 
     g_restoreDecisions.fetch_add(
         1,
-        std::memory_order_relaxed
-    );
+        std::memory_order_relaxed);
 
     Wh_Log(
-        L"PERSISTENCE_MATCH_SEARCH "
-        L"currentIdentity=%llu "
-        L"candidateCount=%llu "
-        L"persistedPathMatchesCurrent=%d",
+        L"RESTART_PERSISTENCE_MATCH_SEARCH "
+        L"currentIdentity=%llu candidateCount=%llu "
+        L"pathMatchesPersisted=%d",
+        static_cast<unsigned long long>(identity),
         static_cast<unsigned long long>(
-            identity
-        ),
-        static_cast<unsigned long long>(
-            candidates.size()
-        ),
-        currentNormalizedPath ==
-                g_loadedNormalizedPath
+            candidates.size()),
+        normalized == g_loadedNormalizedPath
             ? 1
-            : 0
-    );
+            : 0);
 
-    if (
-        candidates.size() !=
-        1
-    ) {
-        Wh_Log(
-            L"PERSISTENCE_MATCH_REJECTED "
-            L"reason=\"logical-match-not-unique\""
-        );
-
+    if (candidates.size() != 1) {
         reinterpret_cast<IUnknown*>(
-            targetAbi
-        )->Release();
+            targetAbi)->Release();
 
         return;
     }
@@ -3379,211 +2062,142 @@ void HandleReplacementTarget(
     const HistoricalCandidate& candidate =
         candidates.front();
 
-    Wh_Log(
-        L"PERSISTENCE_MATCH_CANDIDATE "
-        L"id=%llu "
-        L"uid=%u "
-        L"pathExists=%d "
-        L"uiOrderPosition=%llu",
-        static_cast<unsigned long long>(
-            candidate.identity
-        ),
-        candidate.uid,
-        candidate.pathExists
-            ? 1
-            : 0,
-        candidate.uiOrderPosition
-    );
-
     g_uniqueCandidateObserved.store(
         true,
-        std::memory_order_release
-    );
+        std::memory_order_release);
 
     if (
         candidate.identity !=
-        g_loadedPersistentState.firstTargetIdentity ||
-        currentNormalizedPath !=
-        g_loadedNormalizedPath
-    ) {
-        Wh_Log(
-            L"PERSISTENCE_MATCH_REJECTED "
-            L"reason=\"candidate-or-logical-path-does-not-match-persisted-state\""
-        );
-
+            g_loadedPersistentState.firstTargetIdentity ||
+        normalized !=
+            g_loadedNormalizedPath) {
         reinterpret_cast<IUnknown*>(
-            targetAbi
-        )->Release();
+            targetAbi)->Release();
 
         return;
     }
 
     g_selectedHistoricalIdentity.store(
         candidate.identity,
-        std::memory_order_release
-    );
+        std::memory_order_release);
 
     g_uniqueCandidateSelected.store(
         true,
-        std::memory_order_release
-    );
+        std::memory_order_release);
 
     Wh_Log(
-        L"PERSISTENCE_MATCH_SELECTED "
-        L"currentIdentity=%llu "
+        L"RESTART_PERSISTENCE_MATCH_SELECTED "
         L"historicalIdentity=%llu "
-        L"precedingSlot=%d "
-        L"followingSlot=%d",
+        L"precedingSlot=%d followingSlot=%d",
         static_cast<unsigned long long>(
-            identity
-        ),
-        static_cast<unsigned long long>(
-            candidate.identity
-        ),
+            candidate.identity),
         g_loadedPersistentState.precedingSlot,
-        g_loadedPersistentState.followingSlot
-    );
+        g_loadedPersistentState.followingSlot);
 
-    unsigned int precedingIndex =
-        0;
-
-    unsigned int followingIndex =
-        0;
+    unsigned int precedingIndex = 0;
+    unsigned int followingIndex = 0;
 
     const bool precedingFound =
         GetAnchorPosition(
             before,
             g_loadedPersistentState.precedingSlot,
-            &precedingIndex
-        );
+            &precedingIndex);
 
     const bool followingFound =
         GetAnchorPosition(
             before,
             g_loadedPersistentState.followingSlot,
-            &followingIndex
-        );
+            &followingIndex);
 
     Wh_Log(
-        L"PERSISTENCE_LIVE_PERSISTED_NEIGHBORS "
-        L"precedingFound=%d "
-        L"precedingIndex=%u "
-        L"followingFound=%d "
-        L"followingIndex=%u "
-        L"targetIndex=%u "
-        L"overflowSize=%u",
-        precedingFound
-            ? 1
-            : 0,
+        L"RESTART_PERSISTENCE_LIVE_NEIGHBORS "
+        L"precedingFound=%d precedingIndex=%u "
+        L"followingFound=%d followingIndex=%u "
+        L"targetIndex=%u overflowSize=%u",
+        precedingFound ? 1 : 0,
         precedingIndex,
-        followingFound
-            ? 1
-            : 0,
+        followingFound ? 1 : 0,
         followingIndex,
         before.targetIndex,
-        before.size
-    );
+        before.size);
 
     if (
         !precedingFound ||
         !followingFound ||
-        precedingIndex >=
-            followingIndex
-    ) {
-        Wh_Log(
-            L"PERSISTENCE_ORDER_REJECTED "
-            L"reason=\"persisted-neighbor-interval-unavailable\""
-        );
-
+        precedingIndex >= followingIndex) {
         reinterpret_cast<IUnknown*>(
-            targetAbi
-        )->Release();
+            targetAbi)->Release();
 
         return;
     }
 
     g_secondPrecedingIndexBefore.store(
         precedingIndex,
-        std::memory_order_release
-    );
+        std::memory_order_release);
 
     g_secondFollowingIndexBefore.store(
         followingIndex,
-        std::memory_order_release
-    );
+        std::memory_order_release);
 
     const unsigned int desiredIndex =
         CalculateImmediatelyAfterIndex(
             precedingIndex,
             before.targetIndex,
-            before.size
-        );
+            before.size);
 
     g_secondMoveTargetIndex.store(
         desiredIndex,
-        std::memory_order_release
-    );
+        std::memory_order_release);
 
-    const unsigned long long moveNumber =
+    const unsigned long long move =
         g_analyzerMoveAttempts.fetch_add(
             1,
-            std::memory_order_relaxed
-        ) +
+            std::memory_order_relaxed) +
         1;
 
     Wh_Log(
-        L"PERSISTENCE_REPLACEMENT_MOVE_BEGIN "
-        L"move=%llu "
-        L"persistedManualSavedTargetIndex=%u "
-        L"computedTargetIndex=%u "
-        L"targetIndexBefore=%u",
-        moveNumber,
+        L"RESTART_PERSISTENCE_REPLACEMENT_MOVE_BEGIN "
+        L"move=%llu persistedIndex=%u "
+        L"computedTargetIndex=%u targetIndexBefore=%u",
+        move,
         g_loadedPersistentState.manualSavedTargetIndex,
         desiredIndex,
-        before.targetIndex
-    );
+        before.targetIndex);
 
-    void* iconArgumentStorage =
-        targetAbi;
+    void* storage = targetAbi;
 
     g_internalMoveDepth++;
 
     NotificationAreaIconManager_MoveIcon(
-        pThis,
-        &iconArgumentStorage,
+        manager,
+        &storage,
         kOverflowLocation,
-        desiredIndex
-    );
+        desiredIndex);
 
     g_internalMoveDepth--;
 
     const OverflowPositions after =
-        QueryOverflowPositions(
-            targetAbi
-        );
+        QueryOverflowPositions(targetAbi);
 
     const bool relationRestored =
         IsTargetDirectlyBetween(
             after,
             g_loadedPersistentState.precedingSlot,
-            g_loadedPersistentState.followingSlot
-        );
+            g_loadedPersistentState.followingSlot);
 
-    const bool moveObserved =
+    const bool moved =
         after.targetFound &&
-        before.targetIndex !=
-            after.targetIndex;
+        after.targetIndex !=
+            before.targetIndex;
 
     g_secondTargetIndexAfter.store(
         after.targetIndex,
-        std::memory_order_release
-    );
+        std::memory_order_release);
 
     g_replacementRestoredToPersistedRelation.store(
-        relationRestored &&
-            moveObserved,
-        std::memory_order_release
-    );
+        moved &&
+            relationRestored,
+        std::memory_order_release);
 
     const UIOrderSnapshot snapshot =
         CaptureUIOrderSnapshot();
@@ -3591,118 +2205,68 @@ void HandleReplacementTarget(
     g_secondUiOrderPosition.store(
         FindOneBasedPosition(
             snapshot,
-            identity
-        ),
-        std::memory_order_release
-    );
+            identity),
+        std::memory_order_release);
 
     Wh_Log(
-        L"PERSISTENCE_REPLACEMENT_MOVE_COMPLETE "
-        L"move=%llu "
-        L"targetIndex=%u "
-        L"moveObserved=%d "
-        L"relationRestored=%d",
-        moveNumber,
+        L"RESTART_PERSISTENCE_REPLACEMENT_MOVE_COMPLETE "
+        L"move=%llu targetIndex=%u "
+        L"moveObserved=%d relationRestored=%d",
+        move,
         after.targetIndex,
-        moveObserved
-            ? 1
-            : 0,
-        relationRestored
-            ? 1
-            : 0
-    );
+        moved ? 1 : 0,
+        relationRestored ? 1 : 0);
 
     LogFinalValidation(
         candidate,
         before,
         after,
-        currentNormalizedPath
-    );
+        normalized);
 
     reinterpret_cast<IUnknown*>(
-        targetAbi
-    )->Release();
+        targetAbi)->Release();
 }
 
 void HandleTargetIcon(
-    void* pThis,
+    void* manager,
     std::uint64_t identity,
-    void* iconImplementation
-) {
-    const int phase =
-        GetTargetPhase(
-            identity
-        );
+    void* implementation) {
+    switch (GetTargetPhase(identity)) {
+        case 1:
+            HandleFirstTarget(
+                manager,
+                identity,
+                implementation);
+            break;
 
-    if (
-        phase ==
-        1
-    ) {
-        HandleFirstTarget(
-            pThis,
-            identity,
-            iconImplementation
-        );
-
-        return;
-    }
-
-    if (
-        phase ==
-        2
-    ) {
-        HandleReplacementTarget(
-            pThis,
-            identity,
-            iconImplementation
-        );
+        case 2:
+            HandleReplacementTarget(
+                manager,
+                identity,
+                implementation);
+            break;
     }
 }
 
 int __cdecl
 TaskbarModel_GetOverflowIcons_Hook(
     void* pThis,
-    void** result
-) {
-    const unsigned long long callNumber =
-        g_overflowGetterCalls.fetch_add(
-            1,
-            std::memory_order_relaxed
-        ) +
-        1;
-
+    void** result) {
     const int originalResult =
         TaskbarModel_GetOverflowIcons_Original(
             pThis,
-            result
-        );
+            result);
 
     if (
         SUCCEEDED(
             static_cast<HRESULT>(
-                originalResult
-            )
-        ) &&
+                originalResult)) &&
         result &&
-        *result
-    ) {
+        *result) {
         g_taskbarModel6.store(
             pThis,
-            std::memory_order_release
-        );
+            std::memory_order_release);
     }
-
-    Wh_Log(
-        L"OVERFLOW_GETTER "
-        L"call=%llu "
-        L"result=0x%08X",
-        callNumber,
-        static_cast<unsigned int>(
-            static_cast<HRESULT>(
-                originalResult
-            )
-        )
-    );
 
     return originalResult;
 }
@@ -3710,183 +2274,104 @@ TaskbarModel_GetOverflowIcons_Hook(
 void __cdecl
 NotificationAreaIconManager_AddIcon_Hook(
     void* pThis,
-    void* trayNotifyData
-) {
-    const unsigned long long callNumber =
-        g_addIconCalls.fetch_add(
-            1,
-            std::memory_order_relaxed
-        ) +
-        1;
+    void* data) {
+    AddIconContext previous =
+        std::move(g_addIconContext);
 
-    AddIconContext previousContext =
-        std::move(
-            g_addIconContext
-        );
-
-    g_addIconContext =
-        {};
-
-    g_addIconContext.active =
-        true;
-
-    g_addIconContext.callNumber =
-        callNumber;
-
+    g_addIconContext = {};
+    g_addIconContext.active = true;
     g_addIconContext.before =
         CaptureUIOrderSnapshot();
 
     NotificationAreaIconManager_AddIcon_Original(
         pThis,
-        trayNotifyData
-    );
+        data);
 
     g_addIconContext =
-        std::move(
-            previousContext
-        );
+        std::move(previous);
 }
 
 void __cdecl
 NotificationAreaIconManager_AddVisible_Hook(
     void* pThis,
-    void* iconImplementation
-) {
-    g_visibleAddCalls.fetch_add(
-        1,
-        std::memory_order_relaxed
-    );
-
+    void* implementation) {
     NotificationAreaIconManager_AddVisible_Original(
         pThis,
-        iconImplementation
-    );
+        implementation);
 
     if (
-        g_internalMoveDepth !=
-            0 ||
-        !g_addIconContext.active
-    ) {
+        g_internalMoveDepth ||
+        !g_addIconContext.active) {
         return;
     }
 
     const UIOrderSnapshot current =
         CaptureUIOrderSnapshot();
 
-    const std::vector<std::uint64_t> added =
+    const auto added =
         FindAddedIdentities(
             g_addIconContext.before,
-            current
-        );
+            current);
 
-    std::vector<
-        std::pair<
-            int,
-            std::uint64_t
-        >
-    > anchorAdded;
+    std::vector<std::pair<int, std::uint64_t>>
+        anchors;
 
-    std::vector<std::uint64_t>
-        targetAdded;
+    std::vector<std::uint64_t> targets;
+    std::vector<std::uint64_t> helpers;
 
-    std::vector<std::uint64_t>
-        helperAdded;
+    for (std::uint64_t identity : added) {
+        const int slot =
+            GetAnchorSlotForIdentity(identity);
 
-    for (
-        std::uint64_t identity :
-        added
-    ) {
-        const int anchorSlot =
-            GetAnchorSlotForIdentity(
-                identity
-            );
-
-        if (
-            anchorSlot !=
-            kInvalidAnchorSlot
-        ) {
-            anchorAdded.push_back(
-                {
-                    anchorSlot,
-                    identity
-                }
-            );
+        if (slot != kInvalidAnchorSlot) {
+            anchors.emplace_back(
+                slot,
+                identity);
         }
 
-        if (
-            IsTargetIdentity(
-                identity
-            )
-        ) {
-            targetAdded.push_back(
-                identity
-            );
+        if (IsTargetIdentity(identity)) {
+            targets.push_back(identity);
         }
 
-        if (
-            IsHelperIdentity(
-                identity
-            )
-        ) {
-            helperAdded.push_back(
-                identity
-            );
+        if (IsHelperIdentity(identity)) {
+            helpers.push_back(identity);
         }
     }
 
-    if (
-        anchorAdded.size() ==
-        1
-    ) {
+    if (anchors.size() == 1) {
         CaptureAnchorInterface(
-            anchorAdded.front().first,
-            anchorAdded.front().second,
-            iconImplementation
-        );
+            anchors.front().first,
+            implementation);
 
         return;
     }
 
-    if (
-        helperAdded.size() ==
-        1
-    ) {
-        const unsigned long long helperNumber =
+    if (helpers.size() == 1) {
+        const auto helper =
             g_helperIdentityCount.fetch_add(
                 1,
-                std::memory_order_relaxed
-            ) +
+                std::memory_order_relaxed) +
             1;
 
         Wh_Log(
-            L"PERSISTENCE_HELPER_OBSERVED "
-            L"helper=%llu "
-            L"id=%llu",
-            helperNumber,
-            static_cast<unsigned long long>(
-                helperAdded.front()
-            )
-        );
+            L"RESTART_PERSISTENCE_HELPER_OBSERVED "
+            L"helper=%llu",
+            helper);
 
         return;
     }
 
-    if (
-        targetAdded.size() ==
-        1
-    ) {
+    if (targets.size() == 1) {
         HandleTargetIcon(
             pThis,
-            targetAdded.front(),
-            iconImplementation
-        );
+            targets.front(),
+            implementation);
     }
 }
 
 bool HookTaskbarSymbols(
-    HMODULE taskbarModule
-) {
-    WindhawkUtils::SYMBOL_HOOK symbolHooks[] = {
+    HMODULE taskbarModule) {
+    WindhawkUtils::SYMBOL_HOOK hooks[] = {
         {
             {
                 LR"(private: void __cdecl NotificationAreaIconManager2::AddIcon(struct _TRAYNOTIFYDATAW * const))"
@@ -3920,11 +2405,8 @@ bool HookTaskbarSymbols(
     return
         WindhawkUtils::HookSymbols(
             taskbarModule,
-            symbolHooks,
-            ARRAYSIZE(
-                symbolHooks
-            )
-        );
+            hooks,
+            ARRAYSIZE(hooks));
 }
 
 bool IsPrimaryShellProcess() {
@@ -3935,16 +2417,14 @@ bool IsPrimaryShellProcess() {
         return false;
     }
 
-    DWORD shellProcessId =
-        0;
+    DWORD processId = 0;
 
     GetWindowThreadProcessId(
         shellWindow,
-        &shellProcessId
-    );
+        &processId);
 
     return
-        shellProcessId ==
+        processId ==
         GetCurrentProcessId();
 }
 
@@ -3952,9 +2432,9 @@ bool IsPrimaryShellProcess() {
 
 BOOL Wh_ModInit() {
     Wh_Log(
-        L"Tray Add Path Analyzer "
-        L"0.27.0 initializing"
-    );
+        L"Tray Add Path Analyzer 0.28.0 initializing "
+        L"processId=%lu",
+        GetCurrentProcessId());
 
     if (!IsPrimaryShellProcess()) {
         return TRUE;
@@ -3962,137 +2442,97 @@ BOOL Wh_ModInit() {
 
     LoadPersistentStateAtInit();
 
-    HMODULE taskbarModule =
+    HMODULE taskbar =
         GetModuleHandleW(
-            L"taskbar.dll"
-        );
+            L"taskbar.dll");
 
-    if (!taskbarModule) {
+    if (!taskbar) {
         return FALSE;
     }
 
-    if (
-        !ResolveRequiredSymbols(
-            taskbarModule
-        )
-    ) {
+    if (!ResolveRequiredSymbols(taskbar)) {
         return FALSE;
     }
 
-    if (
-        !HookTaskbarSymbols(
-            taskbarModule
-        )
-    ) {
+    if (!HookTaskbarSymbols(taskbar)) {
         return FALSE;
     }
 
     Wh_Log(
-        L"PERSISTENCE_TEST_READY "
+        L"RESTART_PERSISTENCE_TEST_READY "
         L"processId=%lu "
-        L"persistedStateLoadedAtInit=%d",
+        L"persistedStateLoadedAtInit=%d "
+        L"explorerProcessChanged=%d",
         GetCurrentProcessId(),
         g_persistedStateLoadedAtInit.load(
-            std::memory_order_acquire
-        )
+            std::memory_order_acquire)
             ? 1
-            : 0
-    );
+            : 0,
+        g_explorerProcessChanged.load(
+            std::memory_order_acquire)
+            ? 1
+            : 0);
 
     return TRUE;
 }
 
 void Wh_ModUninit() {
-    void* firstTargetAbi =
+    void* target =
         g_firstTargetAbi.exchange(
             nullptr,
-            std::memory_order_acq_rel
-        );
+            std::memory_order_acq_rel);
 
-    if (firstTargetAbi) {
+    if (target) {
         reinterpret_cast<IUnknown*>(
-            firstTargetAbi
-        )->Release();
+            target)->Release();
     }
 
-    for (
-        int slot = 0;
-        slot <
-            kAnchorCount;
-        slot++
-    ) {
-        void* anchorAbi =
-            g_anchorAbis[
-                slot
-            ].exchange(
+    for (int slot = 0; slot < kAnchorCount; slot++) {
+        void* anchor =
+            g_anchorAbis[slot].exchange(
                 nullptr,
-                std::memory_order_acq_rel
-            );
+                std::memory_order_acq_rel);
 
-        if (anchorAbi) {
+        if (anchor) {
             reinterpret_cast<IUnknown*>(
-                anchorAbi
-            )->Release();
+                anchor)->Release();
         }
     }
 
     Wh_Log(
         L"Tray Add Path Analyzer stopped; "
+        L"processId=%lu "
         L"analyzerMoveAttempts=%llu "
         L"manualTargetMoveCalls=%llu "
-        L"manualRelationUpdates=%llu "
         L"helperCount=%llu "
         L"candidateCount=%u "
-        L"persistentWriteSucceeded=%d "
-        L"persistentImmediateReadbackSucceeded=%d "
         L"persistedStateLoadedAtInit=%d "
-        L"uniqueCandidateSelected=%d "
+        L"explorerProcessChanged=%d "
         L"replacementRestoredToPersistedRelation=%d "
-        L"persistenceValidationCompleted=%d",
+        L"restartPersistenceValidationCompleted=%d",
+        GetCurrentProcessId(),
         g_analyzerMoveAttempts.load(
-            std::memory_order_acquire
-        ),
+            std::memory_order_acquire),
         g_manualTargetMoveCalls.load(
-            std::memory_order_acquire
-        ),
-        g_manualRelationUpdates.load(
-            std::memory_order_acquire
-        ),
+            std::memory_order_acquire),
         g_helperIdentityCount.load(
-            std::memory_order_acquire
-        ),
+            std::memory_order_acquire),
         g_candidateCount.load(
-            std::memory_order_acquire
-        ),
-        g_persistentWriteSucceeded.load(
-            std::memory_order_acquire
-        )
-            ? 1
-            : 0,
-        g_persistentImmediateReadbackSucceeded.load(
-            std::memory_order_acquire
-        )
-            ? 1
-            : 0,
+            std::memory_order_acquire),
         g_persistedStateLoadedAtInit.load(
-            std::memory_order_acquire
-        )
+            std::memory_order_acquire)
             ? 1
             : 0,
-        g_uniqueCandidateSelected.load(
-            std::memory_order_acquire
-        )
+        g_explorerProcessChanged.load(
+            std::memory_order_acquire)
             ? 1
             : 0,
         g_replacementRestoredToPersistedRelation.load(
-            std::memory_order_acquire
-        )
+            std::memory_order_acquire)
             ? 1
             : 0,
-        g_persistenceValidationCompleted.load(
-            std::memory_order_acquire
-        )
+        g_restartPersistenceValidationCompleted.load(
+            std::memory_order_acquire)
             ? 1
-            : 0
-    );
+            : 0);
 }
