@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              tray-add-path-analyzer
 // @name            Tray Add Path Analyzer
-// @description     Enumerates the exact NotificationAreaIcon2 identity symbol signatures without invoking them.
-// @version         0.31.0
+// @description     Audits taskbar.dll symbols that use NotificationAreaIconIdentity.
+// @version         0.32.0
 // @author          Yusseter
 // @github          https://github.com/Yusseter
 // @homepage        https://github.com/Yusseter/tray-order-lock
@@ -15,39 +15,32 @@
 /*
 # Tray Add Path Analyzer
 
-Version 0.31.0 performs a read-only symbol-signature audit for the live
-notification-area icon identity path.
+Version 0.32.0 performs a read-only PDB symbol audit for
+NotificationAreaIconIdentity.
 
-The production Tray Order Lock needs to map:
+Version 0.31.0 established the exact signature:
 
-    live NotificationAreaIcon2 implementation
-        -> INotificationAreaIcon ABI pointer
-        -> Windows NotifyIconSettings identity
-        -> persistent logical identity
+    public: struct NotificationAreaIconIdentity __cdecl
+    winrt::WindowsUdk::UI::Shell::implementation::
+    NotificationAreaIcon2::Identity(void) const
 
-The implementation-to-ABI conversion has already been validated through the
-NotificationAreaIcon2 query-interface path.
+The method therefore returns a user-defined structure by value. Its contents
+and its relationship to the 64-bit NotifyIconSettings/UIOrderList identity
+must be understood before the method can be invoked safely in production.
 
-A NotificationAreaIcon2::Identity() symbol was also observed during the earlier
-taskbar.dll symbol audit. However, its return ABI has not been validated. The
-function must therefore not be called or hooked based on an assumed prototype.
+This version enumerates every taskbar.dll symbol whose undecorated or decorated
+name contains NotificationAreaIconIdentity.
 
-This version enumerates Microsoft taskbar.dll symbols and reports every symbol
-whose name refers to NotificationAreaIcon2 identity information.
+Long symbol names are emitted in multiple chunks so DbgView does not silently
+truncate the information needed to reconstruct their complete signatures.
 
-For each match it records:
-
-- Symbol address.
-- Full undecorated symbol text.
-- Decorated symbol name, when available.
-
-This allows the exact PDB-visible function signature and return type to be
-established before any runtime invocation is attempted.
+No discovered function is called or hooked.
 
 This version:
 
 - Installs no taskbar function hooks.
-- Calls no NotificationAreaIcon2 identity function.
+- Calls no NotificationAreaIconIdentity functions.
+- Calls no NotificationAreaIcon2::Identity function.
 - Moves no tray icons.
 - Creates no tray icons.
 - Writes no registry values.
@@ -61,6 +54,9 @@ This version:
 #include <cwchar>
 
 namespace {
+
+constexpr size_t kLogChunkLength =
+    600;
 
 bool ContainsText(
     const wchar_t* text,
@@ -76,59 +72,165 @@ bool ContainsText(
         nullptr;
 }
 
-bool IsRelevantIdentitySymbol(
-    const wchar_t* symbol
+bool IsIdentitySymbol(
+    const WH_FIND_SYMBOL& symbol
 ) {
-    if (!symbol) {
-        return false;
-    }
-
-    const bool notificationAreaIcon2 =
-        ContainsText(
-            symbol,
-            L"NotificationAreaIcon2"
-        );
-
-    if (!notificationAreaIcon2) {
-        return false;
-    }
-
     return
         ContainsText(
-            symbol,
-            L"Identity"
+            symbol.symbol,
+            L"NotificationAreaIconIdentity"
         ) ||
         ContainsText(
-            symbol,
-            L"identity"
+            symbol.symbolDecorated,
+            L"NotificationAreaIconIdentity"
         );
 }
 
-bool IsRelevantDecoratedSymbol(
-    const wchar_t* symbol
+bool IsBridgeCandidate(
+    const WH_FIND_SYMBOL& symbol
 ) {
-    if (!symbol) {
+    const wchar_t* undecorated =
+        symbol.symbol;
+
+    if (!undecorated) {
         return false;
     }
 
-    // Decorated C++ names don't necessarily preserve readable class/member
-    // spelling in exactly the same form. Keep this as a supplementary check;
-    // the undecorated PDB symbol remains the primary selector.
     return
         ContainsText(
-            symbol,
+            undecorated,
+            L"NotifyIconSettingsDatabase"
+        ) ||
+        ContainsText(
+            undecorated,
+            L"UIOrder"
+        ) ||
+        ContainsText(
+            undecorated,
+            L"NotificationAreaIconManager"
+        ) ||
+        ContainsText(
+            undecorated,
             L"NotificationAreaIcon2"
-        ) &&
-        (
-            ContainsText(
-                symbol,
-                L"Identity"
-            ) ||
-            ContainsText(
-                symbol,
-                L"identity"
-            )
+        ) ||
+        ContainsText(
+            undecorated,
+            L"Settings"
+        ) ||
+        ContainsText(
+            undecorated,
+            L"operator"
+        ) ||
+        ContainsText(
+            undecorated,
+            L"find<"
         );
+}
+
+void LogTextChunks(
+    unsigned long long matchNumber,
+    const wchar_t* field,
+    const wchar_t* text
+) {
+    if (!text) {
+        Wh_Log(
+            L"IDENTITY_SYMBOL_TEXT "
+            L"match=%llu "
+            L"field=%s "
+            L"chunk=1 "
+            L"offset=0 "
+            L"final=1 "
+            L"text=\"<null>\"",
+            matchNumber,
+            field
+        );
+
+        return;
+    }
+
+    const size_t length =
+        std::wcslen(
+            text
+        );
+
+    if (length == 0) {
+        Wh_Log(
+            L"IDENTITY_SYMBOL_TEXT "
+            L"match=%llu "
+            L"field=%s "
+            L"chunk=1 "
+            L"offset=0 "
+            L"final=1 "
+            L"text=\"\"",
+            matchNumber,
+            field
+        );
+
+        return;
+    }
+
+    unsigned long long chunkNumber =
+        0;
+
+    for (
+        size_t offset = 0;
+        offset < length;
+        offset += kLogChunkLength
+    ) {
+        chunkNumber++;
+
+        const size_t remaining =
+            length -
+            offset;
+
+        const size_t chunkLength =
+            remaining <
+                    kLogChunkLength
+                ? remaining
+                : kLogChunkLength;
+
+        wchar_t chunk[
+            kLogChunkLength +
+            1
+        ]{};
+
+        std::wmemcpy(
+            chunk,
+            text +
+                offset,
+            chunkLength
+        );
+
+        chunk[
+            chunkLength
+        ] =
+            L'\0';
+
+        const bool finalChunk =
+            offset +
+                chunkLength >=
+            length;
+
+        Wh_Log(
+            L"IDENTITY_SYMBOL_TEXT "
+            L"match=%llu "
+            L"field=%s "
+            L"chunk=%llu "
+            L"offset=%llu "
+            L"final=%d "
+            L"text=\"%s\"",
+            matchNumber,
+            field,
+            chunkNumber,
+            static_cast<unsigned long long>(
+                offset
+            ),
+            finalChunk
+                ? 1
+                : 0,
+            chunk
+        );
+    }
 }
 
 void LogTaskbarModule(
@@ -148,7 +250,7 @@ void LogTaskbarModule(
         );
 
     Wh_Log(
-        L"IDENTITY_SIGNATURE_TASKBAR_MODULE "
+        L"IDENTITY_TYPE_TASKBAR_MODULE "
         L"address=%p "
         L"path=\"%s\"",
         module,
@@ -164,7 +266,7 @@ void LogTaskbarModule(
     );
 }
 
-bool RunIdentitySignatureAudit(
+bool RunIdentityTypeAudit(
     HMODULE taskbarModule
 ) {
     WH_FIND_SYMBOL_OPTIONS options{};
@@ -191,7 +293,7 @@ bool RunIdentitySignatureAudit(
 
     if (!search) {
         Wh_Log(
-            L"IDENTITY_SIGNATURE_ENUMERATION_FAILED "
+            L"IDENTITY_TYPE_ENUMERATION_FAILED "
             L"lastError=%lu",
             GetLastError()
         );
@@ -205,42 +307,59 @@ bool RunIdentitySignatureAudit(
     unsigned long long matches =
         0;
 
+    unsigned long long bridgeCandidates =
+        0;
+
     do {
         scanned++;
 
-        const bool relevantUndecorated =
-            IsRelevantIdentitySymbol(
-                symbol.symbol
-            );
-
-        const bool relevantDecorated =
-            IsRelevantDecoratedSymbol(
-                symbol.symbolDecorated
-            );
-
         if (
-            !relevantUndecorated &&
-            !relevantDecorated
+            !IsIdentitySymbol(
+                symbol
+            )
         ) {
             continue;
         }
 
         matches++;
 
+        const bool bridgeCandidate =
+            IsBridgeCandidate(
+                symbol
+            );
+
+        if (bridgeCandidate) {
+            bridgeCandidates++;
+        }
+
         Wh_Log(
-            L"IDENTITY_SIGNATURE_MATCH "
+            L"IDENTITY_SYMBOL_BEGIN "
             L"match=%llu "
             L"address=%p "
-            L"undecorated=\"%s\" "
-            L"decorated=\"%s\"",
+            L"bridgeCandidate=%d",
             matches,
             symbol.address,
+            bridgeCandidate
+                ? 1
+                : 0
+        );
+
+        LogTextChunks(
+            matches,
+            L"undecorated",
             symbol.symbol
-                ? symbol.symbol
-                : L"<null>",
+        );
+
+        LogTextChunks(
+            matches,
+            L"decorated",
             symbol.symbolDecorated
-                ? symbol.symbolDecorated
-                : L"<null>"
+        );
+
+        Wh_Log(
+            L"IDENTITY_SYMBOL_END "
+            L"match=%llu",
+            matches
         );
     } while (
         Wh_FindNextSymbol(
@@ -254,11 +373,13 @@ bool RunIdentitySignatureAudit(
     );
 
     Wh_Log(
-        L"IDENTITY_SIGNATURE_SUMMARY "
+        L"IDENTITY_TYPE_SUMMARY "
         L"scanned=%llu "
-        L"matches=%llu",
+        L"matches=%llu "
+        L"bridgeCandidates=%llu",
         scanned,
-        matches
+        matches,
+        bridgeCandidates
     );
 
     return
@@ -270,7 +391,7 @@ bool RunIdentitySignatureAudit(
 
 BOOL Wh_ModInit() {
     Wh_Log(
-        L"Tray Add Path Analyzer 0.31.0 initializing "
+        L"Tray Add Path Analyzer 0.32.0 initializing "
         L"processId=%lu",
         GetCurrentProcessId()
     );
@@ -282,7 +403,7 @@ BOOL Wh_ModInit() {
 
     if (!taskbarModule) {
         Wh_Log(
-            L"IDENTITY_SIGNATURE_TASKBAR_NOT_READY "
+            L"IDENTITY_TYPE_TASKBAR_NOT_READY "
             L"processId=%lu",
             GetCurrentProcessId()
         );
@@ -295,12 +416,12 @@ BOOL Wh_ModInit() {
     );
 
     const bool succeeded =
-        RunIdentitySignatureAudit(
+        RunIdentityTypeAudit(
             taskbarModule
         );
 
     Wh_Log(
-        L"IDENTITY_SIGNATURE_AUDIT_COMPLETE "
+        L"IDENTITY_TYPE_AUDIT_COMPLETE "
         L"processId=%lu "
         L"succeeded=%d",
         GetCurrentProcessId(),
@@ -317,7 +438,7 @@ BOOL Wh_ModInit() {
 
 void Wh_ModUninit() {
     Wh_Log(
-        L"Tray Add Path Analyzer 0.31.0 stopped "
+        L"Tray Add Path Analyzer 0.32.0 stopped "
         L"processId=%lu",
         GetCurrentProcessId()
     );
