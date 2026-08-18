@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              tray-add-path-analyzer
 // @name            Tray Add Path Analyzer
-// @description     Audits taskbar.dll symbols that use NotificationAreaIconIdentity.
-// @version         0.32.0
+// @description     Audits the 64-bit NotifyIconSettings bridge used to construct live NotificationAreaIcon2 objects.
+// @version         0.33.0
 // @author          Yusseter
 // @github          https://github.com/Yusseter
 // @homepage        https://github.com/Yusseter/tray-order-lock
@@ -15,32 +15,37 @@
 /*
 # Tray Add Path Analyzer
 
-Version 0.32.0 performs a read-only PDB symbol audit for
-NotificationAreaIconIdentity.
+Version 0.33.0 performs a read-only PDB symbol audit for the bridge between
+NotificationAreaIcon2 and the 64-bit NotifyIconSettings identity.
 
-Version 0.31.0 established the exact signature:
+Version 0.32.0 established that NotificationAreaIcon2 is constructed with:
 
-    public: struct NotificationAreaIconIdentity __cdecl
-    winrt::WindowsUdk::UI::Shell::implementation::
-    NotificationAreaIcon2::Identity(void) const
+    NotificationAreaIconIdentity &&
+    std::pair<unsigned __int64, shared registry HKEY> &
 
-The method therefore returns a user-defined structure by value. Its contents
-and its relationship to the 64-bit NotifyIconSettings/UIOrderList identity
-must be understood before the method can be invoked safely in production.
+It also established that NotificationAreaIconIdentity itself can be constructed
+from _TRAYNOTIFYDATAW.
 
-This version enumerates every taskbar.dll symbol whose undecorated or decorated
-name contains NotificationAreaIconIdentity.
+The first member of the pair is therefore a strong candidate for the 64-bit
+NotifyIconSettings/UIOrderList identity already used throughout the earlier
+tray-order research. That relationship must still be established directly
+before production code relies on it.
 
-Long symbol names are emitted in multiple chunks so DbgView does not silently
-truncate the information needed to reconstruct their complete signatures.
+This version enumerates symbols involving:
+
+- NotifyIconSettingsDatabase with 64-bit identity values.
+- The unsigned-64-bit + registry-HKEY pair.
+- NotificationAreaIcon2 construction with that pair.
+- UI-order lookup functions related to the same 64-bit identity.
+
+Long symbol names are emitted in chunks to avoid DbgView truncation.
 
 No discovered function is called or hooked.
 
 This version:
 
 - Installs no taskbar function hooks.
-- Calls no NotificationAreaIconIdentity functions.
-- Calls no NotificationAreaIcon2::Identity function.
+- Calls no private taskbar function.
 - Moves no tray icons.
 - Creates no tray icons.
 - Writes no registry values.
@@ -51,11 +56,12 @@ This version:
 #include <windows.h>
 #include <windhawk_utils.h>
 
+#include <cstddef>
 #include <cwchar>
 
 namespace {
 
-constexpr size_t kLogChunkLength =
+constexpr std::size_t kLogChunkLength =
     600;
 
 bool ContainsText(
@@ -72,58 +78,150 @@ bool ContainsText(
         nullptr;
 }
 
-bool IsIdentitySymbol(
-    const WH_FIND_SYMBOL& symbol
-) {
-    return
-        ContainsText(
-            symbol.symbol,
-            L"NotificationAreaIconIdentity"
-        ) ||
-        ContainsText(
-            symbol.symbolDecorated,
-            L"NotificationAreaIconIdentity"
-        );
-}
+struct MatchClassification {
+    bool notifyIconSettingsDatabase =
+        false;
 
-bool IsBridgeCandidate(
-    const WH_FIND_SYMBOL& symbol
-) {
-    const wchar_t* undecorated =
-        symbol.symbol;
+    bool pairWithUnsigned64 =
+        false;
 
-    if (!undecorated) {
-        return false;
+    bool registryHandle =
+        false;
+
+    bool notificationAreaIcon2 =
+        false;
+
+    bool uiOrder =
+        false;
+
+    bool relevant =
+        false;
+};
+
+MatchClassification ClassifyText(
+    const wchar_t* text
+) {
+    MatchClassification result;
+
+    if (!text) {
+        return result;
     }
 
-    return
+    result.notifyIconSettingsDatabase =
         ContainsText(
-            undecorated,
+            text,
             L"NotifyIconSettingsDatabase"
+        );
+
+    result.pairWithUnsigned64 =
+        ContainsText(
+            text,
+            L"pair<unsigned __int64"
         ) ||
         ContainsText(
-            undecorated,
-            L"UIOrder"
+            text,
+            L"?$pair@_K"
+        );
+
+    result.registryHandle =
+        ContainsText(
+            text,
+            L"HKEY__"
         ) ||
         ContainsText(
-            undecorated,
-            L"NotificationAreaIconManager"
+            text,
+            L"shared_any_t"
         ) ||
         ContainsText(
-            undecorated,
+            text,
+            L"RegCloseKey"
+        );
+
+    result.notificationAreaIcon2 =
+        ContainsText(
+            text,
             L"NotificationAreaIcon2"
+        );
+
+    result.uiOrder =
+        ContainsText(
+            text,
+            L"GetUIOrderForIcon"
         ) ||
         ContainsText(
-            undecorated,
-            L"Settings"
+            text,
+            L"UIOrder"
+        );
+
+    result.relevant =
+        (
+            result.pairWithUnsigned64 &&
+            result.registryHandle
         ) ||
-        ContainsText(
-            undecorated,
-            L"operator"
+        (
+            result.notifyIconSettingsDatabase &&
+            (
+                result.pairWithUnsigned64 ||
+                ContainsText(
+                    text,
+                    L"unsigned __int64"
+                ) ||
+                result.registryHandle ||
+                result.uiOrder
+            )
         ) ||
-        ContainsText(
-            undecorated,
-            L"find<"
+        (
+            result.notificationAreaIcon2 &&
+            result.pairWithUnsigned64
+        );
+
+    return result;
+}
+
+MatchClassification MergeClassification(
+    const MatchClassification& left,
+    const MatchClassification& right
+) {
+    MatchClassification result;
+
+    result.notifyIconSettingsDatabase =
+        left.notifyIconSettingsDatabase ||
+        right.notifyIconSettingsDatabase;
+
+    result.pairWithUnsigned64 =
+        left.pairWithUnsigned64 ||
+        right.pairWithUnsigned64;
+
+    result.registryHandle =
+        left.registryHandle ||
+        right.registryHandle;
+
+    result.notificationAreaIcon2 =
+        left.notificationAreaIcon2 ||
+        right.notificationAreaIcon2;
+
+    result.uiOrder =
+        left.uiOrder ||
+        right.uiOrder;
+
+    result.relevant =
+        left.relevant ||
+        right.relevant;
+
+    return result;
+}
+
+MatchClassification ClassifySymbol(
+    const WH_FIND_SYMBOL& symbol
+) {
+    return
+        MergeClassification(
+            ClassifyText(
+                symbol.symbol
+            ),
+            ClassifyText(
+                symbol.symbolDecorated
+            )
         );
 }
 
@@ -134,7 +232,7 @@ void LogTextChunks(
 ) {
     if (!text) {
         Wh_Log(
-            L"IDENTITY_SYMBOL_TEXT "
+            L"SETTINGS_BRIDGE_TEXT "
             L"match=%llu "
             L"field=%s "
             L"chunk=1 "
@@ -148,14 +246,14 @@ void LogTextChunks(
         return;
     }
 
-    const size_t length =
+    const std::size_t length =
         std::wcslen(
             text
         );
 
     if (length == 0) {
         Wh_Log(
-            L"IDENTITY_SYMBOL_TEXT "
+            L"SETTINGS_BRIDGE_TEXT "
             L"match=%llu "
             L"field=%s "
             L"chunk=1 "
@@ -173,17 +271,17 @@ void LogTextChunks(
         0;
 
     for (
-        size_t offset = 0;
+        std::size_t offset = 0;
         offset < length;
         offset += kLogChunkLength
     ) {
         chunkNumber++;
 
-        const size_t remaining =
+        const std::size_t remaining =
             length -
             offset;
 
-        const size_t chunkLength =
+        const std::size_t chunkLength =
             remaining <
                     kLogChunkLength
                 ? remaining
@@ -206,13 +304,8 @@ void LogTextChunks(
         ] =
             L'\0';
 
-        const bool finalChunk =
-            offset +
-                chunkLength >=
-            length;
-
         Wh_Log(
-            L"IDENTITY_SYMBOL_TEXT "
+            L"SETTINGS_BRIDGE_TEXT "
             L"match=%llu "
             L"field=%s "
             L"chunk=%llu "
@@ -225,7 +318,11 @@ void LogTextChunks(
             static_cast<unsigned long long>(
                 offset
             ),
-            finalChunk
+            (
+                offset +
+                    chunkLength >=
+                length
+            )
                 ? 1
                 : 0,
             chunk
@@ -250,7 +347,7 @@ void LogTaskbarModule(
         );
 
     Wh_Log(
-        L"IDENTITY_TYPE_TASKBAR_MODULE "
+        L"SETTINGS_BRIDGE_TASKBAR_MODULE "
         L"address=%p "
         L"path=\"%s\"",
         module,
@@ -266,7 +363,7 @@ void LogTaskbarModule(
     );
 }
 
-bool RunIdentityTypeAudit(
+bool RunSettingsBridgeAudit(
     HMODULE taskbarModule
 ) {
     WH_FIND_SYMBOL_OPTIONS options{};
@@ -293,7 +390,7 @@ bool RunIdentityTypeAudit(
 
     if (!search) {
         Wh_Log(
-            L"IDENTITY_TYPE_ENUMERATION_FAILED "
+            L"SETTINGS_BRIDGE_ENUMERATION_FAILED "
             L"lastError=%lu",
             GetLastError()
         );
@@ -307,39 +404,83 @@ bool RunIdentityTypeAudit(
     unsigned long long matches =
         0;
 
-    unsigned long long bridgeCandidates =
+    unsigned long long databaseMatches =
+        0;
+
+    unsigned long long pairMatches =
+        0;
+
+    unsigned long long icon2Matches =
+        0;
+
+    unsigned long long uiOrderMatches =
         0;
 
     do {
         scanned++;
 
-        if (
-            !IsIdentitySymbol(
+        const MatchClassification classification =
+            ClassifySymbol(
                 symbol
-            )
+            );
+
+        if (
+            !classification.relevant
         ) {
             continue;
         }
 
         matches++;
 
-        const bool bridgeCandidate =
-            IsBridgeCandidate(
-                symbol
-            );
+        if (
+            classification.notifyIconSettingsDatabase
+        ) {
+            databaseMatches++;
+        }
 
-        if (bridgeCandidate) {
-            bridgeCandidates++;
+        if (
+            classification.pairWithUnsigned64 &&
+            classification.registryHandle
+        ) {
+            pairMatches++;
+        }
+
+        if (
+            classification.notificationAreaIcon2
+        ) {
+            icon2Matches++;
+        }
+
+        if (
+            classification.uiOrder
+        ) {
+            uiOrderMatches++;
         }
 
         Wh_Log(
-            L"IDENTITY_SYMBOL_BEGIN "
+            L"SETTINGS_BRIDGE_SYMBOL_BEGIN "
             L"match=%llu "
             L"address=%p "
-            L"bridgeCandidate=%d",
+            L"database=%d "
+            L"pairUnsigned64=%d "
+            L"registryHandle=%d "
+            L"notificationAreaIcon2=%d "
+            L"uiOrder=%d",
             matches,
             symbol.address,
-            bridgeCandidate
+            classification.notifyIconSettingsDatabase
+                ? 1
+                : 0,
+            classification.pairWithUnsigned64
+                ? 1
+                : 0,
+            classification.registryHandle
+                ? 1
+                : 0,
+            classification.notificationAreaIcon2
+                ? 1
+                : 0,
+            classification.uiOrder
                 ? 1
                 : 0
         );
@@ -357,7 +498,7 @@ bool RunIdentityTypeAudit(
         );
 
         Wh_Log(
-            L"IDENTITY_SYMBOL_END "
+            L"SETTINGS_BRIDGE_SYMBOL_END "
             L"match=%llu",
             matches
         );
@@ -373,13 +514,19 @@ bool RunIdentityTypeAudit(
     );
 
     Wh_Log(
-        L"IDENTITY_TYPE_SUMMARY "
+        L"SETTINGS_BRIDGE_SUMMARY "
         L"scanned=%llu "
         L"matches=%llu "
-        L"bridgeCandidates=%llu",
+        L"databaseMatches=%llu "
+        L"pairMatches=%llu "
+        L"icon2Matches=%llu "
+        L"uiOrderMatches=%llu",
         scanned,
         matches,
-        bridgeCandidates
+        databaseMatches,
+        pairMatches,
+        icon2Matches,
+        uiOrderMatches
     );
 
     return
@@ -391,7 +538,7 @@ bool RunIdentityTypeAudit(
 
 BOOL Wh_ModInit() {
     Wh_Log(
-        L"Tray Add Path Analyzer 0.32.0 initializing "
+        L"Tray Add Path Analyzer 0.33.0 initializing "
         L"processId=%lu",
         GetCurrentProcessId()
     );
@@ -403,7 +550,7 @@ BOOL Wh_ModInit() {
 
     if (!taskbarModule) {
         Wh_Log(
-            L"IDENTITY_TYPE_TASKBAR_NOT_READY "
+            L"SETTINGS_BRIDGE_TASKBAR_NOT_READY "
             L"processId=%lu",
             GetCurrentProcessId()
         );
@@ -416,12 +563,12 @@ BOOL Wh_ModInit() {
     );
 
     const bool succeeded =
-        RunIdentityTypeAudit(
+        RunSettingsBridgeAudit(
             taskbarModule
         );
 
     Wh_Log(
-        L"IDENTITY_TYPE_AUDIT_COMPLETE "
+        L"SETTINGS_BRIDGE_AUDIT_COMPLETE "
         L"processId=%lu "
         L"succeeded=%d",
         GetCurrentProcessId(),
@@ -438,7 +585,7 @@ BOOL Wh_ModInit() {
 
 void Wh_ModUninit() {
     Wh_Log(
-        L"Tray Add Path Analyzer 0.32.0 stopped "
+        L"Tray Add Path Analyzer 0.33.0 stopped "
         L"processId=%lu",
         GetCurrentProcessId()
     );
