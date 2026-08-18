@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              tray-order-lock
 // @name            Tray Order Lock
-// @description     Prevents manual reordering of Windows 11 notification-area icons while enabled.
-// @version         0.1.0
+// @description     Controls Windows 11 notification-area icon reordering.
+// @version         0.2.0
 // @author          Yusseter
 // @github          https://github.com/Yusseter
 // @homepage        https://github.com/Yusseter/tray-order-lock
@@ -15,28 +15,23 @@
 /*
 # Tray Order Lock
 
-Prevents manual reordering of Windows 11 notification-area icons while the mod
-is enabled.
+Controls reordering of Windows 11 notification-area icons.
 
-Arrange the tray icons in the desired order before enabling the mod. Dragging an
-icon to another position will then be rejected without changing the live order
-or its persistent `UIOrderList` registry data.
+The 0.2.0 development line starts by preserving the existing
+"lock all reordering" behavior while moving taskbar initialization to the
+Explorer-restart-safe bootstrap validated by the tray-order research tools.
 
-Disabling the mod immediately restores normal tray icon dragging.
+At this stage:
 
-## Scope
+- Manual tray icon move requests are still blocked.
+- Existing tray order is not modified.
+- No UIOrderList registry values are written.
+- Application icon creation and removal are not changed.
+- Taskbar hooks initialize correctly whether Shell_TrayWnd already exists or
+  is created after the mod is injected into Explorer.
 
-Version 0.1.0:
-
-- Blocks manual tray icon move requests.
-- Does not modify or replace the existing saved tray order.
-- Does not write to the registry.
-- Does not interfere with applications adding or removing their tray icons.
-- Targets 64-bit Windows 11 Explorer.
-
-The implementation hooks the verified
-`ITaskbarModel5::MoveNotificationAreaIcon` ABI boundary in `taskbar.dll` and
-returns `S_OK` without forwarding move requests to the original function.
+The later 0.2.0 implementation will build the persistent order-preservation
+behavior on top of this initialization path.
 */
 // ==/WindhawkModReadme==
 
@@ -47,12 +42,6 @@ returns `S_OK` without forwarding move requests to the original function.
 
 namespace {
 
-std::atomic<bool> g_taskbarModuleHooked =
-    false;
-
-std::atomic<unsigned long long> g_blockedMoveCount =
-    0;
-
 using TaskbarModel_MoveNotificationAreaIcon_t =
     int(__cdecl*)(
         void* pThis,
@@ -61,9 +50,25 @@ using TaskbarModel_MoveNotificationAreaIcon_t =
         unsigned int index
     );
 
+using CreateWindowExW_t =
+    decltype(&CreateWindowExW);
+
 TaskbarModel_MoveNotificationAreaIcon_t
     TaskbarModel_MoveNotificationAreaIcon_Original =
         nullptr;
+
+CreateWindowExW_t
+    CreateWindowExW_Original =
+        nullptr;
+
+std::atomic<bool> g_taskbarHooksInitializing =
+    false;
+
+std::atomic<bool> g_taskbarHooksInitialized =
+    false;
+
+std::atomic<unsigned long long> g_blockedMoveCount =
+    0;
 
 int __cdecl
 TaskbarModel_MoveNotificationAreaIcon_Hook(
@@ -72,25 +77,25 @@ TaskbarModel_MoveNotificationAreaIcon_Hook(
     int location,
     unsigned int index
 ) {
-    static_cast<void>(
-        pThis
-    );
+    static_cast<void>(pThis);
 
-    static_cast<void>(
-        notificationAreaIconAbi
-    );
+    const unsigned long long moveNumber =
+        g_blockedMoveCount.fetch_add(
+            1,
+            std::memory_order_relaxed
+        ) +
+        1;
 
-    static_cast<void>(
-        location
-    );
-
-    static_cast<void>(
+    Wh_Log(
+        L"TRAY_ORDER_LOCK_MOVE_BLOCKED "
+        L"move=%llu "
+        L"iconAbi=%p "
+        L"location=%d "
+        L"index=%u",
+        moveNumber,
+        notificationAreaIconAbi,
+        location,
         index
-    );
-
-    g_blockedMoveCount.fetch_add(
-        1,
-        std::memory_order_relaxed
     );
 
     return
@@ -103,7 +108,7 @@ void LogTaskbarModuleInformation(
     HMODULE module
 ) {
     wchar_t modulePath[
-        MAX_PATH
+        32768
     ]{};
 
     const DWORD length =
@@ -123,8 +128,9 @@ void LogTaskbarModuleInformation(
             )
     ) {
         Wh_Log(
-            L"taskbar.dll module=%p; "
-            L"path unavailable",
+            L"TRAY_ORDER_LOCK_TASKBAR_MODULE "
+            L"address=%p "
+            L"path=\"<unavailable>\"",
             module
         );
 
@@ -132,7 +138,8 @@ void LogTaskbarModuleInformation(
     }
 
     Wh_Log(
-        L"taskbar.dll module=%p; "
+        L"TRAY_ORDER_LOCK_TASKBAR_MODULE "
+        L"address=%p "
         L"path=\"%s\"",
         module,
         modulePath
@@ -140,7 +147,7 @@ void LogTaskbarModuleInformation(
 }
 
 bool HookTaskbarSymbols(
-    HMODULE module
+    HMODULE taskbarModule
 ) {
     WindhawkUtils::SYMBOL_HOOK
         symbolHooks[] = {
@@ -155,7 +162,7 @@ bool HookTaskbarSymbols(
 
     if (
         !WindhawkUtils::HookSymbols(
-            module,
+            taskbarModule,
             symbolHooks,
             ARRAYSIZE(
                 symbolHooks
@@ -163,44 +170,110 @@ bool HookTaskbarSymbols(
         )
     ) {
         Wh_Log(
-            L"Failed to locate or hook "
-            L"ITaskbarModel5::"
-            L"MoveNotificationAreaIcon"
+            L"TRAY_ORDER_LOCK_TASKBAR_HOOK_REGISTRATION_FAILED"
         );
 
         return false;
     }
 
     LogTaskbarModuleInformation(
-        module
-    );
-
-    Wh_Log(
-        L"Tray icon move lock installed"
+        taskbarModule
     );
 
     return true;
 }
 
-HMODULE GetTaskbarModuleHandle() {
-    return
-        GetModuleHandleW(
-            L"taskbar.dll"
-        );
-}
-
-bool TryHookTaskbarModule(
-    HMODULE module,
-    bool applyHookOperations
+BOOL CALLBACK
+EnumCurrentProcessTaskbarWindowProc(
+    HWND hWnd,
+    LPARAM lParam
 ) {
+    DWORD processId =
+        0;
+
     if (
-        !module
+        !GetWindowThreadProcessId(
+            hWnd,
+            &processId
+        ) ||
+        processId !=
+            GetCurrentProcessId()
     ) {
-        return false;
+        return TRUE;
+    }
+
+    wchar_t className[
+        64
+    ]{};
+
+    if (
+        GetClassNameW(
+            hWnd,
+            className,
+            ARRAYSIZE(
+                className
+            )
+        ) ==
+        0
+    ) {
+        return TRUE;
     }
 
     if (
-        g_taskbarModuleHooked.load(
+        _wcsicmp(
+            className,
+            L"Shell_TrayWnd"
+        ) !=
+        0
+    ) {
+        return TRUE;
+    }
+
+    *reinterpret_cast<HWND*>(
+        lParam
+    ) =
+        hWnd;
+
+    return FALSE;
+}
+
+HWND FindCurrentProcessTaskbarWindow() {
+    HWND result =
+        nullptr;
+
+    EnumWindows(
+        EnumCurrentProcessTaskbarWindowProc,
+        reinterpret_cast<LPARAM>(
+            &result
+        )
+    );
+
+    return result;
+}
+
+void LogReady() {
+    Wh_Log(
+        L"TRAY_ORDER_LOCK_READY "
+        L"processId=%lu "
+        L"taskbarHooksInitialized=%d "
+        L"blockedMoves=%llu",
+        GetCurrentProcessId(),
+        g_taskbarHooksInitialized.load(
+            std::memory_order_acquire
+        )
+            ? 1
+            : 0,
+        g_blockedMoveCount.load(
+            std::memory_order_acquire
+        )
+    );
+}
+
+bool TryInitializeTaskbarHooks(
+    bool applyImmediately
+) {
+    if (
+        g_taskbarHooksInitialized.load(
             std::memory_order_acquire
         )
     ) {
@@ -211,22 +284,29 @@ bool TryHookTaskbarModule(
         false;
 
     if (
-        !g_taskbarModuleHooked
+        !g_taskbarHooksInitializing
              .compare_exchange_strong(
                  expected,
                  true,
                  std::memory_order_acq_rel
              )
     ) {
-        return true;
+        return false;
     }
 
-    if (
-        !HookTaskbarSymbols(
-            module
-        )
-    ) {
-        g_taskbarModuleHooked.store(
+    HMODULE taskbarModule =
+        GetModuleHandleW(
+            L"taskbar.dll"
+        );
+
+    if (!taskbarModule) {
+        Wh_Log(
+            L"TRAY_ORDER_LOCK_TASKBAR_DLL_NOT_READY "
+            L"processId=%lu",
+            GetCurrentProcessId()
+        );
+
+        g_taskbarHooksInitializing.store(
             false,
             std::memory_order_release
         );
@@ -235,151 +315,166 @@ bool TryHookTaskbarModule(
     }
 
     if (
-        applyHookOperations
+        !HookTaskbarSymbols(
+            taskbarModule
+        )
     ) {
-        Wh_ApplyHookOperations();
+        g_taskbarHooksInitializing.store(
+            false,
+            std::memory_order_release
+        );
+
+        return false;
+    }
+
+    if (applyImmediately) {
+        if (
+            !Wh_ApplyHookOperations()
+        ) {
+            Wh_Log(
+                L"TRAY_ORDER_LOCK_TASKBAR_HOOK_APPLY_FAILED "
+                L"processId=%lu",
+                GetCurrentProcessId()
+            );
+
+            g_taskbarHooksInitializing.store(
+                false,
+                std::memory_order_release
+            );
+
+            return false;
+        }
+    }
+
+    g_taskbarHooksInitialized.store(
+        true,
+        std::memory_order_release
+    );
+
+    g_taskbarHooksInitializing.store(
+        false,
+        std::memory_order_release
+    );
+
+    if (applyImmediately) {
+        Wh_Log(
+            L"TRAY_ORDER_LOCK_TASKBAR_HOOKS_READY "
+            L"processId=%lu "
+            L"applyImmediately=1",
+            GetCurrentProcessId()
+        );
+    } else {
+        Wh_Log(
+            L"TRAY_ORDER_LOCK_TASKBAR_HOOKS_REGISTERED "
+            L"processId=%lu "
+            L"applyImmediately=0",
+            GetCurrentProcessId()
+        );
     }
 
     return true;
 }
 
-void HandleLoadedModule(
-    HMODULE module,
-    LPCWSTR requestedPath
+HWND WINAPI CreateWindowExW_Hook(
+    DWORD dwExStyle,
+    LPCWSTR lpClassName,
+    LPCWSTR lpWindowName,
+    DWORD dwStyle,
+    int X,
+    int Y,
+    int nWidth,
+    int nHeight,
+    HWND hWndParent,
+    HMENU hMenu,
+    HINSTANCE hInstance,
+    LPVOID lpParam
 ) {
+    HWND hWnd =
+        CreateWindowExW_Original(
+            dwExStyle,
+            lpClassName,
+            lpWindowName,
+            dwStyle,
+            X,
+            Y,
+            nWidth,
+            nHeight,
+            hWndParent,
+            hMenu,
+            hInstance,
+            lpParam
+        );
+
     if (
-        !module ||
-        g_taskbarModuleHooked.load(
+        !hWnd ||
+        !lpClassName ||
+        IS_INTRESOURCE(
+            lpClassName
+        ) ||
+        _wcsicmp(
+            lpClassName,
+            L"Shell_TrayWnd"
+        ) !=
+            0
+    ) {
+        return hWnd;
+    }
+
+    DWORD processId =
+        0;
+
+    GetWindowThreadProcessId(
+        hWnd,
+        &processId
+    );
+
+    if (
+        processId !=
+        GetCurrentProcessId()
+    ) {
+        return hWnd;
+    }
+
+    Wh_Log(
+        L"TRAY_ORDER_LOCK_SHELL_WINDOW_CREATED "
+        L"processId=%lu "
+        L"hWnd=%p",
+        processId,
+        hWnd
+    );
+
+    if (
+        !g_taskbarHooksInitialized.load(
             std::memory_order_acquire
         )
     ) {
-        return;
-    }
-
-    HMODULE taskbarModule =
-        GetTaskbarModuleHandle();
-
-    if (
-        !taskbarModule ||
-        taskbarModule !=
-            module
-    ) {
-        return;
-    }
-
-    Wh_Log(
-        L"Detected taskbar.dll load; "
-        L"requestedPath=\"%s\"",
-        requestedPath
-            ? requestedPath
-            : L"<null>"
-    );
-
-    TryHookTaskbarModule(
-        module,
-        true
-    );
-}
-
-using LoadLibraryExW_t =
-    decltype(
-        &LoadLibraryExW
-    );
-
-LoadLibraryExW_t LoadLibraryExW_Original =
-    nullptr;
-
-HMODULE WINAPI LoadLibraryExW_Hook(
-    LPCWSTR libraryPath,
-    HANDLE file,
-    DWORD flags
-) {
-    HMODULE module =
-        LoadLibraryExW_Original(
-            libraryPath,
-            file,
-            flags
-        );
-
-    if (
-        module
-    ) {
-        HandleLoadedModule(
-            module,
-            libraryPath
-        );
-    }
-
-    return module;
-}
-
-bool HookModuleLoader() {
-    HMODULE kernelBase =
-        GetModuleHandleW(
-            L"kernelbase.dll"
-        );
-
-    if (
-        !kernelBase
-    ) {
-        Wh_Log(
-            L"kernelbase.dll is unavailable"
-        );
-
-        return false;
-    }
-
-    auto loadLibraryExW =
-        reinterpret_cast<
-            LoadLibraryExW_t
-        >(
-            GetProcAddress(
-                kernelBase,
-                "LoadLibraryExW"
+        if (
+            TryInitializeTaskbarHooks(
+                true
             )
-        );
-
-    if (
-        !loadLibraryExW
-    ) {
-        Wh_Log(
-            L"LoadLibraryExW is unavailable"
-        );
-
-        return false;
+        ) {
+            LogReady();
+        }
     }
 
-    if (
-        !WindhawkUtils::
-            Wh_SetFunctionHookT(
-                loadLibraryExW,
-                LoadLibraryExW_Hook,
-                &LoadLibraryExW_Original
-            )
-    ) {
-        Wh_Log(
-            L"Failed to hook LoadLibraryExW"
-        );
-
-        return false;
-    }
-
-    Wh_Log(
-        L"taskbar.dll is not loaded yet; "
-        L"waiting for module load"
-    );
-
-    return true;
+    return hWnd;
 }
 
 }  // namespace
 
 BOOL Wh_ModInit() {
     Wh_Log(
-        L"Tray Order Lock 0.1.0 initializing"
+        L"Tray Order Lock 0.2.0 initializing "
+        L"processId=%lu",
+        GetCurrentProcessId()
     );
 
-    g_taskbarModuleHooked.store(
+    g_taskbarHooksInitializing.store(
+        false,
+        std::memory_order_release
+    );
+
+    g_taskbarHooksInitialized.store(
         false,
         std::memory_order_release
     );
@@ -389,55 +484,104 @@ BOOL Wh_ModInit() {
         std::memory_order_release
     );
 
-    HMODULE taskbarModule =
-        GetTaskbarModuleHandle();
-
     if (
-        taskbarModule
+        !WindhawkUtils::SetFunctionHook(
+            CreateWindowExW,
+            CreateWindowExW_Hook,
+            &CreateWindowExW_Original
+        )
     ) {
-        return
-            TryHookTaskbarModule(
-                taskbarModule,
-                false
-            )
-                ? TRUE
-                : FALSE;
+        Wh_Log(
+            L"TRAY_ORDER_LOCK_CREATEWINDOW_HOOK_FAILED "
+            L"processId=%lu",
+            GetCurrentProcessId()
+        );
+
+        return FALSE;
     }
 
-    return
-        HookModuleLoader()
-            ? TRUE
-            : FALSE;
+    HWND existingTaskbarWindow =
+        FindCurrentProcessTaskbarWindow();
+
+    if (existingTaskbarWindow) {
+        Wh_Log(
+            L"TRAY_ORDER_LOCK_EXISTING_PRIMARY_SHELL "
+            L"processId=%lu "
+            L"hWnd=%p",
+            GetCurrentProcessId(),
+            existingTaskbarWindow
+        );
+
+        if (
+            !TryInitializeTaskbarHooks(
+                false
+            )
+        ) {
+            return FALSE;
+        }
+    } else {
+        Wh_Log(
+            L"TRAY_ORDER_LOCK_TASKBAR_HOOKS_DEFERRED "
+            L"processId=%lu "
+            L"reason=\"Shell_TrayWnd-not-created-yet\"",
+            GetCurrentProcessId()
+        );
+    }
+
+    Wh_Log(
+        L"TRAY_ORDER_LOCK_BOOTSTRAP_READY "
+        L"processId=%lu "
+        L"taskbarHooksInitialized=%d",
+        GetCurrentProcessId(),
+        g_taskbarHooksInitialized.load(
+            std::memory_order_acquire
+        )
+            ? 1
+            : 0
+    );
+
+    return TRUE;
 }
 
 void Wh_ModAfterInit() {
     if (
-        g_taskbarModuleHooked.load(
+        !g_taskbarHooksInitialized.load(
             std::memory_order_acquire
         )
     ) {
-        return;
+        HWND taskbarWindow =
+            FindCurrentProcessTaskbarWindow();
+
+        if (taskbarWindow) {
+            TryInitializeTaskbarHooks(
+                true
+            );
+        }
     }
 
-    HMODULE taskbarModule =
-        GetTaskbarModuleHandle();
-
     if (
-        taskbarModule
+        g_taskbarHooksInitialized.load(
+            std::memory_order_acquire
+        )
     ) {
-        TryHookTaskbarModule(
-            taskbarModule,
-            true
-        );
+        LogReady();
     }
 }
 
 void Wh_ModUninit() {
     Wh_Log(
         L"Tray Order Lock stopped; "
-        L"blockedMoves=%llu",
+        L"processId=%lu "
+        L"blockedMoves=%llu "
+        L"taskbarHooksInitialized=%d",
+        GetCurrentProcessId(),
         g_blockedMoveCount.load(
             std::memory_order_relaxed
+        ),
+        g_taskbarHooksInitialized.load(
+            std::memory_order_relaxed
         )
+            ? 1
+            : 0
     );
 }
