@@ -20,27 +20,30 @@ Controls Windows 11 notification-area icon ordering.
 
 Version 0.2.0 is currently under development.
 
-This checkpoint provides two ordering behaviors:
+Current development functionality:
 
 - Lock all reordering:
   preserves the 0.1.0 behavior and blocks tray move requests.
 - Preserve order, allow manual changes:
-  allows Windows to perform the user's tray move, detects the Windows identity
-  which actually moved, converts it to a logical tray identity, updates the
-  canonical relation and persists the result in Windhawk local storage.
+  allows Windows to perform manual tray moves and learns the resulting
+  canonical logical order.
+- Canonical logical order is persisted in Windhawk local storage and survives
+  complete Explorer process restarts.
+- Live NotificationAreaIcon2 objects are mapped to the 64-bit
+  NotifyIconSettings/UIOrderList identity used by Windows.
+- Manual moves use the live ABI-to-Windows-identity mapping whenever available.
+- A conservative UIOrderList before/after comparison remains as a fallback for
+  icons which were constructed before the live mapping hook was installed.
 
 Logical identity currently uses:
 
 - IconGuid when available.
 - Otherwise, version-normalized executable path plus UID.
 
-Ambiguous or unsupported identities are not learned automatically.
+Ambiguous or unsupported logical identities are not learned automatically.
 
-The persisted canonical order survives a complete Explorer process restart.
-
-Automatic restoration of replacement identities is intentionally not enabled
-in this development checkpoint. It will be added after the production
-canonical-state path is validated.
+Automatic replacement restoration is not enabled yet. The validated live
+identity mapping added in this checkpoint will be used by that next layer.
 */
 // ==/WindhawkModReadme==
 
@@ -56,6 +59,7 @@ canonical-state path is validated.
 
 #include <windows.h>
 #include <objbase.h>
+#include <unknwn.h>
 #include <windhawk_utils.h>
 
 #include <algorithm>
@@ -100,12 +104,29 @@ struct UIOrderSnapshot {
 
 struct LogicalSnapshotEntry {
     std::uint64_t identity = 0;
-
     std::wstring key;
-
-    bool unique =
-        false;
+    bool unique = false;
 };
+
+struct LiveIdentityMapping {
+    void* implementation = nullptr;
+    void* abi = nullptr;
+    std::uint64_t windowsIdentity = 0;
+};
+
+using NotificationAreaIcon2_Constructor_t =
+    void(__cdecl*)(
+        void* pThis,
+        void* identityRvalueReference,
+        void* settingsPairReference
+    );
+
+using NotificationAreaIcon_QueryInterface_t =
+    int(__cdecl*)(
+        void* iconImplementation,
+        const GUID& interfaceId,
+        void** result
+    );
 
 using TaskbarModel_MoveNotificationAreaIcon_t =
     int(__cdecl*)(
@@ -117,6 +138,21 @@ using TaskbarModel_MoveNotificationAreaIcon_t =
 
 using CreateWindowExW_t =
     decltype(&CreateWindowExW);
+
+NotificationAreaIcon2_Constructor_t
+    NotificationAreaIcon2_Constructor_Target =
+        nullptr;
+
+NotificationAreaIcon2_Constructor_t
+    NotificationAreaIcon2_Constructor_Original =
+        nullptr;
+
+NotificationAreaIcon_QueryInterface_t
+    NotificationAreaIcon_QueryInterface =
+        nullptr;
+
+const GUID* g_notificationAreaIconInterfaceId =
+    nullptr;
 
 TaskbarModel_MoveNotificationAreaIcon_t
     TaskbarModel_MoveNotificationAreaIcon_Original =
@@ -149,12 +185,28 @@ std::atomic<unsigned long long> g_learnedMoveCount =
 std::atomic<unsigned long long> g_skippedLearningCount =
     0;
 
+std::atomic<unsigned long long> g_liveConstructorCount =
+    0;
+
+std::atomic<unsigned long long> g_liveMappingCount =
+    0;
+
+std::atomic<unsigned long long> g_liveMappedMoveCount =
+    0;
+
+std::atomic<unsigned long long> g_registryFallbackMoveCount =
+    0;
+
 std::mutex g_canonicalMutex;
 
 std::vector<std::wstring> g_canonicalOrder;
 
 bool g_canonicalLoadedFromStorage =
     false;
+
+std::mutex g_liveMappingMutex;
+
+std::vector<LiveIdentityMapping> g_liveMappings;
 
 std::wstring ToLower(
     std::wstring value
@@ -409,6 +461,20 @@ std::wstring BuildVersionNormalizedPath(
     }
 
     return result;
+}
+
+bool ContainsText(
+    const wchar_t* text,
+    const wchar_t* expected
+) {
+    return
+        text &&
+        expected &&
+        std::wcsstr(
+            text,
+            expected
+        ) !=
+        nullptr;
 }
 
 std::wstring MakeTrayEntrySubkey(
@@ -858,6 +924,28 @@ UIOrderSnapshot CaptureUIOrderSnapshot() {
         ERROR_MORE_DATA;
 
     return snapshot;
+}
+
+unsigned int CountIdentity(
+    const UIOrderSnapshot& snapshot,
+    std::uint64_t identity
+) {
+    if (
+        !snapshot.valid ||
+        identity ==
+            0
+    ) {
+        return 0;
+    }
+
+    return
+        static_cast<unsigned int>(
+            std::count(
+                snapshot.entries.begin(),
+                snapshot.entries.end(),
+                identity
+            )
+        );
 }
 
 std::vector<LogicalSnapshotEntry>
@@ -1386,38 +1474,50 @@ FindLogicalEntry(
     return nullptr;
 }
 
+void RecordLearningSkip(
+    const wchar_t* reason,
+    std::uint64_t identity,
+    const wchar_t* identitySource
+) {
+    const unsigned long long skipped =
+        g_skippedLearningCount.fetch_add(
+            1,
+            std::memory_order_relaxed
+        ) +
+        1;
+
+    Wh_Log(
+        L"TRAY_ORDER_LOCK_MANUAL_LEARN_SKIPPED "
+        L"skip=%llu "
+        L"reason=\"%s\" "
+        L"identity=%llu "
+        L"identitySource=%s",
+        skipped,
+        reason,
+        static_cast<unsigned long long>(
+            identity
+        ),
+        identitySource
+            ? identitySource
+            : L"unknown"
+    );
+}
+
 void LearnManualMove(
-    const UIOrderSnapshot& before,
     const UIOrderSnapshot& after,
+    std::uint64_t movedIdentity,
+    const wchar_t* identitySource,
     int location,
     unsigned int requestedIndex
 ) {
-    const std::uint64_t movedIdentity =
-        FindSingleMovedIdentity(
-            before,
-            after
-        );
-
     if (
         movedIdentity ==
         0
     ) {
-        const unsigned long long skipped =
-            g_skippedLearningCount.fetch_add(
-                1,
-                std::memory_order_relaxed
-            ) +
-            1;
-
-        Wh_Log(
-            L"TRAY_ORDER_LOCK_MANUAL_LEARN_SKIPPED "
-            L"skip=%llu "
-            L"reason=\"single-moved-identity-not-resolved\" "
-            L"location=%d "
-            L"requestedIndex=%u",
-            skipped,
-            location,
-            requestedIndex
+        RecordLearningSkip(
+            L"moved-identity-not-resolved",
+            0,
+            identitySource
         );
 
         return;
@@ -1440,22 +1540,10 @@ void LearnManualMove(
         !movedEntry->unique ||
         movedEntry->key.empty()
     ) {
-        const unsigned long long skipped =
-            g_skippedLearningCount.fetch_add(
-                1,
-                std::memory_order_relaxed
-            ) +
-            1;
-
-        Wh_Log(
-            L"TRAY_ORDER_LOCK_MANUAL_LEARN_SKIPPED "
-            L"skip=%llu "
-            L"reason=\"logical-identity-not-unique\" "
-            L"identity=%llu",
-            skipped,
-            static_cast<unsigned long long>(
-                movedIdentity
-            )
+        RecordLearningSkip(
+            L"logical-identity-not-unique",
+            movedIdentity,
+            identitySource
         );
 
         return;
@@ -1485,6 +1573,12 @@ void LearnManualMove(
         movedIndex ==
         logicalAfter.size()
     ) {
+        RecordLearningSkip(
+            L"moved-identity-not-in-logical-snapshot",
+            movedIdentity,
+            identitySource
+        );
+
         return;
     }
 
@@ -1540,22 +1634,10 @@ void LearnManualMove(
         precedingKey.empty() &&
         followingKey.empty()
     ) {
-        const unsigned long long skipped =
-            g_skippedLearningCount.fetch_add(
-                1,
-                std::memory_order_relaxed
-            ) +
-            1;
-
-        Wh_Log(
-            L"TRAY_ORDER_LOCK_MANUAL_LEARN_SKIPPED "
-            L"skip=%llu "
-            L"reason=\"no-reliable-logical-neighbor\" "
-            L"identity=%llu",
-            skipped,
-            static_cast<unsigned long long>(
-                movedIdentity
-            )
+        RecordLearningSkip(
+            L"no-reliable-logical-neighbor",
+            movedIdentity,
+            identitySource
         );
 
         return;
@@ -1642,22 +1724,10 @@ void LearnManualMove(
     if (
         !relationApplied
     ) {
-        const unsigned long long skipped =
-            g_skippedLearningCount.fetch_add(
-                1,
-                std::memory_order_relaxed
-            ) +
-            1;
-
-        Wh_Log(
-            L"TRAY_ORDER_LOCK_MANUAL_LEARN_SKIPPED "
-            L"skip=%llu "
-            L"reason=\"canonical-neighbor-not-found\" "
-            L"identity=%llu",
-            skipped,
-            static_cast<unsigned long long>(
-                movedIdentity
-            )
+        RecordLearningSkip(
+            L"canonical-neighbor-not-found",
+            movedIdentity,
+            identitySource
         );
 
         return;
@@ -1677,6 +1747,7 @@ void LearnManualMove(
         L"TRAY_ORDER_LOCK_MANUAL_MOVE_LEARNED "
         L"learned=%llu "
         L"identity=%llu "
+        L"identitySource=%s "
         L"precedingFound=%d "
         L"followingFound=%d "
         L"canonicalEntries=%llu "
@@ -1687,6 +1758,7 @@ void LearnManualMove(
         static_cast<unsigned long long>(
             movedIdentity
         ),
+        identitySource,
         precedingKey.empty()
             ? 0
             : 1,
@@ -1702,6 +1774,223 @@ void LearnManualMove(
         location,
         requestedIndex
     );
+}
+
+void StoreLiveMapping(
+    const LiveIdentityMapping& mapping
+) {
+    std::lock_guard<std::mutex> lock(
+        g_liveMappingMutex
+    );
+
+    for (
+        LiveIdentityMapping& existing :
+        g_liveMappings
+    ) {
+        if (
+            existing.abi ==
+                mapping.abi ||
+            existing.implementation ==
+                mapping.implementation
+        ) {
+            existing =
+                mapping;
+
+            return;
+        }
+    }
+
+    g_liveMappings.push_back(
+        mapping
+    );
+}
+
+bool LookupLiveMapping(
+    void* abi,
+    LiveIdentityMapping* mapping
+) {
+    if (
+        !abi ||
+        !mapping
+    ) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(
+        g_liveMappingMutex
+    );
+
+    for (
+        const LiveIdentityMapping& candidate :
+        g_liveMappings
+    ) {
+        if (
+            candidate.abi ==
+            abi
+        ) {
+            *mapping =
+                candidate;
+
+            return true;
+        }
+    }
+
+    return false;
+}
+
+void __cdecl
+NotificationAreaIcon2_Constructor_Hook(
+    void* pThis,
+    void* identityRvalueReference,
+    void* settingsPairReference
+) {
+    const unsigned long long callNumber =
+        g_liveConstructorCount.fetch_add(
+            1,
+            std::memory_order_relaxed
+        ) +
+        1;
+
+    std::uint64_t windowsIdentity =
+        0;
+
+    if (
+        settingsPairReference
+    ) {
+        std::memcpy(
+            &windowsIdentity,
+            settingsPairReference,
+            sizeof(
+                windowsIdentity
+            )
+        );
+    }
+
+    NotificationAreaIcon2_Constructor_Original(
+        pThis,
+        identityRvalueReference,
+        settingsPairReference
+    );
+
+    void* queriedAbi =
+        nullptr;
+
+    HRESULT queryResult =
+        E_FAIL;
+
+    if (
+        NotificationAreaIcon_QueryInterface &&
+        g_notificationAreaIconInterfaceId
+    ) {
+        queryResult =
+            static_cast<HRESULT>(
+                NotificationAreaIcon_QueryInterface(
+                    pThis,
+                    *g_notificationAreaIconInterfaceId,
+                    &queriedAbi
+                )
+            );
+    }
+
+    const UIOrderSnapshot current =
+        CaptureUIOrderSnapshot();
+
+    const unsigned int identityOccurrences =
+        CountIdentity(
+            current,
+            windowsIdentity
+        );
+
+    const std::wstring logicalKey =
+        windowsIdentity !=
+                0
+            ? BuildLogicalKey(
+                  windowsIdentity
+              )
+            : L"";
+
+    Wh_Log(
+        L"TRAY_ORDER_LOCK_LIVE_IDENTITY_CONSTRUCTED "
+        L"call=%llu "
+        L"implementation=%p "
+        L"abi=%p "
+        L"windowsIdentity=%llu "
+        L"queryResult=0x%08X "
+        L"uiOrderOccurrences=%u "
+        L"logicalSupported=%d",
+        callNumber,
+        pThis,
+        queriedAbi,
+        static_cast<unsigned long long>(
+            windowsIdentity
+        ),
+        static_cast<unsigned int>(
+            queryResult
+        ),
+        identityOccurrences,
+        logicalKey.empty()
+            ? 0
+            : 1
+    );
+
+    if (
+        SUCCEEDED(
+            queryResult
+        ) &&
+        queriedAbi &&
+        windowsIdentity !=
+            0
+    ) {
+        LiveIdentityMapping mapping;
+
+        mapping.implementation =
+            pThis;
+
+        mapping.abi =
+            queriedAbi;
+
+        mapping.windowsIdentity =
+            windowsIdentity;
+
+        StoreLiveMapping(
+            mapping
+        );
+
+        const unsigned long long mapped =
+            g_liveMappingCount.fetch_add(
+                1,
+                std::memory_order_relaxed
+            ) +
+            1;
+
+        Wh_Log(
+            L"TRAY_ORDER_LOCK_LIVE_IDENTITY_MAP "
+            L"mapped=%llu "
+            L"implementation=%p "
+            L"abi=%p "
+            L"windowsIdentity=%llu "
+            L"uiOrderOccurrences=%u "
+            L"logicalSupported=%d",
+            mapped,
+            pThis,
+            queriedAbi,
+            static_cast<unsigned long long>(
+                windowsIdentity
+            ),
+            identityOccurrences,
+            logicalKey.empty()
+                ? 0
+                : 1
+        );
+    }
+
+    if (
+        queriedAbi
+    ) {
+        reinterpret_cast<IUnknown*>(
+            queriedAbi
+        )->Release();
+    }
 }
 
 OrderingBehavior GetOrderingBehavior() {
@@ -1745,14 +2034,20 @@ void LoadSettings() {
         std::memory_order_release
     );
 
-    Wh_Log(
-        L"TRAY_ORDER_LOCK_SETTINGS "
-        L"orderingBehavior=%s",
+    if (
         behavior ==
-                OrderingBehavior::PreserveManual
-            ? L"preserveManual"
-            : L"lockAll"
-    );
+        OrderingBehavior::PreserveManual
+    ) {
+        Wh_Log(
+            L"TRAY_ORDER_LOCK_SETTINGS "
+            L"orderingBehavior=preserveManual"
+        );
+    } else {
+        Wh_Log(
+            L"TRAY_ORDER_LOCK_SETTINGS "
+            L"orderingBehavior=lockAll"
+        );
+    }
 }
 
 int __cdecl
@@ -1791,8 +2086,24 @@ TaskbarModel_MoveNotificationAreaIcon_Hook(
             );
     }
 
+    LiveIdentityMapping liveMapping;
+
+    const bool liveMapped =
+        LookupLiveMapping(
+            notificationAreaIconAbi,
+            &liveMapping
+        );
+
     const UIOrderSnapshot before =
         CaptureUIOrderSnapshot();
+
+    const unsigned int liveIdentityOccurrencesBefore =
+        liveMapped
+            ? CountIdentity(
+                  before,
+                  liveMapping.windowsIdentity
+              )
+            : 0;
 
     const unsigned long long moveNumber =
         g_allowedMoveCount.fetch_add(
@@ -1805,12 +2116,24 @@ TaskbarModel_MoveNotificationAreaIcon_Hook(
         L"TRAY_ORDER_LOCK_MOVE_ALLOWED "
         L"move=%llu "
         L"iconAbi=%p "
+        L"liveMapped=%d "
+        L"liveWindowsIdentity=%llu "
+        L"liveIdentityOccurrencesBefore=%u "
         L"location=%d "
         L"index=%u "
         L"beforeValid=%d "
         L"beforeEntries=%llu",
         moveNumber,
         notificationAreaIconAbi,
+        liveMapped
+            ? 1
+            : 0,
+        static_cast<unsigned long long>(
+            liveMapped
+                ? liveMapping.windowsIdentity
+                : 0
+        ),
+        liveIdentityOccurrencesBefore,
         location,
         index,
         before.valid
@@ -1832,6 +2155,12 @@ TaskbarModel_MoveNotificationAreaIcon_Hook(
     const UIOrderSnapshot after =
         CaptureUIOrderSnapshot();
 
+    const bool orderChanged =
+        before.valid &&
+        after.valid &&
+        before.entries !=
+            after.entries;
+
     Wh_Log(
         L"TRAY_ORDER_LOCK_MOVE_ALLOWED_COMPLETE "
         L"move=%llu "
@@ -1849,34 +2178,335 @@ TaskbarModel_MoveNotificationAreaIcon_Hook(
         static_cast<unsigned long long>(
             after.entries.size()
         ),
-        before.valid &&
-                after.valid &&
-                before.entries !=
-                    after.entries
+        orderChanged
             ? 1
             : 0
     );
 
     if (
-        SUCCEEDED(
+        !SUCCEEDED(
             static_cast<HRESULT>(
                 result
             )
-        ) &&
-        before.valid &&
-        after.valid &&
-        before.entries !=
-            after.entries
+        ) ||
+        !orderChanged
     ) {
-        LearnManualMove(
-            before,
-            after,
-            location,
-            index
-        );
+        return result;
     }
 
+    std::uint64_t movedIdentity =
+        0;
+
+    const wchar_t* identitySource =
+        L"unresolved";
+
+    if (
+        liveMapped &&
+        liveMapping.windowsIdentity !=
+            0 &&
+        CountIdentity(
+            after,
+            liveMapping.windowsIdentity
+        ) ==
+            1
+    ) {
+        movedIdentity =
+            liveMapping.windowsIdentity;
+
+        identitySource =
+            L"live-map";
+
+        g_liveMappedMoveCount.fetch_add(
+            1,
+            std::memory_order_relaxed
+        );
+    } else {
+        movedIdentity =
+            FindSingleMovedIdentity(
+                before,
+                after
+            );
+
+        if (
+            movedIdentity !=
+            0
+        ) {
+            identitySource =
+                L"registry-diff";
+
+            g_registryFallbackMoveCount.fetch_add(
+                1,
+                std::memory_order_relaxed
+            );
+        }
+    }
+
+    Wh_Log(
+        L"TRAY_ORDER_LOCK_MANUAL_IDENTITY "
+        L"move=%llu "
+        L"identity=%llu "
+        L"source=%s "
+        L"liveMapped=%d "
+        L"liveWindowsIdentity=%llu",
+        moveNumber,
+        static_cast<unsigned long long>(
+            movedIdentity
+        ),
+        identitySource,
+        liveMapped
+            ? 1
+            : 0,
+        static_cast<unsigned long long>(
+            liveMapped
+                ? liveMapping.windowsIdentity
+                : 0
+        )
+    );
+
+    LearnManualMove(
+        after,
+        movedIdentity,
+        identitySource,
+        location,
+        index
+    );
+
     return result;
+}
+
+bool IsNotificationAreaIconConstructorSymbol(
+    const wchar_t* symbol
+) {
+    return
+        symbol &&
+        ContainsText(
+            symbol,
+            L"public: __cdecl "
+        ) &&
+        ContainsText(
+            symbol,
+            L"NotificationAreaIcon2::NotificationAreaIcon2("
+        ) &&
+        ContainsText(
+            symbol,
+            L"NotificationAreaIconIdentity &&"
+        ) &&
+        ContainsText(
+            symbol,
+            L"pair<unsigned __int64"
+        ) &&
+        ContainsText(
+            symbol,
+            L"HKEY__"
+        );
+}
+
+bool IsNotificationAreaIconQueryInterfaceSymbol(
+    const wchar_t* symbol
+) {
+    return
+        ContainsText(
+            symbol,
+            L"root_implements<"
+        ) &&
+        ContainsText(
+            symbol,
+            L"NotificationAreaIcon2"
+        ) &&
+        ContainsText(
+            symbol,
+            L">::query_interface("
+        ) &&
+        ContainsText(
+            symbol,
+            L"winrt::guid const &"
+        ) &&
+        ContainsText(
+            symbol,
+            L"void * *"
+        ) &&
+        !ContainsText(
+            symbol,
+            L"query_interface_common"
+        ) &&
+        !ContainsText(
+            symbol,
+            L"query_interface_tearoff"
+        );
+}
+
+bool IsNotificationAreaIconIidSymbol(
+    const wchar_t* symbol
+) {
+    constexpr wchar_t expected[] =
+        L"struct guid::guid const "
+        L"winrt::impl::guid_v<struct "
+        L"winrt::WindowsUdk::UI::Shell::"
+        L"INotificationAreaIcon>";
+
+    return
+        symbol &&
+        std::wcscmp(
+            symbol,
+            expected
+        ) ==
+            0;
+}
+
+bool ResolveLiveIdentitySymbols(
+    HMODULE taskbarModule
+) {
+    NotificationAreaIcon2_Constructor_Target =
+        nullptr;
+
+    NotificationAreaIcon_QueryInterface =
+        nullptr;
+
+    g_notificationAreaIconInterfaceId =
+        nullptr;
+
+    WH_FIND_SYMBOL_OPTIONS options{};
+
+    options.optionsSize =
+        sizeof(
+            options
+        );
+
+    options.symbolServer =
+        nullptr;
+
+    options.noUndecoratedSymbols =
+        FALSE;
+
+    WH_FIND_SYMBOL symbol{};
+
+    HANDLE search =
+        Wh_FindFirstSymbol(
+            taskbarModule,
+            &options,
+            &symbol
+        );
+
+    if (
+        !search
+    ) {
+        Wh_Log(
+            L"TRAY_ORDER_LOCK_LIVE_IDENTITY_SYMBOL_ENUMERATION_FAILED "
+            L"lastError=%lu",
+            GetLastError()
+        );
+
+        return false;
+    }
+
+    unsigned int constructorMatches =
+        0;
+
+    unsigned int queryInterfaceMatches =
+        0;
+
+    unsigned int iidMatches =
+        0;
+
+    do {
+        if (
+            IsNotificationAreaIconConstructorSymbol(
+                symbol.symbol
+            )
+        ) {
+            constructorMatches++;
+
+            if (
+                !NotificationAreaIcon2_Constructor_Target
+            ) {
+                NotificationAreaIcon2_Constructor_Target =
+                    reinterpret_cast<
+                        NotificationAreaIcon2_Constructor_t
+                    >(
+                        symbol.address
+                    );
+            }
+        }
+
+        if (
+            IsNotificationAreaIconQueryInterfaceSymbol(
+                symbol.symbol
+            )
+        ) {
+            queryInterfaceMatches++;
+
+            if (
+                !NotificationAreaIcon_QueryInterface
+            ) {
+                NotificationAreaIcon_QueryInterface =
+                    reinterpret_cast<
+                        NotificationAreaIcon_QueryInterface_t
+                    >(
+                        symbol.address
+                    );
+            }
+        }
+
+        if (
+            IsNotificationAreaIconIidSymbol(
+                symbol.symbol
+            )
+        ) {
+            iidMatches++;
+
+            if (
+                !g_notificationAreaIconInterfaceId
+            ) {
+                g_notificationAreaIconInterfaceId =
+                    reinterpret_cast<
+                        const GUID*
+                    >(
+                        symbol.address
+                    );
+            }
+        }
+    } while (
+        Wh_FindNextSymbol(
+            search,
+            &symbol
+        )
+    );
+
+    Wh_FindCloseSymbol(
+        search
+    );
+
+    Wh_Log(
+        L"TRAY_ORDER_LOCK_LIVE_IDENTITY_SYMBOLS "
+        L"constructorMatches=%u "
+        L"queryInterfaceMatches=%u "
+        L"iidMatches=%u "
+        L"constructor=%p "
+        L"queryInterface=%p "
+        L"interfaceId=%p",
+        constructorMatches,
+        queryInterfaceMatches,
+        iidMatches,
+        NotificationAreaIcon2_Constructor_Target,
+        NotificationAreaIcon_QueryInterface,
+        g_notificationAreaIconInterfaceId
+    );
+
+    if (
+        constructorMatches !=
+            1 ||
+        !NotificationAreaIcon2_Constructor_Target ||
+        !NotificationAreaIcon_QueryInterface ||
+        !g_notificationAreaIconInterfaceId
+    ) {
+        Wh_Log(
+            L"TRAY_ORDER_LOCK_LIVE_IDENTITY_SYMBOLS_UNAVAILABLE"
+        );
+
+        return false;
+    }
+
+    return true;
 }
 
 void LogTaskbarModuleInformation(
@@ -1896,7 +2526,8 @@ void LogTaskbarModuleInformation(
         );
 
     if (
-        length == 0 ||
+        length ==
+            0 ||
         length >=
             ARRAYSIZE(
                 modulePath
@@ -1924,6 +2555,28 @@ void LogTaskbarModuleInformation(
 bool HookTaskbarSymbols(
     HMODULE taskbarModule
 ) {
+    if (
+        !ResolveLiveIdentitySymbols(
+            taskbarModule
+        )
+    ) {
+        return false;
+    }
+
+    if (
+        !WindhawkUtils::SetFunctionHook(
+            NotificationAreaIcon2_Constructor_Target,
+            NotificationAreaIcon2_Constructor_Hook,
+            &NotificationAreaIcon2_Constructor_Original
+        )
+    ) {
+        Wh_Log(
+            L"TRAY_ORDER_LOCK_LIVE_IDENTITY_CONSTRUCTOR_HOOK_FAILED"
+        );
+
+        return false;
+    }
+
     WindhawkUtils::SYMBOL_HOOK
         symbolHooks[] = {
             {
@@ -1953,6 +2606,12 @@ bool HookTaskbarSymbols(
 
     LogTaskbarModuleInformation(
         taskbarModule
+    );
+
+    Wh_Log(
+        L"TRAY_ORDER_LOCK_LIVE_IDENTITY_HOOK_REGISTERED "
+        L"constructor=%p",
+        NotificationAreaIcon2_Constructor_Target
     );
 
     return true;
@@ -2026,6 +2685,15 @@ HWND FindCurrentProcessTaskbarWindow() {
     return result;
 }
 
+std::size_t GetLiveMappingSize() {
+    std::lock_guard<std::mutex> lock(
+        g_liveMappingMutex
+    );
+
+    return
+        g_liveMappings.size();
+}
+
 void LogReady() {
     std::size_t canonicalEntries =
         0;
@@ -2045,30 +2713,63 @@ void LogReady() {
             g_canonicalLoadedFromStorage;
     }
 
-    Wh_Log(
-        L"TRAY_ORDER_LOCK_READY "
-        L"processId=%lu "
-        L"taskbarHooksInitialized=%d "
-        L"orderingBehavior=%s "
-        L"canonicalEntries=%llu "
-        L"canonicalLoadedFromStorage=%d",
-        GetCurrentProcessId(),
-        g_taskbarHooksInitialized.load(
-            std::memory_order_acquire
-        )
-            ? 1
-            : 0,
+    const std::size_t liveMappings =
+        GetLiveMappingSize();
+
+    if (
         GetOrderingBehavior() ==
-                OrderingBehavior::PreserveManual
-            ? L"preserveManual"
-            : L"lockAll",
-        static_cast<unsigned long long>(
-            canonicalEntries
-        ),
-        loadedFromStorage
-            ? 1
-            : 0
-    );
+        OrderingBehavior::PreserveManual
+    ) {
+        Wh_Log(
+            L"TRAY_ORDER_LOCK_READY "
+            L"processId=%lu "
+            L"taskbarHooksInitialized=%d "
+            L"orderingBehavior=preserveManual "
+            L"canonicalEntries=%llu "
+            L"canonicalLoadedFromStorage=%d "
+            L"liveMappings=%llu",
+            GetCurrentProcessId(),
+            g_taskbarHooksInitialized.load(
+                std::memory_order_acquire
+            )
+                ? 1
+                : 0,
+            static_cast<unsigned long long>(
+                canonicalEntries
+            ),
+            loadedFromStorage
+                ? 1
+                : 0,
+            static_cast<unsigned long long>(
+                liveMappings
+            )
+        );
+    } else {
+        Wh_Log(
+            L"TRAY_ORDER_LOCK_READY "
+            L"processId=%lu "
+            L"taskbarHooksInitialized=%d "
+            L"orderingBehavior=lockAll "
+            L"canonicalEntries=%llu "
+            L"canonicalLoadedFromStorage=%d "
+            L"liveMappings=%llu",
+            GetCurrentProcessId(),
+            g_taskbarHooksInitialized.load(
+                std::memory_order_acquire
+            )
+                ? 1
+                : 0,
+            static_cast<unsigned long long>(
+                canonicalEntries
+            ),
+            loadedFromStorage
+                ? 1
+                : 0,
+            static_cast<unsigned long long>(
+                liveMappings
+            )
+        );
+    }
 }
 
 bool TryInitializeTaskbarHooks(
@@ -2168,14 +2869,16 @@ bool TryInitializeTaskbarHooks(
         Wh_Log(
             L"TRAY_ORDER_LOCK_TASKBAR_HOOKS_READY "
             L"processId=%lu "
-            L"applyImmediately=1",
+            L"applyImmediately=1 "
+            L"liveIdentityMapping=1",
             GetCurrentProcessId()
         );
     } else {
         Wh_Log(
             L"TRAY_ORDER_LOCK_TASKBAR_HOOKS_REGISTERED "
             L"processId=%lu "
-            L"applyImmediately=0",
+            L"applyImmediately=0 "
+            L"liveIdentityMapping=1",
             GetCurrentProcessId()
         );
     }
@@ -2307,6 +3010,34 @@ BOOL Wh_ModInit() {
         std::memory_order_release
     );
 
+    g_liveConstructorCount.store(
+        0,
+        std::memory_order_release
+    );
+
+    g_liveMappingCount.store(
+        0,
+        std::memory_order_release
+    );
+
+    g_liveMappedMoveCount.store(
+        0,
+        std::memory_order_release
+    );
+
+    g_registryFallbackMoveCount.store(
+        0,
+        std::memory_order_release
+    );
+
+    {
+        std::lock_guard<std::mutex> lock(
+            g_liveMappingMutex
+        );
+
+        g_liveMappings.clear();
+    }
+
     LoadSettings();
 
     InitializeCanonicalState();
@@ -2420,6 +3151,9 @@ void Wh_ModUninit() {
             g_canonicalOrder.size();
     }
 
+    const std::size_t liveMappings =
+        GetLiveMappingSize();
+
     Wh_Log(
         L"Tray Order Lock stopped; "
         L"processId=%lu "
@@ -2427,6 +3161,11 @@ void Wh_ModUninit() {
         L"allowedMoves=%llu "
         L"learnedMoves=%llu "
         L"skippedLearning=%llu "
+        L"liveConstructors=%llu "
+        L"liveMappingsObserved=%llu "
+        L"liveMappingsStored=%llu "
+        L"liveMappedMoves=%llu "
+        L"registryFallbackMoves=%llu "
         L"canonicalEntries=%llu "
         L"taskbarHooksInitialized=%d",
         GetCurrentProcessId(),
@@ -2440,6 +3179,21 @@ void Wh_ModUninit() {
             std::memory_order_relaxed
         ),
         g_skippedLearningCount.load(
+            std::memory_order_relaxed
+        ),
+        g_liveConstructorCount.load(
+            std::memory_order_relaxed
+        ),
+        g_liveMappingCount.load(
+            std::memory_order_relaxed
+        ),
+        static_cast<unsigned long long>(
+            liveMappings
+        ),
+        g_liveMappedMoveCount.load(
+            std::memory_order_relaxed
+        ),
+        g_registryFallbackMoveCount.load(
             std::memory_order_relaxed
         ),
         static_cast<unsigned long long>(
