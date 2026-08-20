@@ -90,6 +90,9 @@ constexpr wchar_t kCanonicalStorageHeader[] =
 constexpr std::size_t kMaximumStoredOrderChars =
     262144;
 
+constexpr int kOverflowLocation =
+    1;
+
 enum class OrderingBehavior {
     LockAll = 0,
     PreserveManual = 1,
@@ -114,6 +117,30 @@ struct LiveIdentityMapping {
     std::uint64_t windowsIdentity = 0;
 };
 
+struct LiveOverflowEntry {
+    std::uint64_t windowsIdentity = 0;
+    std::wstring logicalKey;
+
+    bool mapped = false;
+    bool uniqueLogical = false;
+};
+
+struct LiveOverflowSnapshot {
+    bool valid = false;
+
+    HRESULT getterResult = E_FAIL;
+    HRESULT vectorQueryResult = E_FAIL;
+    HRESULT sizeResult = E_FAIL;
+
+    unsigned int size = 0;
+    unsigned int mappedEntries = 0;
+
+    bool targetFound = false;
+    unsigned int targetIndex = 0;
+
+    std::vector<LiveOverflowEntry> entries;
+};
+
 using NotificationAreaIcon2_Constructor_t =
     void(__cdecl*)(
         void* pThis,
@@ -126,6 +153,31 @@ using NotificationAreaIcon_QueryInterface_t =
         void* iconImplementation,
         const GUID& interfaceId,
         void** result
+    );
+
+using NotificationAreaIconManager_AddVisible_t =
+    void(__cdecl*)(
+        void* pThis,
+        void* iconImplementation
+    );
+
+using TaskbarModel_GetOverflowIcons_t =
+    int(__cdecl*)(
+        void* pThis,
+        void** result
+    );
+
+using Vector_GetAt_t =
+    HRESULT(STDMETHODCALLTYPE*)(
+        void* pThis,
+        unsigned int index,
+        void** value
+    );
+
+using Vector_GetSize_t =
+    HRESULT(STDMETHODCALLTYPE*)(
+        void* pThis,
+        unsigned int* size
     );
 
 using TaskbarModel_MoveNotificationAreaIcon_t =
@@ -151,16 +203,30 @@ NotificationAreaIcon_QueryInterface_t
     NotificationAreaIcon_QueryInterface =
         nullptr;
 
-const GUID* g_notificationAreaIconInterfaceId =
-    nullptr;
+NotificationAreaIconManager_AddVisible_t
+    NotificationAreaIconManager_AddVisible_Original =
+        nullptr;
+
+TaskbarModel_GetOverflowIcons_t
+    TaskbarModel_GetOverflowIcons_Original =
+        nullptr;
 
 TaskbarModel_MoveNotificationAreaIcon_t
     TaskbarModel_MoveNotificationAreaIcon_Original =
         nullptr;
 
+const GUID* g_notificationAreaIconInterfaceId =
+    nullptr;
+
+const GUID* g_notificationAreaIconVectorId =
+    nullptr;
+
 CreateWindowExW_t
     CreateWindowExW_Original =
         nullptr;
+
+std::atomic<void*> g_taskbarModel6 =
+    nullptr;
 
 std::atomic<bool> g_taskbarHooksInitializing =
     false;
@@ -195,6 +261,24 @@ std::atomic<unsigned long long> g_liveMappedMoveCount =
     0;
 
 std::atomic<unsigned long long> g_registryFallbackMoveCount =
+    0;
+
+std::atomic<unsigned long long> g_visibleAddCount =
+    0;
+
+std::atomic<unsigned long long> g_overflowGetterCount =
+    0;
+
+std::atomic<unsigned long long> g_restoreObservationCount =
+    0;
+
+std::atomic<unsigned long long> g_restoreKnownCandidateCount =
+    0;
+
+std::atomic<unsigned long long> g_restoreNewIconCount =
+    0;
+
+std::atomic<unsigned long long> g_restoreSkipCount =
     0;
 
 std::mutex g_canonicalMutex;
@@ -1838,6 +1922,907 @@ bool LookupLiveMapping(
     return false;
 }
 
+bool LookupLiveMappingByImplementation(
+    void* implementation,
+    LiveIdentityMapping* mapping
+) {
+    if (
+        !implementation ||
+        !mapping
+    ) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(
+        g_liveMappingMutex
+    );
+
+    for (
+        const LiveIdentityMapping& candidate :
+        g_liveMappings
+    ) {
+        if (
+            candidate.implementation ==
+            implementation
+        ) {
+            *mapping =
+                candidate;
+
+            return true;
+        }
+    }
+
+    return false;
+}
+
+std::vector<std::wstring>
+GetCanonicalOrderSnapshot() {
+    std::lock_guard<std::mutex> lock(
+        g_canonicalMutex
+    );
+
+    return g_canonicalOrder;
+}
+
+void CacheTaskbarModel6(
+    void* taskbarModel6
+) {
+    if (!taskbarModel6) {
+        return;
+    }
+
+    void* current =
+        g_taskbarModel6.load(
+            std::memory_order_acquire
+        );
+
+    if (current == taskbarModel6) {
+        return;
+    }
+
+    reinterpret_cast<IUnknown*>(
+        taskbarModel6
+    )->AddRef();
+
+    void* previous =
+        g_taskbarModel6.exchange(
+            taskbarModel6,
+            std::memory_order_acq_rel
+        );
+
+    if (previous) {
+        reinterpret_cast<IUnknown*>(
+            previous
+        )->Release();
+    }
+
+    Wh_Log(
+        L"TRAY_ORDER_LOCK_OVERFLOW_MODEL_CAPTURED "
+        L"processId=%lu "
+        L"taskbarModel6=%p",
+        GetCurrentProcessId(),
+        taskbarModel6
+    );
+}
+
+void ReleaseCachedTaskbarModel6() {
+    void* taskbarModel6 =
+        g_taskbarModel6.exchange(
+            nullptr,
+            std::memory_order_acq_rel
+        );
+
+    if (taskbarModel6) {
+        reinterpret_cast<IUnknown*>(
+            taskbarModel6
+        )->Release();
+    }
+}
+
+bool IsSameComObject(
+    void* left,
+    void* right
+) {
+    if (
+        !left ||
+        !right
+    ) {
+        return false;
+    }
+
+    IUnknown* leftUnknown =
+        nullptr;
+
+    IUnknown* rightUnknown =
+        nullptr;
+
+    static const GUID kIUnknownGuid =
+    {
+        0x00000000,
+        0x0000,
+        0x0000,
+        {0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}
+    };
+    
+    const HRESULT leftResult =
+        reinterpret_cast<IUnknown*>(
+            left
+        )->QueryInterface(
+            kIUnknownGuid,
+            reinterpret_cast<void**>(
+                &leftUnknown
+            )
+        );
+    
+    const HRESULT rightResult =
+        reinterpret_cast<IUnknown*>(
+            right
+        )->QueryInterface(
+            kIUnknownGuid,
+            reinterpret_cast<void**>(
+                &rightUnknown
+            )
+        );
+
+    const bool same =
+        SUCCEEDED(leftResult) &&
+        SUCCEEDED(rightResult) &&
+        leftUnknown &&
+        rightUnknown &&
+        leftUnknown == rightUnknown;
+
+    if (leftUnknown) {
+        leftUnknown->Release();
+    }
+
+    if (rightUnknown) {
+        rightUnknown->Release();
+    }
+
+    return same;
+}
+
+LiveOverflowSnapshot CaptureLiveOverflowSnapshot(
+    void* targetAbi
+) {
+    LiveOverflowSnapshot snapshot;
+
+    void* taskbarModel6 =
+        g_taskbarModel6.load(
+            std::memory_order_acquire
+        );
+
+    if (
+        !taskbarModel6 ||
+        !TaskbarModel_GetOverflowIcons_Original ||
+        !g_notificationAreaIconVectorId
+    ) {
+        return snapshot;
+    }
+
+    void* collectionAbi =
+        nullptr;
+
+    snapshot.getterResult =
+        static_cast<HRESULT>(
+            TaskbarModel_GetOverflowIcons_Original(
+                taskbarModel6,
+                &collectionAbi
+            )
+        );
+
+    if (
+        FAILED(snapshot.getterResult) ||
+        !collectionAbi
+    ) {
+        return snapshot;
+    }
+
+    void* vectorAbi =
+        nullptr;
+
+    snapshot.vectorQueryResult =
+        reinterpret_cast<IUnknown*>(
+            collectionAbi
+        )->QueryInterface(
+            *g_notificationAreaIconVectorId,
+            &vectorAbi
+        );
+
+    if (
+        FAILED(snapshot.vectorQueryResult) ||
+        !vectorAbi
+    ) {
+        reinterpret_cast<IUnknown*>(
+            collectionAbi
+        )->Release();
+
+        return snapshot;
+    }
+
+    void** vtable =
+        *reinterpret_cast<void***>(
+            vectorAbi
+        );
+
+    if (!vtable) {
+        reinterpret_cast<IUnknown*>(
+            vectorAbi
+        )->Release();
+
+        reinterpret_cast<IUnknown*>(
+            collectionAbi
+        )->Release();
+
+        return snapshot;
+    }
+
+    Vector_GetAt_t getAt =
+        reinterpret_cast<Vector_GetAt_t>(
+            vtable[6]
+        );
+
+    Vector_GetSize_t getSize =
+        reinterpret_cast<Vector_GetSize_t>(
+            vtable[7]
+        );
+
+    if (
+        !getAt ||
+        !getSize
+    ) {
+        reinterpret_cast<IUnknown*>(
+            vectorAbi
+        )->Release();
+
+        reinterpret_cast<IUnknown*>(
+            collectionAbi
+        )->Release();
+
+        return snapshot;
+    }
+
+    snapshot.sizeResult =
+        getSize(
+            vectorAbi,
+            &snapshot.size
+        );
+
+    if (FAILED(snapshot.sizeResult)) {
+        reinterpret_cast<IUnknown*>(
+            vectorAbi
+        )->Release();
+
+        reinterpret_cast<IUnknown*>(
+            collectionAbi
+        )->Release();
+
+        return snapshot;
+    }
+
+    snapshot.entries.reserve(
+        snapshot.size
+    );
+
+    for (
+        unsigned int index = 0;
+        index < snapshot.size;
+        index++
+    ) {
+        LiveOverflowEntry entry;
+
+        void* itemAbi =
+            nullptr;
+
+        const HRESULT getAtResult =
+            getAt(
+                vectorAbi,
+                index,
+                &itemAbi
+            );
+
+        if (
+            SUCCEEDED(getAtResult) &&
+            itemAbi
+        ) {
+            if (
+                targetAbi &&
+                !snapshot.targetFound &&
+                IsSameComObject(
+                    itemAbi,
+                    targetAbi
+                )
+            ) {
+                snapshot.targetFound =
+                    true;
+
+                snapshot.targetIndex =
+                    index;
+            }
+
+            LiveIdentityMapping mapping;
+
+            if (
+                LookupLiveMapping(
+                    itemAbi,
+                    &mapping
+                )
+            ) {
+                entry.mapped =
+                    true;
+
+                entry.windowsIdentity =
+                    mapping.windowsIdentity;
+
+                entry.logicalKey =
+                    BuildLogicalKey(
+                        mapping.windowsIdentity
+                    );
+
+                snapshot.mappedEntries++;
+            }
+
+            reinterpret_cast<IUnknown*>(
+                itemAbi
+            )->Release();
+        }
+
+        snapshot.entries.push_back(
+            std::move(entry)
+        );
+    }
+
+    for (
+        std::size_t index = 0;
+        index < snapshot.entries.size();
+        index++
+    ) {
+        if (
+            snapshot.entries[index]
+                .logicalKey.empty()
+        ) {
+            continue;
+        }
+
+        unsigned int occurrences =
+            0;
+
+        for (
+            const LiveOverflowEntry& candidate :
+            snapshot.entries
+        ) {
+            if (
+                candidate.logicalKey ==
+                snapshot.entries[index]
+                    .logicalKey
+            ) {
+                occurrences++;
+            }
+        }
+
+        snapshot.entries[index]
+            .uniqueLogical =
+                occurrences == 1;
+    }
+
+    reinterpret_cast<IUnknown*>(
+        vectorAbi
+    )->Release();
+
+    reinterpret_cast<IUnknown*>(
+        collectionAbi
+    )->Release();
+
+    snapshot.valid =
+        true;
+
+    return snapshot;
+}
+
+bool FindUniqueOverflowIndexForKey(
+    const LiveOverflowSnapshot& snapshot,
+    const std::wstring& key,
+    unsigned int* index
+) {
+    if (
+        !snapshot.valid ||
+        key.empty() ||
+        !index
+    ) {
+        return false;
+    }
+
+    for (
+        unsigned int current = 0;
+        current < snapshot.entries.size();
+        current++
+    ) {
+        const LiveOverflowEntry& entry =
+            snapshot.entries[current];
+
+        if (
+            entry.uniqueLogical &&
+            entry.logicalKey == key
+        ) {
+            *index =
+                current;
+
+            return true;
+        }
+    }
+
+    return false;
+}
+
+unsigned int CountOverflowLogicalKey(
+    const LiveOverflowSnapshot& snapshot,
+    const std::wstring& key
+) {
+    if (
+        !snapshot.valid ||
+        key.empty()
+    ) {
+        return 0;
+    }
+
+    unsigned int count =
+        0;
+
+    for (
+        const LiveOverflowEntry& entry :
+        snapshot.entries
+    ) {
+        if (entry.logicalKey == key) {
+            count++;
+        }
+    }
+
+    return count;
+}
+
+unsigned int ClampVectorIndex(
+    unsigned int index,
+    unsigned int size
+) {
+    if (size == 0) {
+        return 0;
+    }
+
+    if (index >= size) {
+        return size - 1;
+    }
+
+    return index;
+}
+
+unsigned int CalculateImmediatelyAfterIndex(
+    unsigned int anchorIndex,
+    unsigned int targetIndex,
+    unsigned int size
+) {
+    const unsigned int desiredIndex =
+        targetIndex < anchorIndex
+            ? anchorIndex
+            : anchorIndex + 1;
+
+    return
+        ClampVectorIndex(
+            desiredIndex,
+            size
+        );
+}
+
+unsigned int CalculateImmediatelyBeforeIndex(
+    unsigned int anchorIndex,
+    unsigned int targetIndex,
+    unsigned int size
+) {
+    const unsigned int desiredIndex =
+        targetIndex < anchorIndex
+            ? anchorIndex - 1
+            : anchorIndex;
+
+    return
+        ClampVectorIndex(
+            desiredIndex,
+            size
+        );
+}
+
+void RecordRestoreObservationSkip(
+    const wchar_t* reason,
+    std::uint64_t windowsIdentity
+) {
+    const unsigned long long skip =
+        g_restoreSkipCount.fetch_add(
+            1,
+            std::memory_order_relaxed
+        ) +
+        1;
+
+    Wh_Log(
+        L"TRAY_ORDER_LOCK_RESTORE_OBSERVATION_SKIPPED "
+        L"skip=%llu "
+        L"reason=\"%s\" "
+        L"windowsIdentity=%llu",
+        skip,
+        reason,
+        static_cast<unsigned long long>(
+            windowsIdentity
+        )
+    );
+}
+
+void ObserveCanonicalRestoreDecision(
+    void* iconImplementation
+) {
+    if (
+        static_cast<OrderingBehavior>(
+            g_orderingBehavior.load(
+                std::memory_order_acquire
+            )
+        ) != OrderingBehavior::PreserveManual
+    ) {
+        return;
+    }
+
+    const unsigned long long observation =
+        g_restoreObservationCount.fetch_add(
+            1,
+            std::memory_order_relaxed
+        ) +
+        1;
+
+    LiveIdentityMapping targetMapping;
+
+    if (
+        !LookupLiveMappingByImplementation(
+            iconImplementation,
+            &targetMapping
+        )
+    ) {
+        RecordRestoreObservationSkip(
+            L"target-live-map-not-found",
+            0
+        );
+
+        return;
+    }
+
+    const std::wstring targetKey =
+        BuildLogicalKey(
+            targetMapping.windowsIdentity
+        );
+
+    if (targetKey.empty()) {
+        RecordRestoreObservationSkip(
+            L"target-logical-key-unsupported",
+            targetMapping.windowsIdentity
+        );
+
+        return;
+    }
+
+    const std::vector<std::wstring> canonical =
+        GetCanonicalOrderSnapshot();
+
+    const auto canonicalTarget =
+        std::find(
+            canonical.begin(),
+            canonical.end(),
+            targetKey
+        );
+
+    if (canonicalTarget == canonical.end()) {
+        const unsigned long long newIcon =
+            g_restoreNewIconCount.fetch_add(
+                1,
+                std::memory_order_relaxed
+            ) +
+            1;
+
+        Wh_Log(
+            L"TRAY_ORDER_LOCK_RESTORE_NEW_ICON "
+            L"observation=%llu "
+            L"newIcon=%llu "
+            L"windowsIdentity=%llu "
+            L"action=\"windows-default\"",
+            observation,
+            newIcon,
+            static_cast<unsigned long long>(
+                targetMapping.windowsIdentity
+            )
+        );
+
+        return;
+    }
+
+    const unsigned long long candidate =
+        g_restoreKnownCandidateCount.fetch_add(
+            1,
+            std::memory_order_relaxed
+        ) +
+        1;
+
+    const std::size_t canonicalIndex =
+        static_cast<std::size_t>(
+            std::distance(
+                canonical.begin(),
+                canonicalTarget
+            )
+        );
+
+    const LiveOverflowSnapshot overflow =
+        CaptureLiveOverflowSnapshot(
+            targetMapping.abi
+        );
+
+    if (!overflow.valid) {
+        RecordRestoreObservationSkip(
+            L"overflow-snapshot-unavailable",
+            targetMapping.windowsIdentity
+        );
+
+        return;
+    }
+
+    if (!overflow.targetFound) {
+        RecordRestoreObservationSkip(
+            L"target-not-in-overflow",
+            targetMapping.windowsIdentity
+        );
+
+        return;
+    }
+
+    const unsigned int targetOccurrences =
+        CountOverflowLogicalKey(
+            overflow,
+            targetKey
+        );
+
+    if (targetOccurrences != 1) {
+        RecordRestoreObservationSkip(
+            L"target-logical-key-not-unique-in-overflow",
+            targetMapping.windowsIdentity
+        );
+
+        return;
+    }
+
+    bool precedingFound =
+        false;
+
+    unsigned int precedingIndex =
+        0;
+
+    for (
+        std::size_t index = canonicalIndex;
+        index > 0;
+        index--
+    ) {
+        if (
+            FindUniqueOverflowIndexForKey(
+                overflow,
+                canonical[index - 1],
+                &precedingIndex
+            )
+        ) {
+            precedingFound =
+                true;
+
+            break;
+        }
+    }
+
+    bool followingFound =
+        false;
+
+    unsigned int followingIndex =
+        0;
+
+    for (
+        std::size_t index =
+            canonicalIndex + 1;
+        index < canonical.size();
+        index++
+    ) {
+        if (
+            FindUniqueOverflowIndexForKey(
+                overflow,
+                canonical[index],
+                &followingIndex
+            )
+        ) {
+            followingFound =
+                true;
+
+            break;
+        }
+    }
+
+    if (
+        !precedingFound &&
+        !followingFound
+    ) {
+        RecordRestoreObservationSkip(
+            L"no-live-canonical-neighbor",
+            targetMapping.windowsIdentity
+        );
+
+        return;
+    }
+
+    if (
+        precedingFound &&
+        followingFound &&
+        precedingIndex >= followingIndex
+    ) {
+        RecordRestoreObservationSkip(
+            L"live-neighbor-order-conflicts-with-canonical-order",
+            targetMapping.windowsIdentity
+        );
+
+        return;
+    }
+
+    bool relationSatisfied =
+        false;
+
+    unsigned int desiredIndex =
+        overflow.targetIndex;
+
+    if (
+        precedingFound &&
+        followingFound
+    ) {
+        relationSatisfied =
+            precedingIndex < overflow.targetIndex &&
+            overflow.targetIndex < followingIndex;
+
+        if (!relationSatisfied) {
+            desiredIndex =
+                CalculateImmediatelyAfterIndex(
+                    precedingIndex,
+                    overflow.targetIndex,
+                    overflow.size
+                );
+        }
+    }
+    else if (precedingFound) {
+        relationSatisfied =
+            precedingIndex + 1 ==
+            overflow.targetIndex;
+
+        if (!relationSatisfied) {
+            desiredIndex =
+                CalculateImmediatelyAfterIndex(
+                    precedingIndex,
+                    overflow.targetIndex,
+                    overflow.size
+                );
+        }
+    }
+    else {
+        relationSatisfied =
+            overflow.targetIndex + 1 ==
+            followingIndex;
+
+        if (!relationSatisfied) {
+            desiredIndex =
+                CalculateImmediatelyBeforeIndex(
+                    followingIndex,
+                    overflow.targetIndex,
+                    overflow.size
+                );
+        }
+    }
+
+    const bool wouldMove =
+        !relationSatisfied &&
+        desiredIndex != overflow.targetIndex;
+
+    Wh_Log(
+        L"TRAY_ORDER_LOCK_RESTORE_OBSERVATION "
+        L"observation=%llu "
+        L"candidate=%llu "
+        L"windowsIdentity=%llu "
+        L"canonicalIndex=%llu "
+        L"overflowSize=%u "
+        L"mappedOverflowEntries=%u "
+        L"targetIndex=%u "
+        L"precedingFound=%d "
+        L"precedingIndex=%u "
+        L"followingFound=%d "
+        L"followingIndex=%u "
+        L"relationSatisfied=%d "
+        L"wouldMove=%d "
+        L"computedTargetIndex=%u",
+        observation,
+        candidate,
+        static_cast<unsigned long long>(
+            targetMapping.windowsIdentity
+        ),
+        static_cast<unsigned long long>(
+            canonicalIndex
+        ),
+        overflow.size,
+        overflow.mappedEntries,
+        overflow.targetIndex,
+        precedingFound ? 1 : 0,
+        precedingIndex,
+        followingFound ? 1 : 0,
+        followingIndex,
+        relationSatisfied ? 1 : 0,
+        wouldMove ? 1 : 0,
+        desiredIndex
+    );
+}
+
+void __cdecl
+NotificationAreaIconManager_AddVisible_Hook(
+    void* pThis,
+    void* iconImplementation
+) {
+    const unsigned long long callNumber =
+        g_visibleAddCount.fetch_add(
+            1,
+            std::memory_order_relaxed
+        ) +
+        1;
+
+    NotificationAreaIconManager_AddVisible_Original(
+        pThis,
+        iconImplementation
+    );
+
+    Wh_Log(
+        L"TRAY_ORDER_LOCK_VISIBLE_ADD "
+        L"call=%llu "
+        L"manager=%p "
+        L"implementation=%p",
+        callNumber,
+        pThis,
+        iconImplementation
+    );
+
+    ObserveCanonicalRestoreDecision(
+        iconImplementation
+    );
+}
+
+int __cdecl
+TaskbarModel_GetOverflowIcons_Hook(
+    void* pThis,
+    void** result
+) {
+    g_overflowGetterCount.fetch_add(
+        1,
+        std::memory_order_relaxed
+    );
+
+    const int originalResult =
+        TaskbarModel_GetOverflowIcons_Original(
+            pThis,
+            result
+        );
+
+    if (
+        SUCCEEDED(
+            static_cast<HRESULT>(
+                originalResult
+            )
+        ) &&
+        result &&
+        *result
+    ) {
+        CacheTaskbarModel6(
+            pThis
+        );
+    }
+
+    return originalResult;
+}
 void __cdecl
 NotificationAreaIcon2_Constructor_Hook(
     void* pThis,
@@ -2353,6 +3338,24 @@ bool IsNotificationAreaIconIidSymbol(
             0;
 }
 
+bool IsNotificationAreaIconVectorIidSymbol(
+    const wchar_t* symbol
+) {
+    constexpr wchar_t expected[] =
+        L"struct guid::guid const "
+        L"winrt::impl::guid_v<struct "
+        L"winrt::Windows::Foundation::Collections::"
+        L"IVector<struct "
+        L"winrt::WindowsUdk::UI::Shell::"
+        L"NotificationAreaIcon> >";
+
+    return
+        symbol &&
+        std::wcscmp(
+            symbol,
+            expected
+        ) == 0;
+}
 bool ResolveLiveIdentitySymbols(
     HMODULE taskbarModule
 ) {
@@ -2363,6 +3366,9 @@ bool ResolveLiveIdentitySymbols(
         nullptr;
 
     g_notificationAreaIconInterfaceId =
+        nullptr;
+
+    g_notificationAreaIconVectorId =
         nullptr;
 
     WH_FIND_SYMBOL_OPTIONS options{};
@@ -2387,9 +3393,7 @@ bool ResolveLiveIdentitySymbols(
             &symbol
         );
 
-    if (
-        !search
-    ) {
+    if (!search) {
         Wh_Log(
             L"TRAY_ORDER_LOCK_LIVE_IDENTITY_SYMBOL_ENUMERATION_FAILED "
             L"lastError=%lu",
@@ -2406,6 +3410,9 @@ bool ResolveLiveIdentitySymbols(
         0;
 
     unsigned int iidMatches =
+        0;
+
+    unsigned int vectorIidMatches =
         0;
 
     do {
@@ -2465,6 +3472,25 @@ bool ResolveLiveIdentitySymbols(
                     );
             }
         }
+
+        if (
+            IsNotificationAreaIconVectorIidSymbol(
+                symbol.symbol
+            )
+        ) {
+            vectorIidMatches++;
+
+            if (
+                !g_notificationAreaIconVectorId
+            ) {
+                g_notificationAreaIconVectorId =
+                    reinterpret_cast<
+                        const GUID*
+                    >(
+                        symbol.address
+                    );
+            }
+        }
     } while (
         Wh_FindNextSymbol(
             search,
@@ -2481,23 +3507,27 @@ bool ResolveLiveIdentitySymbols(
         L"constructorMatches=%u "
         L"queryInterfaceMatches=%u "
         L"iidMatches=%u "
+        L"vectorIidMatches=%u "
         L"constructor=%p "
         L"queryInterface=%p "
-        L"interfaceId=%p",
+        L"interfaceId=%p "
+        L"vectorInterfaceId=%p",
         constructorMatches,
         queryInterfaceMatches,
         iidMatches,
+        vectorIidMatches,
         NotificationAreaIcon2_Constructor_Target,
         NotificationAreaIcon_QueryInterface,
-        g_notificationAreaIconInterfaceId
+        g_notificationAreaIconInterfaceId,
+        g_notificationAreaIconVectorId
     );
 
     if (
-        constructorMatches !=
-            1 ||
+        constructorMatches != 1 ||
         !NotificationAreaIcon2_Constructor_Target ||
         !NotificationAreaIcon_QueryInterface ||
-        !g_notificationAreaIconInterfaceId
+        !g_notificationAreaIconInterfaceId ||
+        !g_notificationAreaIconVectorId
     ) {
         Wh_Log(
             L"TRAY_ORDER_LOCK_LIVE_IDENTITY_SYMBOLS_UNAVAILABLE"
@@ -2508,7 +3538,6 @@ bool ResolveLiveIdentitySymbols(
 
     return true;
 }
-
 void LogTaskbarModuleInformation(
     HMODULE module
 ) {
@@ -2581,6 +3610,20 @@ bool HookTaskbarSymbols(
         symbolHooks[] = {
             {
                 {
+                    LR"(private: void __cdecl NotificationAreaIconManager2::AddIconToVisibleCollection(struct winrt::WindowsUdk::UI::Shell::implementation::NotificationAreaIcon2 *))"
+                },
+                &NotificationAreaIconManager_AddVisible_Original,
+                NotificationAreaIconManager_AddVisible_Hook,
+            },
+            {
+                {
+                    LR"(public: virtual int __cdecl winrt::impl::produce<struct winrt::WindowsUdk::UI::Shell::implementation::TaskbarModel,struct winrt::WindowsUdk::UI::Shell::ITaskbarModel6>::get_NotificationAreaOverflowIcons(void * *))"
+                },
+                &TaskbarModel_GetOverflowIcons_Original,
+                TaskbarModel_GetOverflowIcons_Hook,
+            },
+            {
+                {
                     LR"(public: virtual int __cdecl winrt::impl::produce<struct winrt::WindowsUdk::UI::Shell::implementation::TaskbarModel,struct winrt::WindowsUdk::UI::Shell::ITaskbarModel5>::MoveNotificationAreaIcon(void *,int,unsigned int))"
                 },
                 &TaskbarModel_MoveNotificationAreaIcon_Original,
@@ -2610,13 +3653,13 @@ bool HookTaskbarSymbols(
 
     Wh_Log(
         L"TRAY_ORDER_LOCK_LIVE_IDENTITY_HOOK_REGISTERED "
-        L"constructor=%p",
+        L"constructor=%p "
+        L"restoreObservation=1",
         NotificationAreaIcon2_Constructor_Target
     );
 
     return true;
 }
-
 BOOL CALLBACK
 EnumCurrentProcessTaskbarWindowProc(
     HWND hWnd,
@@ -3030,6 +4073,36 @@ BOOL Wh_ModInit() {
         std::memory_order_release
     );
 
+    g_visibleAddCount.store(
+        0,
+        std::memory_order_release
+    );
+
+    g_overflowGetterCount.store(
+        0,
+        std::memory_order_release
+    );
+
+    g_restoreObservationCount.store(
+        0,
+        std::memory_order_release
+    );
+
+    g_restoreKnownCandidateCount.store(
+        0,
+        std::memory_order_release
+    );
+
+    g_restoreNewIconCount.store(
+        0,
+        std::memory_order_release
+    );
+
+    g_restoreSkipCount.store(
+        0,
+        std::memory_order_release
+    );
+
     {
         std::lock_guard<std::mutex> lock(
             g_liveMappingMutex
@@ -3139,6 +4212,8 @@ void Wh_ModSettingsChanged() {
 }
 
 void Wh_ModUninit() {
+    ReleaseCachedTaskbarModel6();
+
     std::size_t canonicalEntries =
         0;
 
