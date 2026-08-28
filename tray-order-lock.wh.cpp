@@ -18,9 +18,9 @@
 
 Controls Windows 11 notification-area icon ordering.
 
-Version 0.2.0 is currently under development.
+Version 0.2.0 adds persistent manual ordering and automatic restoration of known tray icons.
 
-Current development functionality:
+Version 0.2.0 functionality:
 
 - Lock all reordering:
   preserves the 0.1.0 behavior and blocks tray move requests.
