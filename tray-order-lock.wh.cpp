@@ -45,7 +45,8 @@ Ambiguous or unsupported logical identities are not learned automatically.
 In Preserve order mode, returning known icons are restored automatically when
 their live canonical relation is violated. Restoration uses Windows' own
 NotificationAreaIconManager2::MoveIcon path and never writes UIOrderList
-directly. New or ambiguous icons are left at Windows' default position.
+directly. New icons can either keep Windows' default position or be placed at
+the end of the overflow area. Ambiguous icons are left untouched.
 */
 // ==/WindhawkModReadme==
 
@@ -56,6 +57,12 @@ directly. New or ambiguous icons are left at Windows' default position.
   $options:
     - lockAll: Lock all reordering
     - preserveManual: Preserve order, allow manual changes
+
+- newIconBehavior: windowsDefault
+  $name: New icon placement
+  $options:
+    - windowsDefault: Use Windows default position
+    - placeAtEnd: Place new icons at the end
 */
 // ==/WindhawkModSettings==
 
@@ -98,6 +105,11 @@ constexpr int kOverflowLocation =
 enum class OrderingBehavior {
     LockAll = 0,
     PreserveManual = 1,
+};
+
+enum class NewIconBehavior {
+    WindowsDefault = 0,
+    PlaceAtEnd = 1,
 };
 
 struct UIOrderSnapshot {
@@ -251,6 +263,11 @@ std::atomic<bool> g_taskbarHooksInitialized =
 std::atomic<int> g_orderingBehavior =
     static_cast<int>(
         OrderingBehavior::LockAll
+    );
+
+std::atomic<int> g_newIconBehavior =
+    static_cast<int>(
+        NewIconBehavior::WindowsDefault
     );
 
 std::atomic<unsigned long long> g_blockedMoveCount =
@@ -2500,6 +2517,655 @@ unsigned int CalculateImmediatelyBeforeIndex(
         );
 }
 
+bool AppendNewCanonicalKeyAtEnd(
+    const std::wstring& targetKey,
+    bool* persisted
+) {
+    if (
+        targetKey.empty()
+    ) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(
+        g_canonicalMutex
+    );
+
+    if (
+        ContainsCanonicalKeyLocked(
+            targetKey
+        )
+    ) {
+        if (persisted) {
+            *persisted =
+                true;
+        }
+
+        return true;
+    }
+
+    g_canonicalOrder.push_back(
+        targetKey
+    );
+
+    const bool writeSucceeded =
+        PersistCanonicalOrderLocked();
+
+    if (persisted) {
+        *persisted =
+            writeSucceeded;
+    }
+
+    return true;
+}
+
+bool AdoptNewIconAtWindowsDefault(
+    const std::wstring& targetKey,
+    const std::vector<std::wstring>& canonicalSnapshot,
+    const LiveOverflowSnapshot& overflow,
+    bool* persisted
+) {
+    if (
+        targetKey.empty() ||
+        !overflow.valid ||
+        !overflow.targetFound ||
+        overflow.targetIndex >=
+            overflow.entries.size()
+    ) {
+        return false;
+    }
+
+    std::wstring precedingKey;
+    std::wstring followingKey;
+
+    for (
+        unsigned int index =
+            overflow.targetIndex;
+        index >
+            0;
+        index--
+    ) {
+        const LiveOverflowEntry& entry =
+            overflow.entries[
+                index -
+                1
+            ];
+
+        if (
+            !entry.uniqueLogical ||
+            entry.logicalKey.empty()
+        ) {
+            continue;
+        }
+
+        if (
+            std::find(
+                canonicalSnapshot.begin(),
+                canonicalSnapshot.end(),
+                entry.logicalKey
+            ) !=
+                canonicalSnapshot.end()
+        ) {
+            precedingKey =
+                entry.logicalKey;
+
+            break;
+        }
+    }
+
+    for (
+        unsigned int index =
+            overflow.targetIndex +
+            1;
+        index <
+            overflow.entries.size();
+        index++
+    ) {
+        const LiveOverflowEntry& entry =
+            overflow.entries[index];
+
+        if (
+            !entry.uniqueLogical ||
+            entry.logicalKey.empty()
+        ) {
+            continue;
+        }
+
+        if (
+            std::find(
+                canonicalSnapshot.begin(),
+                canonicalSnapshot.end(),
+                entry.logicalKey
+            ) !=
+                canonicalSnapshot.end()
+        ) {
+            followingKey =
+                entry.logicalKey;
+
+            break;
+        }
+    }
+
+    if (
+        precedingKey.empty() &&
+        followingKey.empty()
+    ) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(
+        g_canonicalMutex
+    );
+
+    if (
+        ContainsCanonicalKeyLocked(
+            targetKey
+        )
+    ) {
+        if (persisted) {
+            *persisted =
+                true;
+        }
+
+        return true;
+    }
+
+    auto precedingIterator =
+        precedingKey.empty()
+            ? g_canonicalOrder.end()
+            : std::find(
+                  g_canonicalOrder.begin(),
+                  g_canonicalOrder.end(),
+                  precedingKey
+              );
+
+    auto followingIterator =
+        followingKey.empty()
+            ? g_canonicalOrder.end()
+            : std::find(
+                  g_canonicalOrder.begin(),
+                  g_canonicalOrder.end(),
+                  followingKey
+              );
+
+    if (
+        precedingIterator !=
+            g_canonicalOrder.end() &&
+        followingIterator !=
+            g_canonicalOrder.end() &&
+        std::distance(
+            g_canonicalOrder.begin(),
+            precedingIterator
+        ) >=
+            std::distance(
+                g_canonicalOrder.begin(),
+                followingIterator
+            )
+    ) {
+        return false;
+    }
+
+    if (
+        precedingIterator !=
+        g_canonicalOrder.end()
+    ) {
+        g_canonicalOrder.insert(
+            std::next(
+                precedingIterator
+            ),
+            targetKey
+        );
+    }
+    else if (
+        followingIterator !=
+        g_canonicalOrder.end()
+    ) {
+        g_canonicalOrder.insert(
+            followingIterator,
+            targetKey
+        );
+    }
+    else {
+        return false;
+    }
+
+    const bool writeSucceeded =
+        PersistCanonicalOrderLocked();
+
+    if (persisted) {
+        *persisted =
+            writeSucceeded;
+    }
+
+    return true;
+}
+
+bool AdoptNewIconFromUiOrder(
+    const std::wstring& targetKey,
+    std::uint64_t windowsIdentity,
+    bool* persisted
+) {
+    const UIOrderSnapshot snapshot =
+        CaptureUIOrderSnapshot();
+
+    if (
+        !snapshot.valid
+    ) {
+        return false;
+    }
+
+    const std::vector<LogicalSnapshotEntry> logical =
+        BuildLogicalSnapshot(
+            snapshot
+        );
+
+    const std::vector<std::wstring> canonical =
+        GetCanonicalOrderSnapshot();
+
+    std::size_t targetIndex =
+        logical.size();
+
+    for (
+        std::size_t index = 0;
+        index <
+            logical.size();
+        index++
+    ) {
+        const LogicalSnapshotEntry& entry =
+            logical[index];
+
+        if (
+            entry.identity ==
+                windowsIdentity &&
+            entry.unique &&
+            entry.key ==
+                targetKey
+        ) {
+            targetIndex =
+                index;
+
+            break;
+        }
+    }
+
+    if (
+        targetIndex ==
+        logical.size()
+    ) {
+        return false;
+    }
+
+    std::wstring precedingKey;
+    std::wstring followingKey;
+
+    for (
+        std::size_t index =
+            targetIndex;
+        index >
+            0;
+        index--
+    ) {
+        const LogicalSnapshotEntry& candidate =
+            logical[
+                index -
+                1
+            ];
+
+        if (
+            candidate.unique &&
+            !candidate.key.empty() &&
+            std::find(
+                canonical.begin(),
+                canonical.end(),
+                candidate.key
+            ) !=
+                canonical.end()
+        ) {
+            precedingKey =
+                candidate.key;
+
+            break;
+        }
+    }
+
+    for (
+        std::size_t index =
+            targetIndex +
+            1;
+        index <
+            logical.size();
+        index++
+    ) {
+        const LogicalSnapshotEntry& candidate =
+            logical[index];
+
+        if (
+            candidate.unique &&
+            !candidate.key.empty() &&
+            std::find(
+                canonical.begin(),
+                canonical.end(),
+                candidate.key
+            ) !=
+                canonical.end()
+        ) {
+            followingKey =
+                candidate.key;
+
+            break;
+        }
+    }
+
+    if (
+        precedingKey.empty() &&
+        followingKey.empty()
+    ) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(
+        g_canonicalMutex
+    );
+
+    if (
+        ContainsCanonicalKeyLocked(
+            targetKey
+        )
+    ) {
+        if (persisted) {
+            *persisted =
+                true;
+        }
+
+        return true;
+    }
+
+    auto precedingIterator =
+        precedingKey.empty()
+            ? g_canonicalOrder.end()
+            : std::find(
+                  g_canonicalOrder.begin(),
+                  g_canonicalOrder.end(),
+                  precedingKey
+              );
+
+    auto followingIterator =
+        followingKey.empty()
+            ? g_canonicalOrder.end()
+            : std::find(
+                  g_canonicalOrder.begin(),
+                  g_canonicalOrder.end(),
+                  followingKey
+              );
+
+    if (
+        precedingIterator !=
+            g_canonicalOrder.end() &&
+        followingIterator !=
+            g_canonicalOrder.end() &&
+        precedingIterator >=
+            followingIterator
+    ) {
+        return false;
+    }
+
+    if (
+        precedingIterator !=
+        g_canonicalOrder.end()
+    ) {
+        g_canonicalOrder.insert(
+            std::next(
+                precedingIterator
+            ),
+            targetKey
+        );
+    }
+    else if (
+        followingIterator !=
+        g_canonicalOrder.end()
+    ) {
+        g_canonicalOrder.insert(
+            followingIterator,
+            targetKey
+        );
+    }
+    else {
+        return false;
+    }
+
+    const bool writeSucceeded =
+        PersistCanonicalOrderLocked();
+
+    if (persisted) {
+        *persisted =
+            writeSucceeded;
+    }
+
+    return true;
+}
+void HandleNewIcon(
+    void* manager,
+    const LiveIdentityMapping& targetMapping,
+    const std::wstring& targetKey,
+    const std::vector<std::wstring>& canonical,
+    unsigned long long observation,
+    unsigned long long newIcon
+) {
+    const NewIconBehavior behavior =
+        static_cast<NewIconBehavior>(
+            g_newIconBehavior.load(
+                std::memory_order_acquire
+            )
+        );
+
+    const LiveOverflowSnapshot before =
+        CaptureLiveOverflowSnapshot(
+            targetMapping.abi
+        );
+
+    if (
+        !before.valid ||
+        !before.targetFound ||
+        CountOverflowLogicalKey(
+            before,
+            targetKey
+        ) !=
+            1
+    ) {
+        Wh_Log(
+            L"TRAY_ORDER_LOCK_NEW_ICON "
+            L"observation=%llu "
+            L"newIcon=%llu "
+            L"windowsIdentity=%llu "
+            L"behavior=%s "
+            L"action=\"leave-windows-default\" "
+            L"reason=\"unsafe-live-state\"",
+            observation,
+            newIcon,
+            static_cast<unsigned long long>(
+                targetMapping.windowsIdentity
+            ),
+            behavior ==
+                    NewIconBehavior::PlaceAtEnd
+                ? L"place-at-end"
+                : L"windows-default"
+        );
+
+        return;
+    }
+
+    if (
+        behavior ==
+        NewIconBehavior::WindowsDefault
+    ) {
+        bool persisted =
+            false;
+
+        bool adopted =
+            AdoptNewIconAtWindowsDefault(
+                targetKey,
+                canonical,
+                before,
+                &persisted
+            );
+
+        const wchar_t* adoptionSource =
+            adopted
+                ? L"live-overflow"
+                : L"none";
+
+        if (
+            !adopted
+        ) {
+            adopted =
+                AdoptNewIconFromUiOrder(
+                    targetKey,
+                    targetMapping.windowsIdentity,
+                    &persisted
+                );
+
+            if (
+                adopted
+            ) {
+                adoptionSource =
+                    L"ui-order";
+            }
+        }
+
+        Wh_Log(
+            L"TRAY_ORDER_LOCK_NEW_ICON "
+            L"observation=%llu "
+            L"newIcon=%llu "
+            L"windowsIdentity=%llu "
+            L"behavior=windows-default "
+            L"action=\"keep-current\" "
+            L"targetIndex=%u "
+            L"adopted=%d "
+            L"persisted=%d "
+            L"adoptionSource=%s",
+            observation,
+            newIcon,
+            static_cast<unsigned long long>(
+                targetMapping.windowsIdentity
+            ),
+            before.targetIndex,
+            adopted
+                ? 1
+                : 0,
+            persisted
+                ? 1
+                : 0,
+            adoptionSource
+        );
+
+        return;
+    }
+
+    if (
+        before.size ==
+        0
+    ) {
+        return;
+    }
+
+    const unsigned int desiredIndex =
+        before.size -
+        1;
+
+    bool moveAttempted =
+        false;
+
+    bool moveVerified =
+        before.targetIndex ==
+        desiredIndex;
+
+    if (
+        !moveVerified &&
+        manager &&
+        NotificationAreaIconManager_MoveIcon &&
+        targetMapping.abi
+    ) {
+        moveAttempted =
+            true;
+
+        void* iconArgumentStorage =
+            targetMapping.abi;
+
+        g_internalMoveDepth++;
+
+        NotificationAreaIconManager_MoveIcon(
+            manager,
+            &iconArgumentStorage,
+            kOverflowLocation,
+            desiredIndex
+        );
+
+        g_internalMoveDepth--;
+
+        const LiveOverflowSnapshot after =
+            CaptureLiveOverflowSnapshot(
+                targetMapping.abi
+            );
+
+        moveVerified =
+            after.valid &&
+            after.targetFound &&
+            CountOverflowLogicalKey(
+                after,
+                targetKey
+            ) ==
+                1 &&
+            after.size >
+                0 &&
+            after.targetIndex ==
+                after.size -
+                1;
+    }
+
+    bool persisted =
+        false;
+
+    const bool adopted =
+        moveVerified &&
+        AppendNewCanonicalKeyAtEnd(
+            targetKey,
+            &persisted
+        );
+
+    Wh_Log(
+        L"TRAY_ORDER_LOCK_NEW_ICON "
+        L"observation=%llu "
+        L"newIcon=%llu "
+        L"windowsIdentity=%llu "
+        L"behavior=place-at-end "
+        L"action=\"place-at-end\" "
+        L"beforeIndex=%u "
+        L"requestedIndex=%u "
+        L"moveAttempted=%d "
+        L"verified=%d "
+        L"adopted=%d "
+        L"persisted=%d",
+        observation,
+        newIcon,
+        static_cast<unsigned long long>(
+            targetMapping.windowsIdentity
+        ),
+        before.targetIndex,
+        desiredIndex,
+        moveAttempted
+            ? 1
+            : 0,
+        moveVerified
+            ? 1
+            : 0,
+        adopted
+            ? 1
+            : 0,
+        persisted
+            ? 1
+            : 0
+    );
+}
 void RecordRestoreObservationSkip(
     const wchar_t* reason,
     std::uint64_t windowsIdentity
@@ -2603,17 +3269,13 @@ void RestoreCanonicalRelation(
             ) +
             1;
 
-        Wh_Log(
-            L"TRAY_ORDER_LOCK_RESTORE_NEW_ICON "
-            L"observation=%llu "
-            L"newIcon=%llu "
-            L"windowsIdentity=%llu "
-            L"action=\"windows-default\"",
+        HandleNewIcon(
+            manager,
+            targetMapping,
+            targetKey,
+            canonical,
             observation,
-            newIcon,
-            static_cast<unsigned long long>(
-                targetMapping.windowsIdentity
-            )
+            newIcon
         );
 
         return;
@@ -3353,7 +4015,7 @@ OrderingBehavior GetOrderingBehavior() {
 }
 
 void LoadSettings() {
-    PCWSTR setting =
+    PCWSTR orderingSetting =
         Wh_GetStringSetting(
             L"orderingBehavior"
         );
@@ -3362,9 +4024,9 @@ void LoadSettings() {
         OrderingBehavior::LockAll;
 
     if (
-        setting &&
+        orderingSetting &&
         _wcsicmp(
-            setting,
+            orderingSetting,
             L"preserveManual"
         ) ==
             0
@@ -3374,7 +4036,31 @@ void LoadSettings() {
     }
 
     Wh_FreeStringSetting(
-        setting
+        orderingSetting
+    );
+
+    PCWSTR newIconSetting =
+        Wh_GetStringSetting(
+            L"newIconBehavior"
+        );
+
+    NewIconBehavior newIconBehavior =
+        NewIconBehavior::WindowsDefault;
+
+    if (
+        newIconSetting &&
+        _wcsicmp(
+            newIconSetting,
+            L"placeAtEnd"
+        ) ==
+            0
+    ) {
+        newIconBehavior =
+            NewIconBehavior::PlaceAtEnd;
+    }
+
+    Wh_FreeStringSetting(
+        newIconSetting
     );
 
     g_orderingBehavior.store(
@@ -3384,22 +4070,27 @@ void LoadSettings() {
         std::memory_order_release
     );
 
-    if (
-        behavior ==
-        OrderingBehavior::PreserveManual
-    ) {
-        Wh_Log(
-            L"TRAY_ORDER_LOCK_SETTINGS "
-            L"orderingBehavior=preserveManual"
-        );
-    } else {
-        Wh_Log(
-            L"TRAY_ORDER_LOCK_SETTINGS "
-            L"orderingBehavior=lockAll"
-        );
-    }
-}
+    g_newIconBehavior.store(
+        static_cast<int>(
+            newIconBehavior
+        ),
+        std::memory_order_release
+    );
 
+    Wh_Log(
+        L"TRAY_ORDER_LOCK_SETTINGS "
+        L"orderingBehavior=%s "
+        L"newIconBehavior=%s",
+        behavior ==
+                OrderingBehavior::PreserveManual
+            ? L"preserveManual"
+            : L"lockAll",
+        newIconBehavior ==
+                NewIconBehavior::PlaceAtEnd
+            ? L"placeAtEnd"
+            : L"windowsDefault"
+    );
+}
 int __cdecl
 TaskbarModel_MoveNotificationAreaIcon_Hook(
     void* pThis,
