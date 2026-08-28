@@ -1,13 +1,12 @@
 // ==WindhawkMod==
-// @id              stable-tray-icons
-// @name            Stable Tray Icons
-// @description     Assigns stable GUIDs to selected notification icons whose executable paths or hosts change.
-// @version         0.1.0
+// @id              nvidia-stable-tray-id-test
+// @name            NVIDIA Stable Tray ID Test
+// @description     Assigns a shared fixed notification icon GUID to NVIDIA tray icon hosts.
+// @version         0.2.0
 // @author          Yusseter
 // @github          https://github.com/Yusseter
-// @homepage        https://github.com/Yusseter/windhawk-tray-order-lock
+// @homepage        https://github.com/Yusseter/tray-order-lock
 // @license         MIT
-// @include         ChatGPT.exe
 // @include         nvcontainer.exe
 // @include         NVDisplay.Container.exe
 // @architecture    x86-64
@@ -15,15 +14,13 @@
 
 // ==WindhawkModReadme==
 /*
-# Stable Tray Icons
+# NVIDIA Stable Tray ID Test
 
-Combines the verified ChatGPT and NVIDIA experiments into one mod.
+A focused experiment that gives the NVIDIA Settings icon the same fixed GUID
+whether it is hosted by `nvcontainer.exe` or `NVDisplay.Container.exe`.
 
-- ChatGPT: UID `3`, GUID `{773D7384-708C-46ED-8B56-7BE424DB3C0C}`
-- NVIDIA Settings: UID `1051`, GUID
-  `{98A75E36-6078-4BC0-A312-93989E8E9A31}`
-
-This is an app-identity workaround, not a complete tray-order lock.
+The target icon uses UID `1051` and GUID
+`{98A75E36-6078-4BC0-A312-93989E8E9A31}`.
 */
 // ==/WindhawkModReadme==
 
@@ -97,19 +94,15 @@ bool CopyNotifyIconData(const T* source, T* destination) {
 
 }  // namespace
 
-#include <string>
-#include <vector>
-
 namespace {
 
-struct TrayRule {
-    const wchar_t* name;
-    UINT uid;
-    GUID guid;
+constexpr UINT kTargetUid = 1051;
+constexpr GUID kStableGuid = {
+    0x98A75E36,
+    0x6078,
+    0x4BC0,
+    {0xA3, 0x12, 0x93, 0x98, 0x9E, 0x8E, 0x9A, 0x31}
 };
-
-std::vector<TrayRule> g_rules;
-std::wstring g_processPath;
 
 using Shell_NotifyIconW_t = decltype(&Shell_NotifyIconW);
 using Shell_NotifyIconA_t = decltype(&Shell_NotifyIconA);
@@ -117,106 +110,11 @@ using Shell_NotifyIconA_t = decltype(&Shell_NotifyIconA);
 Shell_NotifyIconW_t Shell_NotifyIconW_Original = nullptr;
 Shell_NotifyIconA_t Shell_NotifyIconA_Original = nullptr;
 
-std::wstring GetCurrentProcessPath() {
-    std::wstring path(32768, L'\0');
-    DWORD length = GetModuleFileNameW(nullptr, path.data(), path.size());
-    if (!length || length >= path.size()) {
-        return L"<unknown>";
-    }
-
-    path.resize(length);
-    return path;
-}
-
-const wchar_t* BaseName(const std::wstring& path) {
-    const wchar_t* slash = wcsrchr(path.c_str(), L'\\');
-    return slash ? slash + 1 : path.c_str();
-}
-
-void LoadSettings() {
-    g_rules.clear();
-    g_processPath = GetCurrentProcessPath();
-
-    const wchar_t* processName = BaseName(g_processPath);
-
-    if (_wcsicmp(processName, L"ChatGPT.exe") == 0) {
-        g_rules.push_back({
-            L"ChatGPT",
-            3,
-            {
-                0x773D7384,
-                0x708C,
-                0x46ED,
-                {0x8B, 0x56, 0x7B, 0xE4, 0x24, 0xDB, 0x3C, 0x0C}
-            }
-        });
-    } else if (_wcsicmp(processName, L"nvcontainer.exe") == 0) {
-        g_rules.push_back({
-            L"NVIDIA Settings - User Container",
-            1051,
-            {
-                0x98A75E36,
-                0x6078,
-                0x4BC0,
-                {0xA3, 0x12, 0x93, 0x98, 0x9E, 0x8E, 0x9A, 0x31}
-            }
-        });
-    } else if (_wcsicmp(processName, L"NVDisplay.Container.exe") == 0) {
-        g_rules.push_back({
-            L"NVIDIA Settings - Display Container",
-            1051,
-            {
-                0x98A75E36,
-                0x6078,
-                0x4BC0,
-                {0xA3, 0x12, 0x93, 0x98, 0x9E, 0x8E, 0x9A, 0x31}
-            }
-        });
-    }
-
-    Wh_Log(
-        L"Loaded %zu rule(s) for process: %s",
-        g_rules.size(),
-        g_processPath.c_str()
-    );
-}
-
-const TrayRule* FindRule(UINT uid) {
-    for (const auto& rule : g_rules) {
-        if (rule.uid == uid) {
-            return &rule;
-        }
-    }
-
-    return nullptr;
-}
-
-void LogPatchedCall(
-    const wchar_t* api,
-    const TrayRule& rule,
-    DWORD message,
-    BOOL result
-) {
-    wchar_t guidText[64]{};
-    FormatGuid(rule.guid, guidText, ARRAYSIZE(guidText));
-
-    Wh_Log(
-        L"%s: rule=\"%s\", message=%s, uID=%u, GUID=%s, result=%d",
-        api,
-        rule.name,
-        NotifyMessageName(message),
-        rule.uid,
-        guidText,
-        result
-    );
-}
-
 BOOL WINAPI Shell_NotifyIconW_Hook(
     DWORD message,
     PNOTIFYICONDATAW data
 ) {
-    const TrayRule* rule = data ? FindRule(data->uID) : nullptr;
-    if (!rule) {
+    if (!data || data->uID != kTargetUid) {
         return Shell_NotifyIconW_Original(message, data);
     }
 
@@ -226,10 +124,20 @@ BOOL WINAPI Shell_NotifyIconW_Hook(
     }
 
     patched.uFlags |= NIF_GUID;
-    patched.guidItem = rule->guid;
+    patched.guidItem = kStableGuid;
 
     BOOL result = Shell_NotifyIconW_Original(message, &patched);
-    LogPatchedCall(L"Shell_NotifyIconW", *rule, message, result);
+
+    wchar_t guidText[64]{};
+    FormatGuid(kStableGuid, guidText, ARRAYSIZE(guidText));
+    Wh_Log(
+        L"Shell_NotifyIconW: message=%s, uID=%u, GUID=%s, result=%d",
+        NotifyMessageName(message),
+        patched.uID,
+        guidText,
+        result
+    );
+
     return result;
 }
 
@@ -237,8 +145,7 @@ BOOL WINAPI Shell_NotifyIconA_Hook(
     DWORD message,
     PNOTIFYICONDATAA data
 ) {
-    const TrayRule* rule = data ? FindRule(data->uID) : nullptr;
-    if (!rule) {
+    if (!data || data->uID != kTargetUid) {
         return Shell_NotifyIconA_Original(message, data);
     }
 
@@ -248,10 +155,20 @@ BOOL WINAPI Shell_NotifyIconA_Hook(
     }
 
     patched.uFlags |= NIF_GUID;
-    patched.guidItem = rule->guid;
+    patched.guidItem = kStableGuid;
 
     BOOL result = Shell_NotifyIconA_Original(message, &patched);
-    LogPatchedCall(L"Shell_NotifyIconA", *rule, message, result);
+
+    wchar_t guidText[64]{};
+    FormatGuid(kStableGuid, guidText, ARRAYSIZE(guidText));
+    Wh_Log(
+        L"Shell_NotifyIconA: message=%s, uID=%u, GUID=%s, result=%d",
+        NotifyMessageName(message),
+        patched.uID,
+        guidText,
+        result
+    );
+
     return result;
 }
 
@@ -299,17 +216,14 @@ bool HookShellNotifyIconFunctions() {
 BOOL Wh_ModInit() {
     DWORD sessionId = 0;
     if (ProcessIdToSessionId(GetCurrentProcessId(), &sessionId) && sessionId == 0) {
+        Wh_Log(L"Skipping the NVIDIA service process in session 0");
         return FALSE;
     }
 
-    LoadSettings();
-    if (g_rules.empty()) {
-        return FALSE;
-    }
-
+    Wh_Log(L"NVIDIA Stable Tray ID Test initializing");
     return HookShellNotifyIconFunctions();
 }
 
 void Wh_ModUninit() {
-    Wh_Log(L"Stable Tray Icons stopped");
+    Wh_Log(L"NVIDIA Stable Tray ID Test stopped");
 }

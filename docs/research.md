@@ -265,7 +265,7 @@ A separate application-lifecycle test completely closed and reopened Discord:
 
 The analyzer watcher and hooks also shut down cleanly when the mod was disabled.
 
-## Production implementation
+## Production implementation: 0.1.0
 
 The successful 0.7.0 experiment was reduced to the production
 `tray-order-lock.wh.cpp` source.
@@ -297,7 +297,7 @@ Runtime validation of version 0.1.0 confirmed:
 - Disabling the mod restored normal dragging immediately.
 - No Explorer restart was required.
 
-## Scope and limitations
+## 0.1.0 scope and limitations
 
 - Testing was performed on the environment listed at the top of this document.
 - Internal Windows symbols and class layouts can change in later Windows builds.
@@ -313,3 +313,135 @@ Runtime validation of version 0.1.0 confirmed:
   order or repair order changes made while the mod was disabled.
 - Newly created icons remain subject to Windows' normal icon creation and
   placement behavior.
+## Version 0.2.0 research and implementation
+
+Version 0.2.0 extends the original move-request lock with a second ordering
+behavior: **Preserve order, allow manual changes**.
+
+The goal is to let the user intentionally change tray order while preventing
+later icon recreation, application updates or Explorer restarts from losing the
+learned logical relation.
+
+### Canonical logical order
+
+Manual moves are converted into a logical canonical order and persisted in
+Windhawk local storage.
+
+Logical identity uses:
+
+- `IconGuid` when available.
+- Otherwise, version-normalized executable path plus UID.
+
+Version directories in executable paths are normalized so that an application
+update can still resolve to the same logical icon when the remaining identity is
+safe and unambiguous.
+
+Historical 64-bit `NotifyIconSettings` identities are not treated as stable
+logical identities across Explorer restarts.
+
+### Live Windows identity mapping
+
+Research with `NotificationAreaIcon2` established a direct runtime bridge
+between the implementation object and the 64-bit Windows
+`NotifyIconSettings`/`UIOrderList` identity.
+
+The constructor receives a settings pair whose first 64-bit value is the Windows
+notification-area identity.
+
+The implementation is converted to the same `INotificationAreaIcon` ABI used by
+the taskbar move path through `QueryInterface`. Production code therefore does
+not depend on a fixed implementation-object offset.
+
+Manual move learning prefers this live ABI-to-Windows-identity mapping. A
+read-only `UIOrderList` before/after comparison remains only as a conservative
+fallback.
+
+### Automatic restoration
+
+Known icons are restored through Windows'
+`NotificationAreaIconManager2::MoveIcon` path.
+
+The production mod does not directly write `UIOrderList`.
+
+Restore decisions are based on canonical logical neighbors rather than requiring
+an exact saved numeric index. Unrelated or newly introduced icons may therefore
+exist between canonical neighbors without violating the learned relation.
+
+A relation is satisfied when:
+
+- With only a predecessor, the predecessor remains before the target.
+- With only a follower, the target remains before the follower.
+- With both, the target remains between them.
+
+Automatic moves are verified after the Windows move call and are not retried
+aggressively when the result is ambiguous.
+
+### Reentrancy and manual moves
+
+Runtime testing found that a user-initiated taskbar move can synchronously cause
+the visible-icon path to run while the outer move is still active.
+
+Automatic restoration is therefore suppressed while a user taskbar move is in
+progress. Internal automatic moves use a separate reentrancy depth and are not
+learned back into the canonical order as manual user changes.
+
+This eliminated the reentrant restore crash observed during development.
+
+### New icons
+
+Version 0.2.0 supports two policies for genuinely new logical icons.
+
+#### Use Windows default position
+
+The icon remains where Windows placed it.
+
+The mod attempts to adopt that position into canonical order using safe known
+neighbors from the live overflow snapshot. If no usable live canonical neighbor
+is available, a read-only `UIOrderList` snapshot can be used as a fallback to
+derive the relation.
+
+No direct `UIOrderList` write is performed.
+
+#### Place new icons at the end
+
+The icon is moved through `NotificationAreaIconManager2::MoveIcon` to the end of
+the overflow ordering.
+
+The new logical key is persisted only after the resulting position is verified.
+
+### Explorer restart validation
+
+Runtime validation confirmed that:
+
+- Canonical logical order loads from Windhawk local storage after a complete
+  Explorer process restart.
+- Live Windows identities can change while the same logical icon is still
+  recognized.
+- Known icons can satisfy or restore their canonical relation after restart.
+- New icons adopted in an earlier Explorer process are treated as known icons
+  after restart.
+
+### Final 0.2.0 validation
+
+The final implementation validated:
+
+- Persistent manual ordering.
+- Live identity mapping before and after Explorer restart.
+- Automatic restoration of known logical icons.
+- Safe suppression of reentrant restore operations during manual moves.
+- Windows-default adoption for new icons.
+- Place-at-end handling for new icons.
+- Read-only `UIOrderList` fallback when live neighbors are unavailable.
+- Continued Lock all reordering behavior from version 0.1.0.
+- Stable Explorer operation during the final test sequence.
+
+## Current scope and limitations
+
+- The implementation targets the tested Windows 11 notification-area
+  architecture and depends on internal taskbar symbols and interfaces.
+- Future Windows builds can change those symbols or interfaces.
+- Logical identities that cannot be resolved uniquely are left untouched.
+- `UIOrderList` is used only for observation and fallback identity/order
+  correlation; the mod does not directly write or reconstruct it.
+- Automatic restoration is deliberately conservative and avoids speculative
+  moves when canonical identity or neighbor relations are ambiguous.

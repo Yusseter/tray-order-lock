@@ -5,7 +5,7 @@
 // @version         0.2.0
 // @author          Yusseter
 // @github          https://github.com/Yusseter
-// @homepage        https://github.com/Yusseter/windhawk-tray-order-lock
+// @homepage        https://github.com/Yusseter/tray-order-lock
 // @license         MIT
 // @include         ChatGPT.exe
 // @architecture    x86-64

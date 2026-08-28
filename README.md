@@ -1,132 +1,159 @@
-# Windhawk Tray Order Lock
+# Tray Order Lock
 
-Windhawk project for studying and preserving Windows 11 notification-area icon
-identity and ordering.
+A Windhawk mod for preserving Windows 11 notification-area icon order while
+still allowing user-controlled reordering.
 
-The repository contains a usable tray-order lock together with the analyzers and
-experiments used to identify a safe control point.
+## Status
 
-## Tray Order Lock
+Tray Order Lock 0.2.0 is the current tested standalone release.
 
-`tray-order-lock.wh.cpp` prevents notification-area icons from being manually
-reordered while the mod is enabled.
+The mod is not yet published in Windhawk's official mod catalog. Version 0.2.0
+is being used normally for an additional period of real-world testing before an
+official submission is considered.
 
-Arrange the icons in the desired order, then enable the mod. Dragging an icon to
-another position is rejected without changing either the live order or the
-persistent `UIOrderList` registry data.
+## Features
 
-Disabling the mod immediately restores normal icon dragging.
+Tray Order Lock provides two ordering modes:
 
-### Version 0.1.0 behavior
+### Lock all reordering
 
-- Blocks tray icon move requests through
-  `ITaskbarModel5::MoveNotificationAreaIcon`.
-- Returns `S_OK` without forwarding blocked requests.
-- Does not modify, replace or reconstruct the saved tray order.
-- Does not write to `UIOrderList`.
-- Allows applications to add and remove their tray icons normally.
-- Requires no Explorer restart when enabling or disabling the lock.
-- Targets 64-bit Windows 11 Explorer.
+Preserves the original 0.1.0 behavior.
 
-The tested behavior covers manual dragging within the visible notification area.
-Because the mod suppresses the interface itself, any other caller using the same
-move interface is also blocked while the mod is enabled.
+- Blocks notification-area icon move requests.
+- Prevents manual tray reordering while the mode is active.
+- Does not directly modify `UIOrderList`.
 
-## Research mods
+### Preserve order, allow manual changes
 
-### Stable Tray Icons
+Allows the user to rearrange tray icons while protecting the resulting order
+from later application, Windows or Explorer-driven recreation.
 
-`stable-tray-icons.wh.cpp` assigns fixed GUIDs to the verified ChatGPT and NVIDIA
-Settings tray icons.
+- Learns successful manual tray moves.
+- Stores a canonical logical order in Windhawk local storage.
+- Restores known icons to their canonical relative position when necessary.
+- Preserves the canonical order across complete Explorer process restarts.
+- Uses Windows' own notification-area move path for restoration.
+- Does not directly write or reconstruct `UIOrderList`.
 
-This experiment addresses icon identity rather than general tray ordering.
+Logical icon identity uses:
 
-### Tray Order Lock Analyzer
+- `IconGuid` when available.
+- Otherwise, a version-normalized executable path plus UID.
 
-`tray-order-lock-analyzer.wh.cpp` hooks `Shell_NotifyIconW/A` and records the
-identity information supplied by tray applications, including process path,
-package family, company, product, window, UID, GUID, flags and tooltip.
+Ambiguous or unsupported identities are deliberately left untouched.
 
-The analyzer observes calls without changing icon data. Version 0.2.0 keeps the
-live Windhawk output and also writes UTF-16 process logs under:
+## New icon placement
 
-```text
-%LOCALAPPDATA%\TrayOrderLockAnalyzer
-```
+In **Preserve order, allow manual changes** mode, genuinely new icons can use
+one of two policies:
 
-### System Tray Index Analyzer
+- **Use Windows default position**
+- **Place new icons at the end**
 
-`system-tray-index-analyzer.wh.cpp` was developed through versions 0.1.0 to
-0.7.0 to trace the tray-order update path.
+Windows-default placement is adopted into the canonical order without moving the
+icon when a safe relation can be determined.
 
-The analyzer was used to:
+## Requirements
 
-- Observe `StackViewModel::UpdateIconIndexes()`.
-- Monitor `UIOrderList` registry changes.
-- Trace native `NtSetValueKey` writes.
-- Resolve the complete tray drag-to-registry call chain.
-- Compare registry-write suppression with move-request suppression.
-- Validate continuous move-request suppression before creating the production
-  mod.
+- Windows 11
+- 64-bit Explorer
+- Windhawk
 
-Analyzer milestones are preserved in annotated tags named
-`analyzer-vX.Y.Z`.
+Development and runtime validation for version 0.2.0 was performed on Windows 11
+25H2, build 26200.8973.
+
+The mod relies on internal Windows taskbar symbols and interfaces, which can
+change in later Windows builds.
+
+## Installation
+
+Until the mod is submitted to the official Windhawk catalog:
+
+1. Open the repository's latest GitHub Release.
+2. Download `tray-order-lock.wh.cpp`.
+3. Open Windhawk.
+4. Create a new local mod.
+5. Replace the local mod source with `tray-order-lock.wh.cpp`.
+6. Select **Compile Mod**.
+7. Enable the mod.
+8. Choose the desired ordering behavior in Settings.
+
+## Settings
+
+### Ordering behavior
+
+- **Lock all reordering**
+- **Preserve order, allow manual changes**
+
+### New icon placement
+
+Used with Preserve order mode:
+
+- **Use Windows default position**
+- **Place new icons at the end**
+
+## Validation
+
+Version 0.2.0 runtime testing confirmed:
+
+- Manual moves can be learned and persisted.
+- Known logical icons can be restored after recreation.
+- Canonical ordering survives Explorer restarts.
+- Automatic restore moves are not learned back as manual changes.
+- Restore operations are suppressed safely during user-initiated moves.
+- Both new-icon placement policies work.
+- The final Lock all reordering regression still blocks move requests.
+- Explorer remained stable during the final validated tests.
+
+See [`docs/research.md`](docs/research.md) for the investigation and technical
+validation history.
 
 ## Repository layout
 
 ```text
 tray-order-lock.wh.cpp
-stable-tray-icons.wh.cpp
-tray-order-lock-analyzer.wh.cpp
-system-tray-index-analyzer.wh.cpp
+README.md
+LICENSE
 docs/
 └── research.md
+research/
+├── analyzers/
+│   ├── system-tray-index-analyzer.wh.cpp
+│   ├── taskbar-symbol-enumerator.wh.cpp
+│   ├── tray-add-path-analyzer.wh.cpp
+│   └── tray-order-lock-analyzer.wh.cpp
+└── experiments/
+    ├── chatgpt-stable-tray-id-test.wh.cpp
+    ├── nvidia-stable-tray-id-test.wh.cpp
+    └── stable-tray-icons.wh.cpp
 scripts/
 └── copy-mod-to-clipboard.ps1
-experiments/
-├── chatgpt-stable-tray-id-test.wh.cpp
-└── nvidia-stable-tray-id-test.wh.cpp
 ```
+
+The repository root intentionally contains only the actual Tray Order Lock
+Windhawk source. Analyzer and experimental mods are retained under `research/`
+for development history and reproducibility.
 
 ## VS Code workflow
 
-The files in this repository are the source of truth. Use normal VS Code for
-editing, Git and review, then copy a `.wh.cpp` file into Windhawk for compilation
-and runtime testing.
+The repository files are the source of truth.
 
-The included VS Code task **Copy active Windhawk mod to clipboard** runs the
-PowerShell helper in `scripts/`.
+Press `Ctrl+Shift+B` while a `.wh.cpp` file is active to run the included
+**Copy active Windhawk mod to clipboard** task.
 
-Press `Ctrl+Shift+B` while the desired Windhawk source file is active to copy its
-complete contents to the clipboard.
-
-Windhawk remains responsible for `Compile Mod`, mod enablement and live log
-output.
-
-## Research notes
-
-See [`docs/research.md`](docs/research.md) for the tested identity,
-`UIOrderList`, call-chain and move-suppression findings.
+The task copies the complete active source file to the clipboard. Windhawk
+remains responsible for **Compile Mod**, mod enablement and runtime logging.
 
 ## Versioning
 
-Analyzer versions use annotated tags in this form:
+Production Tray Order Lock releases use normal semantic-version tags:
 
 ```text
-analyzer-vX.Y.Z
+vX.Y.Z
 ```
 
-Usable Tray Order Lock releases use annotated tags and GitHub Releases in this
-form:
-
-```text
-tray-order-lock-vX.Y.Z
-```
-
-## Status
-
-The repository contains the tested Tray Order Lock 0.1.0 implementation together
-with the research code that led to it.
+Research checkpoints keep tool-specific annotated tag names so that multiple
+analyzers can coexist in the same repository without ambiguity.
 
 ## License
 
