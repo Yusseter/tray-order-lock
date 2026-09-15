@@ -73,6 +73,7 @@ the end of the overflow area. Ambiguous icons are left untouched.
 
 #include <algorithm>
 #include <atomic>
+#include <cstdarg>
 #include <cstdint>
 #include <cstring>
 #include <cwchar>
@@ -83,6 +84,298 @@ the end of the overflow area. Ambiguous icons are left untouched.
 #include <vector>
 
 namespace {
+
+constexpr wchar_t kPersistentDevelopmentLogBuild[] =
+    L"0.2.0-dev-persistent-log";
+
+std::mutex g_persistentDevelopmentLogMutex;
+HANDLE g_persistentDevelopmentLogFile = INVALID_HANDLE_VALUE;
+std::wstring g_persistentDevelopmentLogPath;
+bool g_persistentDevelopmentLogInitialized = false;
+
+bool EnsurePersistentDevelopmentLogDirectory(
+    const std::wstring& path
+) {
+    const DWORD attributes =
+        GetFileAttributesW(path.c_str());
+
+    if (attributes != INVALID_FILE_ATTRIBUTES) {
+        return
+            (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    }
+
+    if (CreateDirectoryW(path.c_str(), nullptr)) {
+        return true;
+    }
+
+    return GetLastError() == ERROR_ALREADY_EXISTS;
+}
+
+void WritePersistentDevelopmentLogRawLocked(
+    const std::wstring& text
+) {
+    if (
+        g_persistentDevelopmentLogFile ==
+            INVALID_HANDLE_VALUE
+    ) {
+        return;
+    }
+
+    DWORD written = 0;
+
+    WriteFile(
+        g_persistentDevelopmentLogFile,
+        text.data(),
+        static_cast<DWORD>(
+            text.size() * sizeof(wchar_t)
+        ),
+        &written,
+        nullptr
+    );
+}
+
+void InitializePersistentDevelopmentLogLocked() {
+    if (g_persistentDevelopmentLogInitialized) {
+        return;
+    }
+
+    g_persistentDevelopmentLogInitialized = true;
+
+    wchar_t localAppData[32768]{};
+
+    const DWORD length =
+        GetEnvironmentVariableW(
+            L"LOCALAPPDATA",
+            localAppData,
+            ARRAYSIZE(localAppData)
+        );
+
+    if (!length || length >= ARRAYSIZE(localAppData)) {
+        return;
+    }
+
+    std::wstring rootDirectory(localAppData, length);
+    rootDirectory += L"\\TrayOrderLock";
+
+    if (!EnsurePersistentDevelopmentLogDirectory(rootDirectory)) {
+        return;
+    }
+
+    std::wstring logDirectory =
+        rootDirectory + L"\\Logs";
+
+    if (!EnsurePersistentDevelopmentLogDirectory(logDirectory)) {
+        return;
+    }
+
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+
+    wchar_t fileName[256]{};
+
+    _snwprintf_s(
+        fileName,
+        ARRAYSIZE(fileName),
+        _TRUNCATE,
+        L"\\tray-order-lock-%04u%02u%02u-%02u%02u%02u-%03u-pid%lu.log",
+        now.wYear,
+        now.wMonth,
+        now.wDay,
+        now.wHour,
+        now.wMinute,
+        now.wSecond,
+        now.wMilliseconds,
+        GetCurrentProcessId()
+    );
+
+    g_persistentDevelopmentLogPath =
+        logDirectory + fileName;
+
+    g_persistentDevelopmentLogFile =
+        CreateFileW(
+            g_persistentDevelopmentLogPath.c_str(),
+            FILE_APPEND_DATA,
+            FILE_SHARE_READ |
+                FILE_SHARE_WRITE |
+                FILE_SHARE_DELETE,
+            nullptr,
+            OPEN_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            nullptr
+        );
+
+    if (
+        g_persistentDevelopmentLogFile ==
+            INVALID_HANDLE_VALUE
+    ) {
+        g_persistentDevelopmentLogPath.clear();
+        return;
+    }
+
+    LARGE_INTEGER size{};
+
+    if (
+        GetFileSizeEx(
+            g_persistentDevelopmentLogFile,
+            &size
+        ) &&
+        size.QuadPart == 0
+    ) {
+        const wchar_t bom = 0xFEFF;
+        DWORD written = 0;
+
+        WriteFile(
+            g_persistentDevelopmentLogFile,
+            &bom,
+            sizeof(bom),
+            &written,
+            nullptr
+        );
+    }
+
+    wchar_t header[4096]{};
+
+    _snwprintf_s(
+        header,
+        ARRAYSIZE(header),
+        _TRUNCATE,
+        L"# Tray Order Lock persistent development log\r\n"
+        L"# build=%s\r\n"
+        L"# started=%04u-%02u-%02u %02u:%02u:%02u.%03u\r\n"
+        L"# processId=%lu\r\n"
+        L"# path=%s\r\n",
+        kPersistentDevelopmentLogBuild,
+        now.wYear,
+        now.wMonth,
+        now.wDay,
+        now.wHour,
+        now.wMinute,
+        now.wSecond,
+        now.wMilliseconds,
+        GetCurrentProcessId(),
+        g_persistentDevelopmentLogPath.c_str()
+    );
+
+    WritePersistentDevelopmentLogRawLocked(header);
+
+    Wh_Log(
+        L"TRAY_ORDER_LOCK_PERSISTENT_LOG_READY "
+        L"build=%s path=\"%s\"",
+        kPersistentDevelopmentLogBuild,
+        g_persistentDevelopmentLogPath.c_str()
+    );
+}
+
+void AppendPersistentDevelopmentLog(
+    int sourceLine,
+    const char* sourceFunction,
+    const wchar_t* message
+) {
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+
+    wchar_t prefix[512]{};
+
+    _snwprintf_s(
+        prefix,
+        ARRAYSIZE(prefix),
+        _TRUNCATE,
+        L"%04u-%02u-%02u %02u:%02u:%02u.%03u "
+        L"pid=%lu tid=%lu source=%d:%S | ",
+        now.wYear,
+        now.wMonth,
+        now.wDay,
+        now.wHour,
+        now.wMinute,
+        now.wSecond,
+        now.wMilliseconds,
+        GetCurrentProcessId(),
+        GetCurrentThreadId(),
+        sourceLine,
+        sourceFunction
+    );
+
+    std::wstring output = prefix;
+    output += message;
+    output += L"\r\n";
+
+    std::lock_guard<std::mutex> lock(
+        g_persistentDevelopmentLogMutex
+    );
+
+    InitializePersistentDevelopmentLogLocked();
+    WritePersistentDevelopmentLogRawLocked(output);
+}
+
+void PersistentWhLog(
+    int sourceLine,
+    const char* sourceFunction,
+    const wchar_t* format,
+    ...
+) {
+    wchar_t message[32768]{};
+
+    va_list args;
+    va_start(args, format);
+
+    _vsnwprintf_s(
+        message,
+        ARRAYSIZE(message),
+        _TRUNCATE,
+        format,
+        args
+    );
+
+    va_end(args);
+
+    AppendPersistentDevelopmentLog(
+        sourceLine,
+        sourceFunction,
+        message
+    );
+
+    Wh_Log(
+        L"[source=%d:%S] %s",
+        sourceLine,
+        sourceFunction,
+        message
+    );
+}
+
+void ClosePersistentDevelopmentLog() {
+    std::lock_guard<std::mutex> lock(
+        g_persistentDevelopmentLogMutex
+    );
+
+    if (
+        g_persistentDevelopmentLogFile !=
+            INVALID_HANDLE_VALUE
+    ) {
+        FlushFileBuffers(
+            g_persistentDevelopmentLogFile
+        );
+
+        CloseHandle(
+            g_persistentDevelopmentLogFile
+        );
+
+        g_persistentDevelopmentLogFile =
+            INVALID_HANDLE_VALUE;
+    }
+
+    g_persistentDevelopmentLogPath.clear();
+    g_persistentDevelopmentLogInitialized = false;
+}
+
+#define TOR_LOG(message, ...) \
+    do { \
+        PersistentWhLog( \
+            __LINE__, \
+            __FUNCTION__, \
+            message, \
+            ##__VA_ARGS__ \
+        ); \
+    } while (0)
 
 constexpr wchar_t kNotifyIconSettingsPath[] =
     L"Control Panel\\NotifyIconSettings";
@@ -1200,7 +1493,7 @@ bool PersistCanonicalOrderLocked() {
             serialized.c_str()
         );
 
-    Wh_Log(
+    TOR_LOG(
         L"TRAY_ORDER_LOCK_CANONICAL_WRITE "
         L"succeeded=%d "
         L"entries=%llu "
@@ -1375,7 +1668,7 @@ void InitializeCanonicalState() {
     if (
         !snapshot.valid
     ) {
-        Wh_Log(
+        TOR_LOG(
             L"TRAY_ORDER_LOCK_CANONICAL_INIT_SKIPPED "
             L"reason=\"invalid-ui-order\" "
             L"status=%ld",
@@ -1414,7 +1707,7 @@ void InitializeCanonicalState() {
             !g_canonicalOrder.empty() &&
             PersistCanonicalOrderLocked();
 
-        Wh_Log(
+        TOR_LOG(
             L"TRAY_ORDER_LOCK_CANONICAL_INIT "
             L"loaded=0 "
             L"uiOrderEntries=%llu "
@@ -1450,7 +1743,7 @@ void InitializeCanonicalState() {
             PersistCanonicalOrderLocked();
     }
 
-    Wh_Log(
+    TOR_LOG(
         L"TRAY_ORDER_LOCK_CANONICAL_LOAD "
         L"loaded=1 "
         L"uiOrderEntries=%llu "
@@ -1622,7 +1915,7 @@ void RecordLearningSkip(
         ) +
         1;
 
-    Wh_Log(
+    TOR_LOG(
         L"TRAY_ORDER_LOCK_MANUAL_LEARN_SKIPPED "
         L"skip=%llu "
         L"reason=\"%s\" "
@@ -1879,7 +2172,7 @@ void LearnManualMove(
         ) +
         1;
 
-    Wh_Log(
+    TOR_LOG(
         L"TRAY_ORDER_LOCK_MANUAL_MOVE_LEARNED "
         L"learned=%llu "
         L"identity=%llu "
@@ -2048,7 +2341,7 @@ void CacheTaskbarModel6(
         )->Release();
     }
 
-    Wh_Log(
+    TOR_LOG(
         L"TRAY_ORDER_LOCK_OVERFLOW_MODEL_CAPTURED "
         L"processId=%lu "
         L"taskbarModel6=%p",
@@ -2972,7 +3265,7 @@ void HandleNewIcon(
         ) !=
             1
     ) {
-        Wh_Log(
+        TOR_LOG(
             L"TRAY_ORDER_LOCK_NEW_ICON "
             L"observation=%llu "
             L"newIcon=%llu "
@@ -3032,7 +3325,7 @@ void HandleNewIcon(
             }
         }
 
-        Wh_Log(
+        TOR_LOG(
             L"TRAY_ORDER_LOCK_NEW_ICON "
             L"observation=%llu "
             L"newIcon=%llu "
@@ -3132,7 +3425,7 @@ void HandleNewIcon(
             &persisted
         );
 
-    Wh_Log(
+    TOR_LOG(
         L"TRAY_ORDER_LOCK_NEW_ICON "
         L"observation=%llu "
         L"newIcon=%llu "
@@ -3177,7 +3470,7 @@ void RecordRestoreObservationSkip(
         ) +
         1;
 
-    Wh_Log(
+    TOR_LOG(
         L"TRAY_ORDER_LOCK_RESTORE_OBSERVATION_SKIPPED "
         L"skip=%llu "
         L"reason=\"%s\" "
@@ -3477,7 +3770,7 @@ void RestoreCanonicalRelation(
         desiredIndex !=
             before.targetIndex;
 
-    Wh_Log(
+    TOR_LOG(
         L"TRAY_ORDER_LOCK_RESTORE_OBSERVATION "
         L"observation=%llu "
         L"candidate=%llu "
@@ -3547,7 +3840,7 @@ void RestoreCanonicalRelation(
         ) +
         1;
 
-    Wh_Log(
+    TOR_LOG(
         L"TRAY_ORDER_LOCK_RESTORE_MOVE_BEGIN "
         L"move=%llu "
         L"observation=%llu "
@@ -3697,7 +3990,7 @@ void RestoreCanonicalRelation(
         );
     }
 
-    Wh_Log(
+    TOR_LOG(
         L"TRAY_ORDER_LOCK_RESTORE_MOVE_COMPLETE "
         L"move=%llu "
         L"windowsIdentity=%llu "
@@ -3771,7 +4064,7 @@ NotificationAreaIconManager_AddVisible_Hook(
         g_taskbarMoveDepth !=
         0;
 
-    Wh_Log(
+    TOR_LOG(
         L"TRAY_ORDER_LOCK_VISIBLE_ADD "
         L"call=%llu "
         L"manager=%p "
@@ -3799,7 +4092,7 @@ NotificationAreaIconManager_AddVisible_Hook(
             ) +
             1;
 
-        Wh_Log(
+        TOR_LOG(
             L"TRAY_ORDER_LOCK_RESTORE_SUPPRESSED "
             L"suppressed=%llu "
             L"reason=\"taskbar-move-in-progress\" "
@@ -3921,7 +4214,7 @@ NotificationAreaIcon2_Constructor_Hook(
               )
             : L"";
 
-    Wh_Log(
+    TOR_LOG(
         L"TRAY_ORDER_LOCK_LIVE_IDENTITY_CONSTRUCTED "
         L"call=%llu "
         L"implementation=%p "
@@ -3975,7 +4268,7 @@ NotificationAreaIcon2_Constructor_Hook(
             ) +
             1;
 
-        Wh_Log(
+        TOR_LOG(
             L"TRAY_ORDER_LOCK_LIVE_IDENTITY_MAP "
             L"mapped=%llu "
             L"implementation=%p "
@@ -4077,7 +4370,7 @@ void LoadSettings() {
         std::memory_order_release
     );
 
-    Wh_Log(
+    TOR_LOG(
         L"TRAY_ORDER_LOCK_SETTINGS "
         L"orderingBehavior=%s "
         L"newIconBehavior=%s",
@@ -4109,7 +4402,7 @@ TaskbarModel_MoveNotificationAreaIcon_Hook(
             ) +
             1;
 
-        Wh_Log(
+        TOR_LOG(
             L"TRAY_ORDER_LOCK_INTERNAL_TASKBAR_MOVE_FORWARDED "
             L"move=%llu "
             L"iconAbi=%p "
@@ -4141,7 +4434,7 @@ TaskbarModel_MoveNotificationAreaIcon_Hook(
             ) +
             1;
 
-        Wh_Log(
+        TOR_LOG(
             L"TRAY_ORDER_LOCK_MOVE_BLOCKED "
             L"move=%llu "
             L"iconAbi=%p "
@@ -4185,7 +4478,7 @@ TaskbarModel_MoveNotificationAreaIcon_Hook(
         ) +
         1;
 
-    Wh_Log(
+    TOR_LOG(
         L"TRAY_ORDER_LOCK_MOVE_ALLOWED "
         L"move=%llu "
         L"iconAbi=%p "
@@ -4238,7 +4531,7 @@ TaskbarModel_MoveNotificationAreaIcon_Hook(
         before.entries !=
             after.entries;
 
-    Wh_Log(
+    TOR_LOG(
         L"TRAY_ORDER_LOCK_MOVE_ALLOWED_COMPLETE "
         L"move=%llu "
         L"result=0x%08X "
@@ -4318,7 +4611,7 @@ TaskbarModel_MoveNotificationAreaIcon_Hook(
         }
     }
 
-    Wh_Log(
+    TOR_LOG(
         L"TRAY_ORDER_LOCK_MANUAL_IDENTITY "
         L"move=%llu "
         L"identity=%llu "
@@ -4514,7 +4807,7 @@ bool ResolveLiveIdentitySymbols(
     if (
         !search
     ) {
-        Wh_Log(
+        TOR_LOG(
             L"TRAY_ORDER_LOCK_LIVE_IDENTITY_SYMBOL_ENUMERATION_FAILED "
             L"lastError=%lu",
             GetLastError()
@@ -4644,7 +4937,7 @@ bool ResolveLiveIdentitySymbols(
         search
     );
 
-    Wh_Log(
+    TOR_LOG(
         L"TRAY_ORDER_LOCK_LIVE_IDENTITY_SYMBOLS "
         L"constructorMatches=%u "
         L"queryInterfaceMatches=%u "
@@ -4679,7 +4972,7 @@ bool ResolveLiveIdentitySymbols(
         !g_notificationAreaIconInterfaceId ||
         !g_notificationAreaIconVectorId
     ) {
-        Wh_Log(
+        TOR_LOG(
             L"TRAY_ORDER_LOCK_LIVE_IDENTITY_SYMBOLS_UNAVAILABLE"
         );
 
@@ -4712,7 +5005,7 @@ void LogTaskbarModuleInformation(
                 modulePath
             )
     ) {
-        Wh_Log(
+        TOR_LOG(
             L"TRAY_ORDER_LOCK_TASKBAR_MODULE "
             L"address=%p "
             L"path=\"<unavailable>\"",
@@ -4722,7 +5015,7 @@ void LogTaskbarModuleInformation(
         return;
     }
 
-    Wh_Log(
+    TOR_LOG(
         L"TRAY_ORDER_LOCK_TASKBAR_MODULE "
         L"address=%p "
         L"path=\"%s\"",
@@ -4749,7 +5042,7 @@ bool HookTaskbarSymbols(
             &NotificationAreaIcon2_Constructor_Original
         )
     ) {
-        Wh_Log(
+        TOR_LOG(
             L"TRAY_ORDER_LOCK_LIVE_IDENTITY_CONSTRUCTOR_HOOK_FAILED"
         );
 
@@ -4790,7 +5083,7 @@ bool HookTaskbarSymbols(
             )
         )
     ) {
-        Wh_Log(
+        TOR_LOG(
             L"TRAY_ORDER_LOCK_TASKBAR_HOOK_REGISTRATION_FAILED"
         );
 
@@ -4801,7 +5094,7 @@ bool HookTaskbarSymbols(
         taskbarModule
     );
 
-    Wh_Log(
+    TOR_LOG(
         L"TRAY_ORDER_LOCK_LIVE_IDENTITY_HOOK_REGISTERED "
         L"constructor=%p "
         L"automaticRestore=1",
@@ -4913,7 +5206,7 @@ void LogReady() {
         GetOrderingBehavior() ==
         OrderingBehavior::PreserveManual
     ) {
-        Wh_Log(
+        TOR_LOG(
             L"TRAY_ORDER_LOCK_READY "
             L"processId=%lu "
             L"taskbarHooksInitialized=%d "
@@ -4938,7 +5231,7 @@ void LogReady() {
             )
         );
     } else {
-        Wh_Log(
+        TOR_LOG(
             L"TRAY_ORDER_LOCK_READY "
             L"processId=%lu "
             L"taskbarHooksInitialized=%d "
@@ -4998,7 +5291,7 @@ bool TryInitializeTaskbarHooks(
     if (
         !taskbarModule
     ) {
-        Wh_Log(
+        TOR_LOG(
             L"TRAY_ORDER_LOCK_TASKBAR_DLL_NOT_READY "
             L"processId=%lu",
             GetCurrentProcessId()
@@ -5031,7 +5324,7 @@ bool TryInitializeTaskbarHooks(
         if (
             !Wh_ApplyHookOperations()
         ) {
-            Wh_Log(
+            TOR_LOG(
                 L"TRAY_ORDER_LOCK_TASKBAR_HOOK_APPLY_FAILED "
                 L"processId=%lu",
                 GetCurrentProcessId()
@@ -5059,7 +5352,7 @@ bool TryInitializeTaskbarHooks(
     if (
         applyImmediately
     ) {
-        Wh_Log(
+        TOR_LOG(
             L"TRAY_ORDER_LOCK_TASKBAR_HOOKS_READY "
             L"processId=%lu "
             L"applyImmediately=1 "
@@ -5067,7 +5360,7 @@ bool TryInitializeTaskbarHooks(
             GetCurrentProcessId()
         );
     } else {
-        Wh_Log(
+        TOR_LOG(
             L"TRAY_ORDER_LOCK_TASKBAR_HOOKS_REGISTERED "
             L"processId=%lu "
             L"applyImmediately=0 "
@@ -5139,7 +5432,7 @@ HWND WINAPI CreateWindowExW_Hook(
         return hWnd;
     }
 
-    Wh_Log(
+    TOR_LOG(
         L"TRAY_ORDER_LOCK_SHELL_WINDOW_CREATED "
         L"processId=%lu "
         L"hWnd=%p",
@@ -5167,7 +5460,7 @@ HWND WINAPI CreateWindowExW_Hook(
 }  // namespace
 
 BOOL Wh_ModInit() {
-    Wh_Log(
+    TOR_LOG(
         L"Tray Order Lock 0.2.0 initializing "
         L"processId=%lu",
         GetCurrentProcessId()
@@ -5297,7 +5590,7 @@ BOOL Wh_ModInit() {
             &CreateWindowExW_Original
         )
     ) {
-        Wh_Log(
+        TOR_LOG(
             L"TRAY_ORDER_LOCK_CREATEWINDOW_HOOK_FAILED "
             L"processId=%lu",
             GetCurrentProcessId()
@@ -5312,7 +5605,7 @@ BOOL Wh_ModInit() {
     if (
         existingTaskbarWindow
     ) {
-        Wh_Log(
+        TOR_LOG(
             L"TRAY_ORDER_LOCK_EXISTING_PRIMARY_SHELL "
             L"processId=%lu "
             L"hWnd=%p",
@@ -5328,7 +5621,7 @@ BOOL Wh_ModInit() {
             return FALSE;
         }
     } else {
-        Wh_Log(
+        TOR_LOG(
             L"TRAY_ORDER_LOCK_TASKBAR_HOOKS_DEFERRED "
             L"processId=%lu "
             L"reason=\"Shell_TrayWnd-not-created-yet\"",
@@ -5336,7 +5629,7 @@ BOOL Wh_ModInit() {
         );
     }
 
-    Wh_Log(
+    TOR_LOG(
         L"TRAY_ORDER_LOCK_BOOTSTRAP_READY "
         L"processId=%lu "
         L"taskbarHooksInitialized=%d",
@@ -5404,7 +5697,7 @@ void Wh_ModUninit() {
     const std::size_t liveMappings =
         GetLiveMappingSize();
 
-    Wh_Log(
+    TOR_LOG(
         L"Tray Order Lock stopped; "
         L"processId=%lu "
         L"blockedMoves=%llu "
@@ -5475,4 +5768,6 @@ void Wh_ModUninit() {
             ? 1
             : 0
     );
+
+    ClosePersistentDevelopmentLog();
 }
