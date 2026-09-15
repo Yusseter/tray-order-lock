@@ -1,0 +1,9 @@
+{
+  "gitignore": true,
+  "ignores": [
+    ".codex/**",
+    ".claude/**",
+    ".agents/**",
+    "LICENSE"
+  ]
+}

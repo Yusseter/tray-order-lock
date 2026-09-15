@@ -5,11 +5,15 @@ still allowing user-controlled reordering.
 
 ## Status
 
-Tray Order Lock 0.2.0 is the current tested standalone release.
+Tray Order Lock 0.2.0 is the current standalone release.
 
-The mod is not yet published in Windhawk's official mod catalog. Version 0.2.0
-is being used normally for an additional period of real-world testing before an
-official submission is considered.
+Long-term real-world use has exposed an order-drift issue in
+**Preserve order, allow manual changes** mode. The trigger and responsible code
+path are still under investigation.
+
+The mod is not yet published in Windhawk's official mod catalog. Official
+submission is paused until the order-drift issue is understood and the resulting
+fix is validated.
 
 ## Features
 
@@ -42,7 +46,7 @@ Logical icon identity uses:
 
 Ambiguous or unsupported identities are deliberately left untouched.
 
-## New icon placement
+## New icon handling
 
 In **Preserve order, allow manual changes** mode, genuinely new icons can use
 one of two policies:

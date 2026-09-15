@@ -313,6 +313,7 @@ Runtime validation of version 0.1.0 confirmed:
   order or repair order changes made while the mod was disabled.
 - Newly created icons remain subject to Windows' normal icon creation and
   placement behavior.
+
 ## Version 0.2.0 research and implementation
 
 Version 0.2.0 extends the original move-request lock with a second ordering
@@ -434,6 +435,21 @@ The final implementation validated:
 - Read-only `UIOrderList` fallback when live neighbors are unavailable.
 - Continued Lock all reordering behavior from version 0.1.0.
 - Stable Explorer operation during the final test sequence.
+
+## Post-release order-drift investigation
+
+During longer-term real-world use of version 0.2.0 in **Preserve order, allow
+manual changes** mode, some tray icons were observed to move from previously
+chosen positions.
+
+The trigger and responsible code path are not yet known. No deliberate Explorer
+restart was part of the observed period, so the issue is not currently classified
+as an Explorer-restart persistence failure.
+
+The investigation/order-drift branch adds persistent file-backed diagnostic
+logging so future occurrences can be correlated with manual-move learning,
+canonical-state loading, new-icon handling and automatic restoration before the
+ordering logic is changed.
 
 ## Current scope and limitations
 
