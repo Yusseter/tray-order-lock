@@ -86,7 +86,7 @@ the end of the overflow area. Ambiguous icons are left untouched.
 namespace {
 
 constexpr wchar_t kPersistentDevelopmentLogBuild[] =
-    L"0.2.0-dev-persistent-log";
+    L"0.2.0-dev-order-drift-diagnostics";
 
 std::mutex g_persistentDevelopmentLogMutex;
 HANDLE g_persistentDevelopmentLogFile = INVALID_HANDLE_VALUE;
@@ -1483,9 +1483,80 @@ std::wstring SerializeCanonicalOrderLocked() {
     return serialized;
 }
 
+std::uint64_t DiagnosticHashCodeUnit(
+    std::uint64_t hash,
+    std::uint16_t codeUnit
+) {
+    constexpr std::uint64_t kPrime =
+        1099511628211ULL;
+
+    hash ^=
+        static_cast<std::uint8_t>(
+            codeUnit &
+            0x00FFu
+        );
+
+    hash *=
+        kPrime;
+
+    hash ^=
+        static_cast<std::uint8_t>(
+            (
+                codeUnit >>
+                8
+            ) &
+            0x00FFu
+        );
+
+    hash *=
+        kPrime;
+
+    return hash;
+}
+
+std::uint64_t DiagnosticCanonicalFingerprint(
+    const std::vector<std::wstring>& order
+) {
+    std::uint64_t hash =
+        14695981039346656037ULL;
+
+    for (
+        const std::wstring& key :
+        order
+    ) {
+        for (
+            wchar_t character :
+            key
+        ) {
+            hash =
+                DiagnosticHashCodeUnit(
+                    hash,
+                    static_cast<std::uint16_t>(
+                        character
+                    )
+                );
+        }
+
+        hash =
+            DiagnosticHashCodeUnit(
+                hash,
+                static_cast<std::uint16_t>(
+                    L'\n'
+                )
+            );
+    }
+
+    return hash;
+}
+
 bool PersistCanonicalOrderLocked() {
     const std::wstring serialized =
         SerializeCanonicalOrderLocked();
+
+    const std::uint64_t fingerprint =
+        DiagnosticCanonicalFingerprint(
+            g_canonicalOrder
+        );
 
     const BOOL succeeded =
         Wh_SetStringValue(
@@ -1497,12 +1568,16 @@ bool PersistCanonicalOrderLocked() {
         L"TRAY_ORDER_LOCK_CANONICAL_WRITE "
         L"succeeded=%d "
         L"entries=%llu "
+        L"fingerprint=%016llX "
         L"chars=%llu",
         succeeded
             ? 1
             : 0,
         static_cast<unsigned long long>(
             g_canonicalOrder.size()
+        ),
+        static_cast<unsigned long long>(
+            fingerprint
         ),
         static_cast<unsigned long long>(
             serialized.size()
@@ -2076,9 +2151,87 @@ void LearnManualMove(
         g_canonicalMutex
     );
 
+    const std::uint64_t canonicalBeforeFingerprint =
+        DiagnosticCanonicalFingerprint(
+            g_canonicalOrder
+        );
+
+    std::size_t targetCanonicalIndexBefore =
+        g_canonicalOrder.size();
+
+    const auto targetBeforeIterator =
+        std::find(
+            g_canonicalOrder.begin(),
+            g_canonicalOrder.end(),
+            movedEntry->key
+        );
+
+    if (
+        targetBeforeIterator !=
+        g_canonicalOrder.end()
+    ) {
+        targetCanonicalIndexBefore =
+            static_cast<std::size_t>(
+                std::distance(
+                    g_canonicalOrder.begin(),
+                    targetBeforeIterator
+                )
+            );
+    }
+
     MergeLiveKeysLocked(
         logicalAfter
     );
+
+    std::size_t precedingCanonicalIndex =
+        g_canonicalOrder.size();
+
+    std::size_t followingCanonicalIndex =
+        g_canonicalOrder.size();
+
+    if (!precedingKey.empty()) {
+        const auto precedingCanonicalIterator =
+            std::find(
+                g_canonicalOrder.begin(),
+                g_canonicalOrder.end(),
+                precedingKey
+            );
+
+        if (
+            precedingCanonicalIterator !=
+            g_canonicalOrder.end()
+        ) {
+            precedingCanonicalIndex =
+                static_cast<std::size_t>(
+                    std::distance(
+                        g_canonicalOrder.begin(),
+                        precedingCanonicalIterator
+                    )
+                );
+        }
+    }
+
+    if (!followingKey.empty()) {
+        const auto followingCanonicalIterator =
+            std::find(
+                g_canonicalOrder.begin(),
+                g_canonicalOrder.end(),
+                followingKey
+            );
+
+        if (
+            followingCanonicalIterator !=
+            g_canonicalOrder.end()
+        ) {
+            followingCanonicalIndex =
+                static_cast<std::size_t>(
+                    std::distance(
+                        g_canonicalOrder.begin(),
+                        followingCanonicalIterator
+                    )
+                );
+        }
+    }
 
     auto movedIterator =
         std::find(
@@ -2165,6 +2318,34 @@ void LearnManualMove(
     const bool persisted =
         PersistCanonicalOrderLocked();
 
+    const std::uint64_t canonicalAfterFingerprint =
+        DiagnosticCanonicalFingerprint(
+            g_canonicalOrder
+        );
+
+    std::size_t targetCanonicalIndexAfter =
+        g_canonicalOrder.size();
+
+    const auto targetAfterIterator =
+        std::find(
+            g_canonicalOrder.begin(),
+            g_canonicalOrder.end(),
+            movedEntry->key
+        );
+
+    if (
+        targetAfterIterator !=
+        g_canonicalOrder.end()
+    ) {
+        targetCanonicalIndexAfter =
+            static_cast<std::size_t>(
+                std::distance(
+                    g_canonicalOrder.begin(),
+                    targetAfterIterator
+                )
+            );
+    }
+
     const unsigned long long learned =
         g_learnedMoveCount.fetch_add(
             1,
@@ -2173,10 +2354,49 @@ void LearnManualMove(
         1;
 
     TOR_LOG(
+        L"TRAY_ORDER_LOCK_MANUAL_CANONICAL_CONTEXT "
+        L"targetKey=\"%s\" "
+        L"targetBeforeIndex=%llu "
+        L"targetAfterIndex=%llu "
+        L"precedingCanonicalIndex=%llu "
+        L"followingCanonicalIndex=%llu "
+        L"canonicalEntries=%llu "
+        L"canonicalBefore=%016llX "
+        L"canonicalAfter=%016llX",
+        movedEntry->key.c_str(),
+        static_cast<unsigned long long>(
+            targetCanonicalIndexBefore
+        ),
+        static_cast<unsigned long long>(
+            targetCanonicalIndexAfter
+        ),
+        static_cast<unsigned long long>(
+            precedingCanonicalIndex
+        ),
+        static_cast<unsigned long long>(
+            followingCanonicalIndex
+        ),
+        static_cast<unsigned long long>(
+            g_canonicalOrder.size()
+        ),
+        static_cast<unsigned long long>(
+            canonicalBeforeFingerprint
+        ),
+        static_cast<unsigned long long>(
+            canonicalAfterFingerprint
+        )
+    );
+
+    TOR_LOG(
         L"TRAY_ORDER_LOCK_MANUAL_MOVE_LEARNED "
         L"learned=%llu "
         L"identity=%llu "
         L"identitySource=%s "
+        L"targetKey=\"%s\" "
+        L"precedingKey=\"%s\" "
+        L"followingKey=\"%s\" "
+        L"canonicalBefore=%016llX "
+        L"canonicalAfter=%016llX "
         L"precedingFound=%d "
         L"followingFound=%d "
         L"canonicalEntries=%llu "
@@ -2188,6 +2408,19 @@ void LearnManualMove(
             movedIdentity
         ),
         identitySource,
+        movedEntry->key.c_str(),
+        precedingKey.empty()
+            ? L"<none>"
+            : precedingKey.c_str(),
+        followingKey.empty()
+            ? L"<none>"
+            : followingKey.c_str(),
+        static_cast<unsigned long long>(
+            canonicalBeforeFingerprint
+        ),
+        static_cast<unsigned long long>(
+            canonicalAfterFingerprint
+        ),
         precedingKey.empty()
             ? 0
             : 1,
@@ -3251,6 +3484,29 @@ void HandleNewIcon(
             )
         );
 
+    const std::uint64_t canonicalFingerprint =
+        DiagnosticCanonicalFingerprint(
+            canonical
+        );
+
+    TOR_LOG(
+        L"TRAY_ORDER_LOCK_NEW_ICON_CONTEXT "
+        L"observation=%llu "
+        L"newIcon=%llu "
+        L"windowsIdentity=%llu "
+        L"canonicalFingerprint=%016llX "
+        L"targetKey=\"%s\"",
+        observation,
+        newIcon,
+        static_cast<unsigned long long>(
+            targetMapping.windowsIdentity
+        ),
+        static_cast<unsigned long long>(
+            canonicalFingerprint
+        ),
+        targetKey.c_str()
+    );
+
     const LiveOverflowSnapshot before =
         CaptureLiveOverflowSnapshot(
             targetMapping.abi
@@ -3544,6 +3800,11 @@ void RestoreCanonicalRelation(
     const std::vector<std::wstring> canonical =
         GetCanonicalOrderSnapshot();
 
+    const std::uint64_t canonicalFingerprint =
+        DiagnosticCanonicalFingerprint(
+            canonical
+        );
+
     const auto canonicalTarget =
         std::find(
             canonical.begin(),
@@ -3703,6 +3964,42 @@ void RestoreCanonicalRelation(
             break;
         }
     }
+
+    TOR_LOG(
+        L"TRAY_ORDER_LOCK_RESTORE_CONTEXT "
+        L"observation=%llu "
+        L"windowsIdentity=%llu "
+        L"canonicalIndex=%llu "
+        L"canonicalFingerprint=%016llX "
+        L"targetKey=\"%s\" "
+        L"precedingKey=\"%s\" "
+        L"followingKey=\"%s\" "
+        L"precedingFound=%d "
+        L"followingFound=%d",
+        observation,
+        static_cast<unsigned long long>(
+            targetMapping.windowsIdentity
+        ),
+        static_cast<unsigned long long>(
+            canonicalIndex
+        ),
+        static_cast<unsigned long long>(
+            canonicalFingerprint
+        ),
+        targetKey.c_str(),
+        precedingKey.empty()
+            ? L"<none>"
+            : precedingKey.c_str(),
+        followingKey.empty()
+            ? L"<none>"
+            : followingKey.c_str(),
+        precedingFound
+            ? 1
+            : 0,
+        followingFound
+            ? 1
+            : 0
+    );
 
     if (
         !precedingFound &&
