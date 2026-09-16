@@ -86,7 +86,7 @@ the end of the overflow area. Ambiguous icons are left untouched.
 namespace {
 
 constexpr wchar_t kPersistentDevelopmentLogBuild[] =
-    L"0.2.0-dev-order-drift-diagnostics";
+    L"0.2.0-dev-order-drift-restore-guard";
 
 std::mutex g_persistentDevelopmentLogMutex;
 HANDLE g_persistentDevelopmentLogFile = INVALID_HANDLE_VALUE;
@@ -3970,6 +3970,7 @@ void RestoreCanonicalRelation(
         L"observation=%llu "
         L"windowsIdentity=%llu "
         L"canonicalIndex=%llu "
+        L"canonicalEntries=%llu "
         L"canonicalFingerprint=%016llX "
         L"targetKey=\"%s\" "
         L"precedingKey=\"%s\" "
@@ -3982,6 +3983,9 @@ void RestoreCanonicalRelation(
         ),
         static_cast<unsigned long long>(
             canonicalIndex
+        ),
+        static_cast<unsigned long long>(
+            canonical.size()
         ),
         static_cast<unsigned long long>(
             canonicalFingerprint
@@ -4007,6 +4011,33 @@ void RestoreCanonicalRelation(
     ) {
         RecordRestoreObservationSkip(
             L"no-live-canonical-neighbor",
+            targetMapping.windowsIdentity
+        );
+
+        return;
+    }
+
+    const bool hasCanonicalPredecessor =
+        canonicalIndex >
+        0;
+
+    const bool hasCanonicalFollower =
+        canonicalIndex +
+            1 <
+        canonical.size();
+
+    if (
+        (
+            hasCanonicalPredecessor &&
+            !precedingFound
+        ) ||
+        (
+            hasCanonicalFollower &&
+            !followingFound
+        )
+    ) {
+        RecordRestoreObservationSkip(
+            L"incomplete-live-canonical-neighborhood",
             targetMapping.windowsIdentity
         );
 
