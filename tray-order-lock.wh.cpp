@@ -86,7 +86,7 @@ the end of the overflow area. Ambiguous icons are left untouched.
 namespace {
 
 constexpr wchar_t kPersistentDevelopmentLogBuild[] =
-    L"0.2.0-dev-order-drift-restore-guard";
+    L"0.2.0-dev-order-drift-continuity-group-reconcile";
 
 std::mutex g_persistentDevelopmentLogMutex;
 HANDLE g_persistentDevelopmentLogFile = INVALID_HANDLE_VALUE;
@@ -416,6 +416,12 @@ struct LogicalSnapshotEntry {
     std::uint64_t identity = 0;
     std::wstring key;
     bool unique = false;
+};
+
+struct ContinuityIdentityMetadata {
+    DWORD uid = 0;
+    std::wstring tooltip;
+    std::vector<BYTE> iconSnapshot;
 };
 
 struct LiveIdentityMapping {
@@ -1042,6 +1048,80 @@ bool QueryDwordValue(
     return true;
 }
 
+bool QueryBinaryValue(
+    const std::wstring& subkey,
+    const wchar_t* valueName,
+    std::vector<BYTE>* value
+) {
+    if (!value) {
+        return false;
+    }
+
+    value->clear();
+
+    DWORD registryType =
+        REG_NONE;
+
+    DWORD requiredBytes =
+        0;
+
+    LONG status =
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            subkey.c_str(),
+            valueName,
+            RRF_RT_REG_BINARY,
+            &registryType,
+            nullptr,
+            &requiredBytes
+        );
+
+    if (
+        status !=
+            ERROR_SUCCESS ||
+        registryType !=
+            REG_BINARY ||
+        requiredBytes ==
+            0
+    ) {
+        return false;
+    }
+
+    value->resize(
+        requiredBytes
+    );
+
+    DWORD actualBytes =
+        requiredBytes;
+
+    status =
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            subkey.c_str(),
+            valueName,
+            RRF_RT_REG_BINARY,
+            &registryType,
+            value->data(),
+            &actualBytes
+        );
+
+    if (
+        status !=
+            ERROR_SUCCESS ||
+        actualBytes ==
+            0
+    ) {
+        value->clear();
+        return false;
+    }
+
+    value->resize(
+        actualBytes
+    );
+
+    return true;
+}
+
 bool QueryIconGuid(
     const std::wstring& subkey,
     std::wstring* guidText
@@ -1169,6 +1249,121 @@ bool QueryIconGuid(
         );
 
     return true;
+}
+
+std::wstring NormalizeContinuityTooltip(
+    std::wstring value
+) {
+    std::size_t first =
+        0;
+
+    while (
+        first <
+            value.size() &&
+        std::iswspace(
+            value[first]
+        )
+    ) {
+        first++;
+    }
+
+    std::size_t last =
+        value.size();
+
+    while (
+        last >
+            first &&
+        std::iswspace(
+            value[last - 1]
+        )
+    ) {
+        last--;
+    }
+
+    return
+        ToLower(
+            value.substr(
+                first,
+                last - first
+            )
+        );
+}
+
+bool BuildContinuityIdentityMetadata(
+    std::uint64_t identity,
+    ContinuityIdentityMetadata* metadata
+) {
+    if (!metadata) {
+        return false;
+    }
+
+    *metadata =
+        ContinuityIdentityMetadata{};
+
+    const std::wstring subkey =
+        MakeTrayEntrySubkey(
+            identity
+        );
+
+    std::wstring iconGuid;
+
+    if (
+        QueryIconGuid(
+            subkey,
+            &iconGuid
+        )
+    ) {
+        return false;
+    }
+
+    if (
+        !QueryDwordValue(
+            subkey,
+            L"UID",
+            &metadata->uid
+        )
+    ) {
+        return false;
+    }
+
+    metadata->tooltip =
+        NormalizeContinuityTooltip(
+            QueryStringValue(
+                subkey,
+                L"InitialTooltip"
+            )
+        );
+
+    if (
+        metadata->tooltip.empty()
+    ) {
+        return false;
+    }
+
+    if (
+        !QueryBinaryValue(
+            subkey,
+            L"IconSnapshot",
+            &metadata->iconSnapshot
+        )
+    ) {
+        return false;
+    }
+
+    return true;
+}
+
+bool ContinuityIdentityMatches(
+    const ContinuityIdentityMetadata& left,
+    const ContinuityIdentityMetadata& right
+) {
+    return
+        left.uid ==
+            right.uid &&
+        left.tooltip ==
+            right.tooltip &&
+        left.iconSnapshot ==
+            right.iconSnapshot;
 }
 
 std::wstring BuildLogicalKey(
@@ -1450,6 +1645,171 @@ BuildLogicalSnapshot(
     return result;
 }
 
+struct ContinuityGroupAnalysis {
+    std::vector<std::uint64_t> identities;
+    std::vector<std::wstring> keys;
+
+    unsigned int canonicalMembers = 0;
+
+    std::size_t earliestCanonicalIndex = 0;
+    std::uint64_t earliestCanonicalIdentity = 0;
+    std::wstring earliestCanonicalKey;
+};
+
+bool ContinuityGroupContainsKey(
+    const ContinuityGroupAnalysis& group,
+    const std::wstring& key
+) {
+    return
+        std::find(
+            group.keys.begin(),
+            group.keys.end(),
+            key
+        ) !=
+        group.keys.end();
+}
+
+bool AnalyzeContinuityGroup(
+    std::uint64_t targetIdentity,
+    const std::wstring& targetKey,
+    const std::vector<LogicalSnapshotEntry>& logicalSnapshot,
+    const std::vector<std::wstring>& canonicalSnapshot,
+    ContinuityGroupAnalysis* analysis
+) {
+    if (
+        targetIdentity ==
+            0 ||
+        targetKey.empty() ||
+        !analysis
+    ) {
+        return false;
+    }
+
+    *analysis =
+        ContinuityGroupAnalysis{};
+
+    ContinuityIdentityMetadata targetMetadata;
+
+    if (
+        !BuildContinuityIdentityMetadata(
+            targetIdentity,
+            &targetMetadata
+        )
+    ) {
+        return false;
+    }
+
+    unsigned int targetMatches =
+        0;
+
+    for (
+        const LogicalSnapshotEntry& entry :
+        logicalSnapshot
+    ) {
+        if (
+            !entry.unique ||
+            entry.key.empty()
+        ) {
+            continue;
+        }
+
+        ContinuityIdentityMetadata candidateMetadata;
+
+        if (
+            !BuildContinuityIdentityMetadata(
+                entry.identity,
+                &candidateMetadata
+            ) ||
+            !ContinuityIdentityMatches(
+                targetMetadata,
+                candidateMetadata
+            )
+        ) {
+            continue;
+        }
+
+        analysis->identities.push_back(
+            entry.identity
+        );
+
+        analysis->keys.push_back(
+            entry.key
+        );
+
+        if (
+            entry.identity ==
+                targetIdentity &&
+            entry.key ==
+                targetKey
+        ) {
+            targetMatches++;
+        }
+    }
+
+    if (
+        targetMatches !=
+            1 ||
+        analysis->keys.size() <
+            2
+    ) {
+        *analysis =
+            ContinuityGroupAnalysis{};
+
+        return false;
+    }
+
+    analysis->earliestCanonicalIndex =
+        canonicalSnapshot.size();
+
+    for (
+        std::size_t index = 0;
+        index <
+            canonicalSnapshot.size();
+        index++
+    ) {
+        const auto groupKey =
+            std::find(
+                analysis->keys.begin(),
+                analysis->keys.end(),
+                canonicalSnapshot[index]
+            );
+
+        if (
+            groupKey ==
+            analysis->keys.end()
+        ) {
+            continue;
+        }
+
+        analysis->canonicalMembers++;
+
+        if (
+            index >=
+            analysis->earliestCanonicalIndex
+        ) {
+            continue;
+        }
+
+        analysis->earliestCanonicalIndex =
+            index;
+
+        const std::size_t groupIndex =
+            static_cast<std::size_t>(
+                std::distance(
+                    analysis->keys.begin(),
+                    groupKey
+                )
+            );
+
+        analysis->earliestCanonicalKey =
+            analysis->keys[groupIndex];
+
+        analysis->earliestCanonicalIdentity =
+            analysis->identities[groupIndex];
+    }
+
+    return true;
+}
 bool ContainsCanonicalKeyLocked(
     const std::wstring& key
 ) {
@@ -1736,6 +2096,87 @@ unsigned int MergeLiveKeysLocked(
     return added;
 }
 
+unsigned int MergeLoadedLiveKeysLocked(
+    const std::vector<LogicalSnapshotEntry>& logicalSnapshot,
+    const std::vector<std::wstring>& canonicalBeforeMerge,
+    unsigned int* continuityDeferred
+) {
+    unsigned int added =
+        0;
+
+    unsigned int deferred =
+        0;
+
+    for (
+        const LogicalSnapshotEntry& entry :
+        logicalSnapshot
+    ) {
+        if (
+            !entry.unique ||
+            entry.key.empty() ||
+            ContainsCanonicalKeyLocked(
+                entry.key
+            )
+        ) {
+            continue;
+        }
+
+        ContinuityGroupAnalysis group;
+
+        if (
+            AnalyzeContinuityGroup(
+                entry.identity,
+                entry.key,
+                logicalSnapshot,
+                canonicalBeforeMerge,
+                &group
+            ) &&
+            group.canonicalMembers !=
+                0
+        ) {
+            deferred++;
+
+            TOR_LOG(
+                L"TRAY_ORDER_LOCK_CANONICAL_CONTINUITY_GROUP_DEFERRED "
+                L"windowsIdentity=%llu "
+                L"groupMembers=%llu "
+                L"canonicalMembers=%u "
+                L"anchorIndex=%llu "
+                L"targetKey=\"%s\" "
+                L"anchorKey=\"%s\"",
+                static_cast<unsigned long long>(
+                    entry.identity
+                ),
+                static_cast<unsigned long long>(
+                    group.keys.size()
+                ),
+                group.canonicalMembers,
+                static_cast<unsigned long long>(
+                    group.earliestCanonicalIndex
+                ),
+                entry.key.c_str(),
+                group.earliestCanonicalKey.empty()
+                    ? L"<none>"
+                    : group.earliestCanonicalKey.c_str()
+            );
+
+            continue;
+        }
+
+        g_canonicalOrder.push_back(
+            entry.key
+        );
+
+        added++;
+    }
+
+    if (continuityDeferred) {
+        *continuityDeferred =
+            deferred;
+    }
+
+    return added;
+}
 void InitializeCanonicalState() {
     const UIOrderSnapshot snapshot =
         CaptureUIOrderSnapshot();
@@ -1802,9 +2243,17 @@ void InitializeCanonicalState() {
         return;
     }
 
+    const std::vector<std::wstring> canonicalBeforeMerge =
+        g_canonicalOrder;
+
+    unsigned int continuityDeferred =
+        0;
+
     const unsigned int merged =
-        MergeLiveKeysLocked(
-            logicalSnapshot
+        MergeLoadedLiveKeysLocked(
+            logicalSnapshot,
+            canonicalBeforeMerge,
+            &continuityDeferred
         );
 
     bool persisted =
@@ -1824,6 +2273,7 @@ void InitializeCanonicalState() {
         L"uiOrderEntries=%llu "
         L"canonicalEntries=%llu "
         L"newLiveKeys=%u "
+        L"continuityDeferred=%u "
         L"persisted=%d",
         static_cast<unsigned long long>(
             snapshot.entries.size()
@@ -1832,6 +2282,7 @@ void InitializeCanonicalState() {
             g_canonicalOrder.size()
         ),
         merged,
+        continuityDeferred,
         persisted
             ? 1
             : 0
@@ -2053,6 +2504,47 @@ void LearnManualMove(
         return;
     }
 
+    std::vector<std::wstring> canonicalForContinuity;
+
+    {
+        std::lock_guard<std::mutex> continuityLock(
+            g_canonicalMutex
+        );
+
+        canonicalForContinuity =
+            g_canonicalOrder;
+    }
+
+    ContinuityGroupAnalysis manualContinuityGroup;
+
+    const bool hasManualContinuityGroup =
+        AnalyzeContinuityGroup(
+            movedIdentity,
+            movedEntry->key,
+            logicalAfter,
+            canonicalForContinuity,
+            &manualContinuityGroup
+        );
+
+    auto IsManualContinuityAlias =
+        [&](const LogicalSnapshotEntry& candidate) {
+            if (
+                !hasManualContinuityGroup ||
+                candidate.identity ==
+                    movedIdentity
+            ) {
+                return false;
+            }
+
+            return
+                std::find(
+                    manualContinuityGroup.identities.begin(),
+                    manualContinuityGroup.identities.end(),
+                    candidate.identity
+                ) !=
+                manualContinuityGroup.identities.end();
+        };
+
     std::size_t movedIndex =
         logicalAfter.size();
 
@@ -2103,7 +2595,10 @@ void LearnManualMove(
 
         if (
             candidate.unique &&
-            !candidate.key.empty()
+            !candidate.key.empty() &&
+            !IsManualContinuityAlias(
+                candidate
+            )
         ) {
             precedingKey =
                 candidate.key;
@@ -2125,7 +2620,10 @@ void LearnManualMove(
 
         if (
             candidate.unique &&
-            !candidate.key.empty()
+            !candidate.key.empty() &&
+            !IsManualContinuityAlias(
+                candidate
+            )
         ) {
             followingKey =
                 candidate.key;
@@ -2150,6 +2648,9 @@ void LearnManualMove(
     std::lock_guard<std::mutex> lock(
         g_canonicalMutex
     );
+
+    const std::vector<std::wstring> canonicalBeforeOrder =
+        g_canonicalOrder;
 
     const std::uint64_t canonicalBeforeFingerprint =
         DiagnosticCanonicalFingerprint(
@@ -2179,9 +2680,81 @@ void LearnManualMove(
             );
     }
 
-    MergeLiveKeysLocked(
+    unsigned int continuityAliasesRemoved =
+        0;
+
+    if (hasManualContinuityGroup) {
+        for (
+            const std::wstring& aliasKey :
+            manualContinuityGroup.keys
+        ) {
+            if (
+                aliasKey ==
+                movedEntry->key
+            ) {
+                continue;
+            }
+
+            const std::size_t beforeSize =
+                g_canonicalOrder.size();
+
+            g_canonicalOrder.erase(
+                std::remove(
+                    g_canonicalOrder.begin(),
+                    g_canonicalOrder.end(),
+                    aliasKey
+                ),
+                g_canonicalOrder.end()
+            );
+
+            continuityAliasesRemoved +=
+                static_cast<unsigned int>(
+                    beforeSize -
+                    g_canonicalOrder.size()
+                );
+        }
+    }
+
+    unsigned int mergedKeys =
+        0;
+
+    for (
+        const LogicalSnapshotEntry& entry :
         logicalAfter
-    );
+    ) {
+        if (
+            !entry.unique ||
+            entry.key.empty()
+        ) {
+            continue;
+        }
+
+        if (
+            hasManualContinuityGroup &&
+            entry.key !=
+                movedEntry->key &&
+            ContinuityGroupContainsKey(
+                manualContinuityGroup,
+                entry.key
+            )
+        ) {
+            continue;
+        }
+
+        if (
+            ContainsCanonicalKeyLocked(
+                entry.key
+            )
+        ) {
+            continue;
+        }
+
+        g_canonicalOrder.push_back(
+            entry.key
+        );
+
+        mergedKeys++;
+    }
 
     std::size_t precedingCanonicalIndex =
         g_canonicalOrder.size();
@@ -2306,6 +2879,9 @@ void LearnManualMove(
     if (
         !relationApplied
     ) {
+        g_canonicalOrder =
+            canonicalBeforeOrder;
+
         RecordLearningSkip(
             L"canonical-neighbor-not-found",
             movedIdentity,
@@ -2315,8 +2891,39 @@ void LearnManualMove(
         return;
     }
 
+    TOR_LOG(
+        L"TRAY_ORDER_LOCK_MANUAL_CONTINUITY_CONTEXT "
+        L"continuityGroup=%d "
+        L"groupMembers=%llu "
+        L"aliasesRemoved=%u "
+        L"mergedKeys=%u",
+        hasManualContinuityGroup
+            ? 1
+            : 0,
+        static_cast<unsigned long long>(
+            hasManualContinuityGroup
+                ? manualContinuityGroup.keys.size()
+                : 0
+        ),
+        continuityAliasesRemoved,
+        mergedKeys
+    );
+
     const bool persisted =
         PersistCanonicalOrderLocked();
+
+    if (!persisted) {
+        g_canonicalOrder =
+            canonicalBeforeOrder;
+
+        RecordLearningSkip(
+            L"canonical-persist-failed",
+            movedIdentity,
+            identitySource
+        );
+
+        return;
+    }
 
     const std::uint64_t canonicalAfterFingerprint =
         DiagnosticCanonicalFingerprint(
@@ -2958,6 +3565,377 @@ unsigned int CountOverflowLogicalKey(
     return count;
 }
 
+enum class ContinuityReconcileResult {
+    NoCandidate = 0,
+    Reconciled = 1,
+    Deferred = 2,
+};
+
+bool IsSafeContinuityLiveState(
+    const LiveIdentityMapping& targetMapping
+) {
+    const LiveOverflowSnapshot live =
+        CaptureLiveOverflowSnapshot(
+            targetMapping.abi
+        );
+
+    if (
+        !live.valid ||
+        !live.targetFound ||
+        live.mappedEntries !=
+            live.size
+    ) {
+        return false;
+    }
+
+    ContinuityIdentityMetadata targetMetadata;
+
+    if (
+        !BuildContinuityIdentityMetadata(
+            targetMapping.windowsIdentity,
+            &targetMetadata
+        )
+    ) {
+        return false;
+    }
+
+    unsigned int targetLiveCount =
+        0;
+
+    for (
+        const LiveOverflowEntry& entry :
+        live.entries
+    ) {
+        if (!entry.mapped) {
+            return false;
+        }
+
+        if (
+            entry.windowsIdentity ==
+            targetMapping.windowsIdentity
+        ) {
+            targetLiveCount++;
+
+            continue;
+        }
+
+        ContinuityIdentityMetadata candidateMetadata;
+
+        if (
+            BuildContinuityIdentityMetadata(
+                entry.windowsIdentity,
+                &candidateMetadata
+            ) &&
+            ContinuityIdentityMatches(
+                targetMetadata,
+                candidateMetadata
+            )
+        ) {
+            return false;
+        }
+    }
+
+    return
+        targetLiveCount ==
+        1;
+}
+
+ContinuityReconcileResult
+TryReconcileCanonicalContinuityGroup(
+    const LiveIdentityMapping& targetMapping,
+    const std::wstring& targetKey
+) {
+    ContinuityIdentityMetadata targetMetadata;
+
+    if (
+        !BuildContinuityIdentityMetadata(
+            targetMapping.windowsIdentity,
+            &targetMetadata
+        )
+    ) {
+        return
+            ContinuityReconcileResult::NoCandidate;
+    }
+
+    const UIOrderSnapshot uiOrder =
+        CaptureUIOrderSnapshot();
+
+    if (!uiOrder.valid) {
+        TOR_LOG(
+            L"TRAY_ORDER_LOCK_CONTINUITY_GROUP_DEFERRED "
+            L"reason=\"invalid-ui-order\" "
+            L"windowsIdentity=%llu "
+            L"targetKey=\"%s\"",
+            static_cast<unsigned long long>(
+                targetMapping.windowsIdentity
+            ),
+            targetKey.c_str()
+        );
+
+        return
+            ContinuityReconcileResult::Deferred;
+    }
+
+    const std::vector<LogicalSnapshotEntry> logical =
+        BuildLogicalSnapshot(
+            uiOrder
+        );
+
+    const std::vector<std::wstring> canonicalSnapshot =
+        GetCanonicalOrderSnapshot();
+
+    ContinuityGroupAnalysis group;
+
+    if (
+        !AnalyzeContinuityGroup(
+            targetMapping.windowsIdentity,
+            targetKey,
+            logical,
+            canonicalSnapshot,
+            &group
+        )
+    ) {
+        return
+            ContinuityReconcileResult::NoCandidate;
+    }
+
+    if (
+        group.canonicalMembers ==
+        0
+    ) {
+        TOR_LOG(
+            L"TRAY_ORDER_LOCK_CONTINUITY_GROUP_DEFERRED "
+            L"reason=\"no-canonical-group-anchor\" "
+            L"windowsIdentity=%llu "
+            L"groupMembers=%llu "
+            L"targetKey=\"%s\"",
+            static_cast<unsigned long long>(
+                targetMapping.windowsIdentity
+            ),
+            static_cast<unsigned long long>(
+                group.keys.size()
+            ),
+            targetKey.c_str()
+        );
+
+        return
+            ContinuityReconcileResult::Deferred;
+    }
+
+    if (
+        !IsSafeContinuityLiveState(
+            targetMapping
+        )
+    ) {
+        TOR_LOG(
+            L"TRAY_ORDER_LOCK_CONTINUITY_GROUP_DEFERRED "
+            L"reason=\"unsafe-live-state\" "
+            L"windowsIdentity=%llu "
+            L"groupMembers=%llu "
+            L"canonicalMembers=%u "
+            L"targetKey=\"%s\"",
+            static_cast<unsigned long long>(
+                targetMapping.windowsIdentity
+            ),
+            static_cast<unsigned long long>(
+                group.keys.size()
+            ),
+            group.canonicalMembers,
+            targetKey.c_str()
+        );
+
+        return
+            ContinuityReconcileResult::Deferred;
+    }
+
+    std::lock_guard<std::mutex> lock(
+        g_canonicalMutex
+    );
+
+    std::size_t earliestIndex =
+        g_canonicalOrder.size();
+
+    std::size_t targetPreviousIndex =
+        g_canonicalOrder.size();
+
+    unsigned int canonicalMembers =
+        0;
+
+    for (
+        std::size_t index = 0;
+        index <
+            g_canonicalOrder.size();
+        index++
+    ) {
+        if (
+            !ContinuityGroupContainsKey(
+                group,
+                g_canonicalOrder[index]
+            )
+        ) {
+            continue;
+        }
+
+        canonicalMembers++;
+
+        if (
+            index <
+            earliestIndex
+        ) {
+            earliestIndex =
+                index;
+        }
+
+        if (
+            g_canonicalOrder[index] ==
+            targetKey
+        ) {
+            targetPreviousIndex =
+                index;
+        }
+    }
+
+    if (canonicalMembers == 0) {
+        return
+            ContinuityReconcileResult::Deferred;
+    }
+
+    const std::vector<std::wstring> beforeOrder =
+        g_canonicalOrder;
+
+    const std::uint64_t beforeFingerprint =
+        DiagnosticCanonicalFingerprint(
+            beforeOrder
+        );
+
+    std::vector<std::wstring> updated;
+
+    updated.reserve(
+        beforeOrder.size()
+    );
+
+    for (
+        const std::wstring& key :
+        beforeOrder
+    ) {
+        if (
+            ContinuityGroupContainsKey(
+                group,
+                key
+            )
+        ) {
+            continue;
+        }
+
+        updated.push_back(
+            key
+        );
+    }
+
+    const std::size_t preservedIndex =
+        std::min(
+            earliestIndex,
+            updated.size()
+        );
+
+    updated.insert(
+        updated.begin() +
+            preservedIndex,
+        targetKey
+    );
+
+    if (updated == beforeOrder) {
+        TOR_LOG(
+            L"TRAY_ORDER_LOCK_CONTINUITY_GROUP_STABLE "
+            L"windowsIdentity=%llu "
+            L"groupMembers=%llu "
+            L"canonicalIndex=%llu "
+            L"targetKey=\"%s\"",
+            static_cast<unsigned long long>(
+                targetMapping.windowsIdentity
+            ),
+            static_cast<unsigned long long>(
+                group.keys.size()
+            ),
+            static_cast<unsigned long long>(
+                preservedIndex
+            ),
+            targetKey.c_str()
+        );
+
+        return
+            ContinuityReconcileResult::Reconciled;
+    }
+
+    const std::uint64_t afterFingerprint =
+        DiagnosticCanonicalFingerprint(
+            updated
+        );
+
+    g_canonicalOrder =
+        updated;
+
+    const bool persisted =
+        PersistCanonicalOrderLocked();
+
+    if (!persisted) {
+        g_canonicalOrder =
+            beforeOrder;
+    }
+
+    const unsigned int aliasesRemoved =
+        canonicalMembers >
+                0
+            ? canonicalMembers - 1
+            : 0;
+
+    TOR_LOG(
+        L"TRAY_ORDER_LOCK_CONTINUITY_GROUP_MIGRATION "
+        L"windowsIdentity=%llu "
+        L"groupMembers=%llu "
+        L"canonicalMembers=%u "
+        L"anchorIndex=%llu "
+        L"targetPreviousIndex=%llu "
+        L"preservedIndex=%llu "
+        L"aliasesRemoved=%u "
+        L"beforeFingerprint=%016llX "
+        L"afterFingerprint=%016llX "
+        L"persisted=%d "
+        L"targetKey=\"%s\"",
+        static_cast<unsigned long long>(
+            targetMapping.windowsIdentity
+        ),
+        static_cast<unsigned long long>(
+            group.keys.size()
+        ),
+        canonicalMembers,
+        static_cast<unsigned long long>(
+            earliestIndex
+        ),
+        static_cast<unsigned long long>(
+            targetPreviousIndex
+        ),
+        static_cast<unsigned long long>(
+            preservedIndex
+        ),
+        aliasesRemoved,
+        static_cast<unsigned long long>(
+            beforeFingerprint
+        ),
+        static_cast<unsigned long long>(
+            afterFingerprint
+        ),
+        persisted
+            ? 1
+            : 0,
+        targetKey.c_str()
+    );
+
+    return
+        persisted
+            ? ContinuityReconcileResult::Reconciled
+            : ContinuityReconcileResult::Deferred;
+}
 bool IsCanonicalRelationSatisfied(
     unsigned int targetIndex,
     bool precedingFound,
@@ -3797,8 +4775,42 @@ void RestoreCanonicalRelation(
         return;
     }
 
-    const std::vector<std::wstring> canonical =
+    std::vector<std::wstring> canonical =
         GetCanonicalOrderSnapshot();
+
+    const bool targetKnownBeforeContinuity =
+        std::find(
+            canonical.begin(),
+            canonical.end(),
+            targetKey
+        ) !=
+        canonical.end();
+
+    const ContinuityReconcileResult continuityResult =
+        TryReconcileCanonicalContinuityGroup(
+            targetMapping,
+            targetKey
+        );
+
+    if (
+        continuityResult ==
+        ContinuityReconcileResult::Reconciled
+    ) {
+        canonical =
+            GetCanonicalOrderSnapshot();
+    }
+    else if (
+        continuityResult ==
+            ContinuityReconcileResult::Deferred &&
+        !targetKnownBeforeContinuity
+    ) {
+        RecordRestoreObservationSkip(
+            L"continuity-group-deferred",
+            targetMapping.windowsIdentity
+        );
+
+        return;
+    }
 
     const std::uint64_t canonicalFingerprint =
         DiagnosticCanonicalFingerprint(
