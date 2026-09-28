@@ -86,7 +86,7 @@ the end of the overflow area. Ambiguous icons are left untouched.
 namespace {
 
 constexpr wchar_t kPersistentDevelopmentLogBuild[] =
-    L"0.2.0-dev-order-drift-continuity-group-reconcile";
+    L"0.2.0-dev-order-drift-session-gated-baseline";
 
 std::mutex g_persistentDevelopmentLogMutex;
 HANDLE g_persistentDevelopmentLogFile = INVALID_HANDLE_VALUE;
@@ -386,6 +386,12 @@ constexpr wchar_t kUIOrderListValueName[] =
 constexpr wchar_t kCanonicalOrderValueName[] =
     L"CanonicalOrderV200";
 
+constexpr wchar_t kLiveBaselineTrustedValueName[] =
+    L"CanonicalLiveBaselineTrustedV1";
+
+constexpr wchar_t kLiveBaselineSizeValueName[] =
+    L"CanonicalLiveBaselineSizeV1";
+
 constexpr wchar_t kCanonicalStorageHeader[] =
     L"TRAY_ORDER_LOCK_V200";
 
@@ -632,6 +638,13 @@ std::vector<std::wstring> g_canonicalOrder;
 
 bool g_canonicalLoadedFromStorage =
     false;
+
+std::atomic<bool> g_liveBaselineTrusted = false;
+std::atomic<unsigned int> g_liveBaselineSize = 0;
+
+// A manual move may update the persisted baseline, but automatic
+// ordering must not activate until the next Explorer/mod session.
+std::atomic<bool> g_liveBaselineActiveInSession = false;
 
 std::mutex g_liveMappingMutex;
 
@@ -2210,6 +2223,45 @@ void InitializeCanonicalState() {
     g_canonicalLoadedFromStorage =
         loaded;
 
+    const int savedBaselineSize = Wh_GetIntValue(
+        kLiveBaselineSizeValueName, 0
+    );
+
+    const bool trustedBaseline =
+        loaded &&
+        savedBaselineSize >= 2 &&
+        savedBaselineSize <= 64 &&
+        Wh_GetIntValue(
+            kLiveBaselineTrustedValueName, 0
+        ) == 1;
+
+    g_liveBaselineTrusted.store(
+        trustedBaseline,
+        std::memory_order_release
+    );
+
+    g_liveBaselineActiveInSession.store(
+        trustedBaseline,
+        std::memory_order_release
+    );
+
+    g_liveBaselineSize.store(
+        trustedBaseline
+            ? static_cast<unsigned int>(savedBaselineSize)
+            : 0,
+        std::memory_order_release
+    );
+
+    TOR_LOG(
+        L"TRAY_ORDER_LOCK_LIVE_BASELINE_STATE "
+        L"trusted=%d storedLiveSize=%d canonicalEntries=%llu",
+        trustedBaseline ? 1 : 0,
+        savedBaselineSize,
+        static_cast<unsigned long long>(
+            g_canonicalOrder.size()
+        )
+    );
+
     if (
         !loaded
     ) {
@@ -2458,6 +2510,173 @@ void RecordLearningSkip(
     );
 }
 
+// Called only after a user-initiated drag and a complete live mapping.
+// Reassign existing live-key slots; leave dormant canonical entries
+// in place. No Windows UIOrderList writes are performed.
+
+LiveOverflowSnapshot CaptureLiveOverflowSnapshot(
+    void* targetAbi
+);
+
+bool TryRebaseCanonicalLiveOrderLocked(
+    const LiveOverflowSnapshot& live,
+    const std::wstring& movedKey,
+    int location,
+    unsigned int requestedIndex,
+    unsigned int* changedSlots
+) {
+    if (changedSlots) {
+        *changedSlots = 0;
+    }
+
+    constexpr unsigned int kMaxLiveBaselineSize = 64;
+
+    if (
+        location != kOverflowLocation ||
+        !live.valid ||
+        live.size < 2 ||
+        live.size > kMaxLiveBaselineSize ||
+        live.entries.size() != live.size ||
+        live.mappedEntries != live.size
+    ) {
+        return false;
+    }
+
+    std::vector<std::size_t> slots;
+
+    std::vector<ContinuityIdentityMetadata> metadata(
+        live.size
+    );
+
+    std::vector<bool> metadataValid(
+        live.size, false
+    );
+
+    unsigned int targetCount = 0;
+    unsigned int movedIndex = 0;
+
+    for (
+        unsigned int index = 0;
+        index < live.size;
+        ++index
+    ) {
+        const LiveOverflowEntry& entry =
+            live.entries[index];
+
+        if (
+            !entry.mapped ||
+            !entry.uniqueLogical ||
+            entry.logicalKey.empty() ||
+            std::count(
+                g_canonicalOrder.begin(),
+                g_canonicalOrder.end(),
+                entry.logicalKey
+            ) != 1
+        ) {
+            return false;
+        }
+
+        const auto canonicalIt = std::find(
+            g_canonicalOrder.begin(),
+            g_canonicalOrder.end(),
+            entry.logicalKey
+        );
+
+        slots.push_back(
+            static_cast<std::size_t>(
+                std::distance(
+                    g_canonicalOrder.begin(),
+                    canonicalIt
+                )
+            )
+        );
+
+        if (entry.logicalKey == movedKey) {
+            targetCount++;
+            movedIndex = index;
+        }
+
+        metadataValid[index] =
+            BuildContinuityIdentityMetadata(
+                entry.windowsIdentity,
+                &metadata[index]
+            );
+    }
+
+    if (
+        targetCount != 1 ||
+        movedIndex != requestedIndex
+    ) {
+        return false;
+    }
+
+    // Do not establish a baseline from two simultaneously live
+    // no-GUID registrations with matching continuity metadata.
+
+    for (
+        unsigned int i = 0;
+        i < live.size;
+        ++i
+    ) {
+        if (!metadataValid[i]) {
+            continue;
+        }
+
+        for (
+            unsigned int j = i + 1;
+            j < live.size;
+            ++j
+        ) {
+            if (
+                metadataValid[j] &&
+                ContinuityIdentityMatches(
+                    metadata[i],
+                    metadata[j]
+                )
+            ) {
+                return false;
+            }
+        }
+    }
+
+    std::sort(
+        slots.begin(),
+        slots.end()
+    );
+
+    if (
+        std::adjacent_find(
+            slots.begin(),
+            slots.end()
+        ) != slots.end()
+    ) {
+        return false;
+    }
+
+    unsigned int changed = 0;
+
+    for (
+        unsigned int i = 0;
+        i < live.size;
+        ++i
+    ) {
+        if (
+            g_canonicalOrder[slots[i]] !=
+            live.entries[i].logicalKey
+        ) {
+            g_canonicalOrder[slots[i]] =
+                live.entries[i].logicalKey;
+
+            changed++;
+        }
+    }
+
+    if (changedSlots) {
+        *changedSlots = changed;
+    }
+
+    return true;
+}
 void LearnManualMove(
     const UIOrderSnapshot& after,
     std::uint64_t movedIdentity,
@@ -2644,6 +2863,9 @@ void LearnManualMove(
 
         return;
     }
+
+    const LiveOverflowSnapshot liveAfterManual =
+        CaptureLiveOverflowSnapshot(nullptr);
 
     std::lock_guard<std::mutex> lock(
         g_canonicalMutex
@@ -2891,6 +3113,17 @@ void LearnManualMove(
         return;
     }
 
+    unsigned int rebasedSlots = 0;
+
+    const bool liveRebased =
+        TryRebaseCanonicalLiveOrderLocked(
+            liveAfterManual,
+            movedEntry->key,
+            location,
+            requestedIndex,
+            &rebasedSlots
+        );
+
     TOR_LOG(
         L"TRAY_ORDER_LOCK_MANUAL_CONTINUITY_CONTEXT "
         L"continuityGroup=%d "
@@ -2909,6 +3142,40 @@ void LearnManualMove(
         mergedKeys
     );
 
+    // A changed canonical order must not retain its old trust marker.
+
+    const bool baselineInvalidated =
+        Wh_SetIntValue(
+            kLiveBaselineTrustedValueName, 0
+        ) != FALSE;
+
+    g_liveBaselineTrusted.store(
+        false,
+        std::memory_order_release
+    );
+
+    g_liveBaselineActiveInSession.store(
+        false,
+        std::memory_order_release
+    );
+
+    g_liveBaselineSize.store(
+        0,
+        std::memory_order_release
+    );
+
+    if (!baselineInvalidated) {
+        g_canonicalOrder = canonicalBeforeOrder;
+
+        RecordLearningSkip(
+            L"live-baseline-invalidation-failed",
+            movedIdentity,
+            identitySource
+        );
+
+        return;
+    }
+
     const bool persisted =
         PersistCanonicalOrderLocked();
 
@@ -2924,6 +3191,50 @@ void LearnManualMove(
 
         return;
     }
+
+    bool baselinePersisted = false;
+
+    if (liveRebased) {
+        const bool sizePersisted =
+            Wh_SetIntValue(
+                kLiveBaselineSizeValueName,
+                static_cast<int>(
+                    liveAfterManual.size
+                )
+            ) != FALSE;
+
+        baselinePersisted =
+            sizePersisted &&
+            Wh_SetIntValue(
+                kLiveBaselineTrustedValueName, 1
+            ) != FALSE;
+
+        if (baselinePersisted) {
+            g_liveBaselineSize.store(
+                liveAfterManual.size,
+                std::memory_order_release
+            );
+
+            g_liveBaselineTrusted.store(
+                true,
+                std::memory_order_release
+            );
+        }
+    }
+
+    TOR_LOG(
+        L"TRAY_ORDER_LOCK_MANUAL_LIVE_REBASE "
+        L"applied=%d trusted=%d changedSlots=%u "
+        L"liveValid=%d liveSize=%u liveMapped=%u "
+        L"requestedIndex=%u",
+        liveRebased ? 1 : 0,
+        baselinePersisted ? 1 : 0,
+        rebasedSlots,
+        liveAfterManual.valid ? 1 : 0,
+        liveAfterManual.size,
+        liveAfterManual.mappedEntries,
+        requestedIndex
+    );
 
     const std::uint64_t canonicalAfterFingerprint =
         DiagnosticCanonicalFingerprint(
@@ -4717,6 +5028,37 @@ void RecordRestoreObservationSkip(
     );
 }
 
+bool HasSufficientTrustedLiveBaseline(
+    unsigned int liveSize
+) {
+    if (
+        !g_liveBaselineActiveInSession.load(
+            std::memory_order_acquire
+        )
+    ) {
+        return false;
+    }
+
+    const unsigned int baselineSize =
+        g_liveBaselineSize.load(
+            std::memory_order_acquire
+        );
+
+    if (
+        baselineSize < 2 ||
+        baselineSize > 64
+    ) {
+        return false;
+    }
+
+    const unsigned int required =
+        std::max(
+            2u,
+            (baselineSize * 3u + 3u) / 4u
+        );
+
+    return liveSize >= required;
+}
 void RestoreCanonicalRelation(
     void* manager,
     void* iconImplementation
@@ -4825,6 +5167,19 @@ void RestoreCanonicalRelation(
         );
 
     if (
+        canonicalTarget != canonical.end() &&
+        !g_liveBaselineActiveInSession.load(
+            std::memory_order_acquire
+        )
+    ) {
+        RecordRestoreObservationSkip(
+            L"canonical-live-baseline-not-active-in-session",
+            targetMapping.windowsIdentity
+        );
+
+        return;
+    }
+    if (
         canonicalTarget ==
         canonical.end()
     ) {
@@ -4898,6 +5253,19 @@ void RestoreCanonicalRelation(
     ) {
         RecordRestoreObservationSkip(
             L"target-logical-key-not-unique-in-overflow",
+            targetMapping.windowsIdentity
+        );
+
+        return;
+    }
+
+    if (
+        !HasSufficientTrustedLiveBaseline(
+            before.size
+        )
+    ) {
+        RecordRestoreObservationSkip(
+            L"waiting-for-trusted-live-baseline-quorum",
             targetMapping.windowsIdentity
         );
 
@@ -5379,6 +5747,331 @@ void RestoreCanonicalRelation(
     );
 }
 
+// A bounded, event-driven second pass for icons whose individual restore
+// was skipped because the other live icons were not yet in canonical order.
+// Never retain ABI pointers beyond the immediate move that uses them.
+void* AcquireCurrentOverflowIconAtIndex(
+    unsigned int index,
+    const LiveOverflowEntry& expected
+) {
+    void* model = g_taskbarModel6.load(std::memory_order_acquire);
+    if (!model || !TaskbarModel_GetOverflowIcons_Original ||
+        !g_notificationAreaIconVectorId) {
+        return nullptr;
+    }
+
+    void* collectionAbi = nullptr;
+    const HRESULT getterResult = static_cast<HRESULT>(
+        TaskbarModel_GetOverflowIcons_Original(model, &collectionAbi)
+    );
+    if (FAILED(getterResult) || !collectionAbi) {
+        return nullptr;
+    }
+
+    void* vectorAbi = nullptr;
+    const HRESULT queryResult = reinterpret_cast<IUnknown*>(
+        collectionAbi
+    )->QueryInterface(*g_notificationAreaIconVectorId, &vectorAbi);
+
+    if (FAILED(queryResult) || !vectorAbi) {
+        reinterpret_cast<IUnknown*>(collectionAbi)->Release();
+        return nullptr;
+    }
+
+    void* acquired = nullptr;
+    void** vtable = *reinterpret_cast<void***>(vectorAbi);
+    if (vtable && vtable[6] && vtable[7]) {
+        const auto getAt = reinterpret_cast<Vector_GetAt_t>(vtable[6]);
+        const auto getSize = reinterpret_cast<Vector_GetSize_t>(vtable[7]);
+        unsigned int liveSize = 0;
+
+        if (SUCCEEDED(getSize(vectorAbi, &liveSize)) && index < liveSize) {
+            void* iconAbi = nullptr;
+            if (SUCCEEDED(getAt(vectorAbi, index, &iconAbi)) && iconAbi) {
+                LiveIdentityMapping mapping;
+                if (LookupLiveMapping(iconAbi, &mapping) &&
+                    mapping.windowsIdentity == expected.windowsIdentity &&
+                    BuildLogicalKey(mapping.windowsIdentity) ==
+                        expected.logicalKey) {
+                    acquired = iconAbi;
+                } else {
+                    reinterpret_cast<IUnknown*>(iconAbi)->Release();
+                }
+            }
+        }
+    }
+
+    reinterpret_cast<IUnknown*>(vectorAbi)->Release();
+    reinterpret_cast<IUnknown*>(collectionAbi)->Release();
+    return acquired;
+}
+
+void ReconcileKnownLiveOverflowOrder(
+    void* manager,
+    unsigned long long visibleAddCall
+) {
+    if (!manager || !NotificationAreaIconManager_MoveIcon ||
+        g_internalMoveDepth != 0 || g_taskbarMoveDepth != 0 ||
+        static_cast<OrderingBehavior>(
+            g_orderingBehavior.load(std::memory_order_acquire)) !=
+            OrderingBehavior::PreserveManual) {
+        return;
+    }
+
+    if (
+        !g_liveBaselineActiveInSession.load(
+            std::memory_order_acquire
+        )
+    ) {
+        TOR_LOG(
+            L"TRAY_ORDER_LOCK_LIVE_RECONCILE_SKIPPED "
+            L"reason=\"canonical-live-baseline-not-established\" "
+            L"call=%llu",
+            visibleAddCall
+        );
+
+        return;
+    }
+
+    constexpr unsigned int kMaxSweepIcons = 64;
+    const std::vector<std::wstring> canonical =
+        GetCanonicalOrderSnapshot();
+    const LiveOverflowSnapshot initial =
+        CaptureLiveOverflowSnapshot(nullptr);
+
+    // Never operate on unmapped, unknown, or duplicate live identities.
+    // Hot reload commonly has unmapped existing objects: that is a no-op.
+    if (!initial.valid || initial.size < 2 ||
+        initial.size > kMaxSweepIcons ||
+        initial.entries.size() != initial.size ||
+        initial.mappedEntries != initial.size) {
+        TOR_LOG(
+            L"TRAY_ORDER_LOCK_LIVE_RECONCILE_SKIPPED "
+            L"reason=\"incomplete-live-snapshot\" call=%llu "
+            L"valid=%d size=%u mapped=%u",
+            visibleAddCall, initial.valid ? 1 : 0,
+            initial.size, initial.mappedEntries
+        );
+        return;
+    }
+
+    if (
+        !HasSufficientTrustedLiveBaseline(
+            initial.size
+        )
+    ) {
+        TOR_LOG(
+            L"TRAY_ORDER_LOCK_LIVE_RECONCILE_SKIPPED "
+            L"reason=\"waiting-for-live-baseline-quorum\" "
+            L"call=%llu size=%u baselineSize=%u",
+            visibleAddCall,
+            initial.size,
+            g_liveBaselineSize.load(
+                std::memory_order_acquire
+            )
+        );
+
+        return;
+    }
+
+    for (const LiveOverflowEntry& entry : initial.entries) {
+        if (!entry.mapped || !entry.uniqueLogical ||
+            entry.logicalKey.empty() ||
+            std::count(canonical.begin(), canonical.end(),
+                       entry.logicalKey) != 1) {
+            TOR_LOG(
+                L"TRAY_ORDER_LOCK_LIVE_RECONCILE_SKIPPED "
+                L"reason=\"unknown-or-nonunique-logical-key\" "
+                L"call=%llu identity=%llu",
+                visibleAddCall,
+                static_cast<unsigned long long>(entry.windowsIdentity)
+            );
+            return;
+        }
+    }
+
+    std::vector<LiveOverflowEntry> desired = initial.entries;
+    std::sort(
+        desired.begin(), desired.end(),
+        [&canonical](const LiveOverflowEntry& left,
+                     const LiveOverflowEntry& right) {
+            return std::find(canonical.begin(), canonical.end(),
+                             left.logicalKey) <
+                   std::find(canonical.begin(), canonical.end(),
+                             right.logicalKey);
+        }
+    );
+
+    bool anyConflict = false;
+    for (std::size_t i = 0; i < desired.size(); ++i) {
+        if (desired[i].logicalKey != initial.entries[i].logicalKey) {
+            anyConflict = true;
+            break;
+        }
+    }
+    if (!anyConflict) {
+        return;
+    }
+
+    // Two concurrently live no-GUID registrations with identical metadata
+    // are ambiguous even if their path-based logical keys differ.
+    std::vector<ContinuityIdentityMetadata> metadata(initial.size);
+    std::vector<bool> metadataValid(initial.size, false);
+    for (std::size_t i = 0; i < initial.entries.size(); ++i) {
+        metadataValid[i] = BuildContinuityIdentityMetadata(
+            initial.entries[i].windowsIdentity, &metadata[i]
+        );
+    }
+    for (std::size_t i = 0; i < metadata.size(); ++i) {
+        if (!metadataValid[i]) {
+            continue;
+        }
+        for (std::size_t j = i + 1; j < metadata.size(); ++j) {
+            if (metadataValid[j] &&
+                ContinuityIdentityMatches(metadata[i], metadata[j])) {
+                TOR_LOG(
+                    L"TRAY_ORDER_LOCK_LIVE_RECONCILE_SKIPPED "
+                    L"reason=\"ambiguous-live-continuity\" "
+                    L"call=%llu identityA=%llu identityB=%llu",
+                    visibleAddCall,
+                    static_cast<unsigned long long>(
+                        initial.entries[i].windowsIdentity),
+                    static_cast<unsigned long long>(
+                        initial.entries[j].windowsIdentity)
+                );
+                return;
+            }
+        }
+    }
+
+    TOR_LOG(
+        L"TRAY_ORDER_LOCK_LIVE_RECONCILE_BEGIN "
+        L"call=%llu overflowSize=%u canonicalFingerprint=%016llX",
+        visibleAddCall, initial.size,
+        static_cast<unsigned long long>(
+            DiagnosticCanonicalFingerprint(canonical))
+    );
+
+    std::vector<LiveOverflowEntry> observed = initial.entries;
+    unsigned int verifiedMoves = 0;
+
+    // Stable insertion: a maximum of size-1 verified moves, with one attempt
+    // per position. If Windows disagrees with the predicted entire sequence,
+    // stop immediately; do not retry or guess.
+    for (std::size_t correctIndex = 0;
+         correctIndex < desired.size(); ++correctIndex) {
+        if (GetCanonicalOrderSnapshot() != canonical) {
+            TOR_LOG(
+                L"TRAY_ORDER_LOCK_LIVE_RECONCILE_STOP "
+                L"reason=\"canonical-changed\" call=%llu "
+                L"verifiedMoves=%u",
+                visibleAddCall, verifiedMoves
+            );
+            return;
+        }
+        if (observed[correctIndex].logicalKey ==
+            desired[correctIndex].logicalKey) {
+            continue;
+        }
+
+        std::size_t sourceIndex = correctIndex + 1;
+        while (sourceIndex < observed.size() &&
+               observed[sourceIndex].logicalKey !=
+                   desired[correctIndex].logicalKey) {
+            ++sourceIndex;
+        }
+        if (sourceIndex == observed.size()) {
+            TOR_LOG(
+                L"TRAY_ORDER_LOCK_LIVE_RECONCILE_STOP "
+                L"reason=\"desired-key-not-live\" call=%llu "
+                L"verifiedMoves=%u",
+                visibleAddCall, verifiedMoves
+            );
+            return;
+        }
+
+        void* liveAbi = AcquireCurrentOverflowIconAtIndex(
+            static_cast<unsigned int>(sourceIndex), observed[sourceIndex]
+        );
+        if (!liveAbi) {
+            TOR_LOG(
+                L"TRAY_ORDER_LOCK_LIVE_RECONCILE_STOP "
+                L"reason=\"live-abi-not-confirmed\" call=%llu "
+                L"identity=%llu verifiedMoves=%u",
+                visibleAddCall,
+                static_cast<unsigned long long>(
+                    observed[sourceIndex].windowsIdentity),
+                verifiedMoves
+            );
+            return;
+        }
+
+        const std::uint64_t movedIdentity =
+            observed[sourceIndex].windowsIdentity;
+        std::vector<LiveOverflowEntry> predicted = observed;
+        std::rotate(predicted.begin() + correctIndex,
+                    predicted.begin() + sourceIndex,
+                    predicted.begin() + sourceIndex + 1);
+
+        void* iconArgumentStorage = liveAbi;
+        g_internalMoveDepth++;
+        NotificationAreaIconManager_MoveIcon(
+            manager, &iconArgumentStorage, kOverflowLocation,
+            static_cast<unsigned int>(correctIndex)
+        );
+        g_internalMoveDepth--;
+        reinterpret_cast<IUnknown*>(liveAbi)->Release();
+
+        const LiveOverflowSnapshot after =
+            CaptureLiveOverflowSnapshot(nullptr);
+        bool verified = after.valid &&
+            after.size == initial.size &&
+            after.mappedEntries == after.size &&
+            after.entries.size() == predicted.size();
+        if (verified) {
+            for (std::size_t i = 0; i < predicted.size(); ++i) {
+                if (!after.entries[i].mapped ||
+                    !after.entries[i].uniqueLogical ||
+                    after.entries[i].windowsIdentity !=
+                        predicted[i].windowsIdentity ||
+                    after.entries[i].logicalKey !=
+                        predicted[i].logicalKey) {
+                    verified = false;
+                    break;
+                }
+            }
+        }
+
+        TOR_LOG(
+            L"TRAY_ORDER_LOCK_LIVE_RECONCILE_MOVE_COMPLETE "
+            L"call=%llu identity=%llu fromIndex=%u toIndex=%u "
+            L"verified=%d",
+            visibleAddCall,
+            static_cast<unsigned long long>(movedIdentity),
+            static_cast<unsigned int>(sourceIndex),
+            static_cast<unsigned int>(correctIndex),
+            verified ? 1 : 0
+        );
+        if (!verified) {
+            TOR_LOG(
+                L"TRAY_ORDER_LOCK_LIVE_RECONCILE_STOP "
+                L"reason=\"move-not-verified\" call=%llu "
+                L"verifiedMoves=%u",
+                visibleAddCall, verifiedMoves
+            );
+            return;
+        }
+
+        observed = after.entries;
+        ++verifiedMoves;
+    }
+
+    TOR_LOG(
+        L"TRAY_ORDER_LOCK_LIVE_RECONCILE_COMPLETE "
+        L"call=%llu verifiedMoves=%u overflowSize=%u",
+        visibleAddCall, verifiedMoves, initial.size
+    );
+}
 void __cdecl
 NotificationAreaIconManager_AddVisible_Hook(
     void* pThis,
@@ -5449,6 +6142,11 @@ NotificationAreaIconManager_AddVisible_Hook(
     RestoreCanonicalRelation(
         pThis,
         iconImplementation
+    );
+
+    ReconcileKnownLiveOverflowOrder(
+        pThis,
+        callNumber
     );
 }
 int __cdecl
