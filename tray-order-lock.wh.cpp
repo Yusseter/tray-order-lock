@@ -86,7 +86,7 @@ the end of the overflow area. Ambiguous icons are left untouched.
 namespace {
 
 constexpr wchar_t kPersistentDevelopmentLogBuild[] =
-    L"0.2.0-dev-order-drift-session-gated-baseline";
+    L"0.2.0-dev-order-drift-known-target-continuity";
 
 std::mutex g_persistentDevelopmentLogMutex;
 HANDLE g_persistentDevelopmentLogFile = INVALID_HANDLE_VALUE;
@@ -425,8 +425,14 @@ struct LogicalSnapshotEntry {
 };
 
 struct ContinuityIdentityMetadata {
+    bool guidBacked = false;
+
     DWORD uid = 0;
     std::wstring tooltip;
+
+    std::wstring normalizedExecutablePath;
+    std::vector<unsigned int> packageVersion;
+
     std::vector<BYTE> iconSnapshot;
 };
 
@@ -911,6 +917,210 @@ std::wstring BuildVersionNormalizedPath(
     return result;
 }
 
+int CompareVersionParts(
+    const std::vector<unsigned int>& left,
+    const std::vector<unsigned int>& right
+) {
+    const std::size_t count =
+        std::max(
+            left.size(),
+            right.size()
+        );
+
+    for (std::size_t index = 0; index < count; index++) {
+        const unsigned int leftPart =
+            index < left.size()
+                ? left[index]
+                : 0;
+
+        const unsigned int rightPart =
+            index < right.size()
+                ? right[index]
+                : 0;
+
+        if (leftPart < rightPart) {
+            return -1;
+        }
+
+        if (leftPart > rightPart) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+bool ParseNumericDottedVersion(
+    const std::wstring& value,
+    std::vector<unsigned int>* parts
+) {
+    if (!parts || !IsNumericDottedVersionCore(value)) {
+        return false;
+    }
+
+    parts->clear();
+
+    unsigned long long current = 0;
+    bool digitSeen = false;
+
+    for (wchar_t character : value) {
+        if (character >= L'0' && character <= L'9') {
+            current =
+                current * 10 +
+                static_cast<unsigned int>(
+                    character - L'0'
+                );
+
+            if (current > 0xFFFFFFFFULL) {
+                parts->clear();
+                return false;
+            }
+
+            digitSeen = true;
+            continue;
+        }
+
+        if (character != L'.' || !digitSeen) {
+            parts->clear();
+            return false;
+        }
+
+        parts->push_back(
+            static_cast<unsigned int>(current)
+        );
+
+        current = 0;
+        digitSeen = false;
+    }
+
+    if (!digitSeen) {
+        parts->clear();
+        return false;
+    }
+
+    parts->push_back(
+        static_cast<unsigned int>(current)
+    );
+
+    return
+        parts->size() >= 2;
+}
+
+std::wstring BuildWindowsAppsGuidContinuityPath(
+    const std::wstring& executablePath,
+    std::vector<unsigned int>* packageVersion
+) {
+    if (packageVersion) {
+        packageVersion->clear();
+    }
+
+    std::wstring path =
+        ToLower(
+            NormalizeSlashes(
+                executablePath
+            )
+        );
+
+    if (path.empty()) {
+        return L"";
+    }
+
+    const std::wstring marker =
+        L"\\windowsapps\\";
+
+    const std::size_t markerIndex =
+        path.find(
+            marker
+        );
+
+    if (markerIndex == std::wstring::npos) {
+        return L"";
+    }
+
+    const std::size_t packageStart =
+        markerIndex +
+        marker.size();
+
+    const std::size_t packageEnd =
+        path.find(
+            L'\\',
+            packageStart
+        );
+
+    if (
+        packageEnd == std::wstring::npos ||
+        packageEnd <= packageStart
+    ) {
+        return L"";
+    }
+
+    std::wstring package =
+        path.substr(
+            packageStart,
+            packageEnd - packageStart
+        );
+
+    bool versionNormalized = false;
+
+    std::size_t separator =
+        package.find(L'_');
+
+    while (separator != std::wstring::npos) {
+        const std::size_t nextSeparator =
+            package.find(
+                L'_',
+                separator + 1
+            );
+
+        if (nextSeparator == std::wstring::npos) {
+            break;
+        }
+
+        const std::wstring candidate =
+            package.substr(
+                separator + 1,
+                nextSeparator - separator - 1
+            );
+
+        std::vector<unsigned int> parsedVersion;
+
+        if (
+            ParseNumericDottedVersion(
+                candidate,
+                &parsedVersion
+            )
+        ) {
+            package.replace(
+                separator + 1,
+                candidate.size(),
+                L"<version>"
+            );
+
+            if (packageVersion) {
+                *packageVersion =
+                    std::move(parsedVersion);
+            }
+
+            versionNormalized = true;
+            break;
+        }
+
+        separator =
+            nextSeparator;
+    }
+
+    if (!versionNormalized) {
+        return L"";
+    }
+
+    path.replace(
+        packageStart,
+        packageEnd - packageStart,
+        package
+    );
+
+    return path;
+}
 bool ContainsText(
     const wchar_t* text,
     const wchar_t* expected
@@ -1320,13 +1530,42 @@ bool BuildContinuityIdentityMetadata(
 
     std::wstring iconGuid;
 
-    if (
+    const bool hasGuid =
         QueryIconGuid(
             subkey,
             &iconGuid
-        )
-    ) {
-        return false;
+        );
+
+    if (hasGuid) {
+        metadata->normalizedExecutablePath =
+            BuildWindowsAppsGuidContinuityPath(
+                QueryStringValue(
+                    subkey,
+                    L"ExecutablePath"
+                ),
+                &metadata->packageVersion
+            );
+
+        if (
+            metadata->normalizedExecutablePath.empty()
+        ) {
+            return false;
+        }
+
+        if (
+            !QueryBinaryValue(
+                subkey,
+                L"IconSnapshot",
+                &metadata->iconSnapshot
+            )
+        ) {
+            return false;
+        }
+
+        metadata->guidBacked =
+            true;
+
+        return true;
     }
 
     if (
@@ -1370,6 +1609,20 @@ bool ContinuityIdentityMatches(
     const ContinuityIdentityMetadata& left,
     const ContinuityIdentityMetadata& right
 ) {
+    if (
+        left.guidBacked ||
+        right.guidBacked
+    ) {
+        return
+            left.guidBacked &&
+            right.guidBacked &&
+            !left.normalizedExecutablePath.empty() &&
+            left.normalizedExecutablePath ==
+                right.normalizedExecutablePath &&
+            left.iconSnapshot ==
+                right.iconSnapshot;
+    }
+
     return
         left.uid ==
             right.uid &&
@@ -1682,6 +1935,221 @@ bool ContinuityGroupContainsKey(
         group.keys.end();
 }
 
+bool FindGuidContinuityPredecessorFromRegistry(
+    const ContinuityIdentityMetadata& targetMetadata,
+    const std::wstring& targetKey,
+    const std::vector<std::wstring>& canonicalSnapshot,
+    std::uint64_t* predecessorIdentity,
+    std::wstring* predecessorKey
+) {
+    if (
+        !targetMetadata.guidBacked ||
+        targetMetadata.packageVersion.empty() ||
+        targetKey.empty() ||
+        !predecessorIdentity ||
+        !predecessorKey
+    ) {
+        return false;
+    }
+
+    *predecessorIdentity = 0;
+    predecessorKey->clear();
+
+    HKEY settingsKey = nullptr;
+
+    const LONG openStatus =
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            kNotifyIconSettingsPath,
+            0,
+            KEY_READ,
+            &settingsKey
+        );
+
+    if (openStatus != ERROR_SUCCESS) {
+        return false;
+    }
+
+    bool found = false;
+    bool ambiguous = false;
+
+    std::uint64_t selectedIdentity = 0;
+    std::wstring selectedKey;
+    std::vector<unsigned int> selectedVersion;
+
+    DWORD enumerationIndex = 0;
+
+    for (;;) {
+        wchar_t subkeyName[64]{};
+        DWORD subkeyNameLength =
+            ARRAYSIZE(subkeyName);
+
+        const LONG enumerationStatus =
+            RegEnumKeyExW(
+                settingsKey,
+                enumerationIndex,
+                subkeyName,
+                &subkeyNameLength,
+                nullptr,
+                nullptr,
+                nullptr,
+                nullptr
+            );
+
+        if (
+            enumerationStatus ==
+            ERROR_NO_MORE_ITEMS
+        ) {
+            break;
+        }
+
+        enumerationIndex++;
+
+        if (
+            enumerationStatus !=
+            ERROR_SUCCESS
+        ) {
+            continue;
+        }
+
+        if (
+            subkeyNameLength >=
+            ARRAYSIZE(subkeyName)
+        ) {
+            continue;
+        }
+
+        subkeyName[subkeyNameLength] =
+            L'\0';
+
+        wchar_t* parseEnd = nullptr;
+
+        const unsigned long long parsedIdentity =
+            std::wcstoull(
+                subkeyName,
+                &parseEnd,
+                10
+            );
+
+        if (
+            parsedIdentity == 0 ||
+            !parseEnd ||
+            *parseEnd != L'\0'
+        ) {
+            continue;
+        }
+
+        const std::uint64_t candidateIdentity =
+            static_cast<std::uint64_t>(
+                parsedIdentity
+            );
+
+        ContinuityIdentityMetadata candidateMetadata;
+
+        if (
+            !BuildContinuityIdentityMetadata(
+                candidateIdentity,
+                &candidateMetadata
+            ) ||
+            !candidateMetadata.guidBacked ||
+            candidateMetadata.packageVersion.empty() ||
+            !ContinuityIdentityMatches(
+                targetMetadata,
+                candidateMetadata
+            )
+        ) {
+            continue;
+        }
+
+        const std::wstring candidateKey =
+            BuildLogicalKey(
+                candidateIdentity
+            );
+
+        if (
+            candidateKey.empty() ||
+            candidateKey == targetKey ||
+            std::find(
+                canonicalSnapshot.begin(),
+                canonicalSnapshot.end(),
+                candidateKey
+            ) == canonicalSnapshot.end()
+        ) {
+            continue;
+        }
+
+        const int relativeToTarget =
+            CompareVersionParts(
+                candidateMetadata.packageVersion,
+                targetMetadata.packageVersion
+            );
+
+        if (relativeToTarget > 0) {
+            continue;
+        }
+
+        if (!found) {
+            found = true;
+            ambiguous = false;
+
+            selectedIdentity =
+                candidateIdentity;
+
+            selectedKey =
+                candidateKey;
+
+            selectedVersion =
+                candidateMetadata.packageVersion;
+
+            continue;
+        }
+
+        const int relativeToSelected =
+            CompareVersionParts(
+                candidateMetadata.packageVersion,
+                selectedVersion
+            );
+
+        if (relativeToSelected > 0) {
+            ambiguous = false;
+
+            selectedIdentity =
+                candidateIdentity;
+
+            selectedKey =
+                candidateKey;
+
+            selectedVersion =
+                candidateMetadata.packageVersion;
+        }
+        else if (
+            relativeToSelected == 0 &&
+            candidateKey != selectedKey
+        ) {
+            ambiguous = true;
+        }
+    }
+
+    RegCloseKey(
+        settingsKey
+    );
+
+    if (
+        !found ||
+        ambiguous
+    ) {
+        return false;
+    }
+
+    *predecessorIdentity =
+        selectedIdentity;
+
+    *predecessorKey =
+        selectedKey;
+
+    return true;
+}
+
 bool AnalyzeContinuityGroup(
     std::uint64_t targetIdentity,
     const std::wstring& targetKey,
@@ -1690,8 +2158,7 @@ bool AnalyzeContinuityGroup(
     ContinuityGroupAnalysis* analysis
 ) {
     if (
-        targetIdentity ==
-            0 ||
+        targetIdentity == 0 ||
         targetKey.empty() ||
         !analysis
     ) {
@@ -1712,63 +2179,124 @@ bool AnalyzeContinuityGroup(
         return false;
     }
 
-    unsigned int targetMatches =
-        0;
-
-    for (
-        const LogicalSnapshotEntry& entry :
-        logicalSnapshot
-    ) {
-        if (
-            !entry.unique ||
-            entry.key.empty()
-        ) {
-            continue;
-        }
-
-        ContinuityIdentityMetadata candidateMetadata;
+    if (targetMetadata.guidBacked) {
+        std::uint64_t predecessorIdentity = 0;
+        std::wstring predecessorKey;
 
         if (
-            !BuildContinuityIdentityMetadata(
-                entry.identity,
-                &candidateMetadata
-            ) ||
-            !ContinuityIdentityMatches(
+            !FindGuidContinuityPredecessorFromRegistry(
                 targetMetadata,
-                candidateMetadata
+                targetKey,
+                canonicalSnapshot,
+                &predecessorIdentity,
+                &predecessorKey
             )
         ) {
-            continue;
+            return false;
         }
 
+        const bool targetKnown =
+            std::find(
+                canonicalSnapshot.begin(),
+                canonicalSnapshot.end(),
+                targetKey
+            ) != canonicalSnapshot.end();
+
+        TOR_LOG(
+            L"TRAY_ORDER_LOCK_GUID_CONTINUITY_PREDECESSOR "
+            L"windowsIdentity=%llu "
+            L"targetKnown=%d "
+            L"predecessorIdentity=%llu "
+            L"predecessorKey=\"%s\" "
+            L"targetKey=\"%s\"",
+            static_cast<unsigned long long>(
+                targetIdentity
+            ),
+            targetKnown
+                ? 1
+                : 0,
+            static_cast<unsigned long long>(
+                predecessorIdentity
+            ),
+            predecessorKey.c_str(),
+            targetKey.c_str()
+        );
+
+        // targetKnown can be true after an earlier new-icon
+        // place-at-end adoption. The registry predecessor is still
+        // authoritative for continuity migration in that case.
         analysis->identities.push_back(
-            entry.identity
+            targetIdentity
         );
 
         analysis->keys.push_back(
-            entry.key
+            targetKey
         );
 
-        if (
-            entry.identity ==
-                targetIdentity &&
-            entry.key ==
-                targetKey
-        ) {
-            targetMatches++;
-        }
+        analysis->identities.push_back(
+            predecessorIdentity
+        );
+
+        analysis->keys.push_back(
+            predecessorKey
+        );
     }
+    else {
+        unsigned int targetMatches = 0;
 
-    if (
-        targetMatches !=
-            1 ||
-        analysis->keys.size() <
-            2
-    ) {
-        *analysis =
-            ContinuityGroupAnalysis{};
+        for (
+            const LogicalSnapshotEntry& entry :
+            logicalSnapshot
+        ) {
+            if (
+                !entry.unique ||
+                entry.key.empty()
+            ) {
+                continue;
+            }
 
-        return false;
+            ContinuityIdentityMetadata candidateMetadata;
+
+            if (
+                !BuildContinuityIdentityMetadata(
+                    entry.identity,
+                    &candidateMetadata
+                ) ||
+                !ContinuityIdentityMatches(
+                    targetMetadata,
+                    candidateMetadata
+                )
+            ) {
+                continue;
+            }
+
+            analysis->identities.push_back(
+                entry.identity
+            );
+
+            analysis->keys.push_back(
+                entry.key
+            );
+
+            if (
+                entry.identity ==
+                    targetIdentity &&
+                entry.key ==
+                    targetKey
+            ) {
+                targetMatches++;
+            }
+        }
+
+        if (
+            targetMatches != 1 ||
+            analysis->keys.size() < 2
+        ) {
+            *analysis =
+                ContinuityGroupAnalysis{};
+
+            return false;
+        }
     }
 
     analysis->earliestCanonicalIndex =
@@ -1776,8 +2304,7 @@ bool AnalyzeContinuityGroup(
 
     for (
         std::size_t index = 0;
-        index <
-            canonicalSnapshot.size();
+        index < canonicalSnapshot.size();
         index++
     ) {
         const auto groupKey =
@@ -1821,7 +2348,8 @@ bool AnalyzeContinuityGroup(
             analysis->identities[groupIndex];
     }
 
-    return true;
+    return
+        analysis->canonicalMembers != 0;
 }
 bool ContainsCanonicalKeyLocked(
     const std::wstring& key
