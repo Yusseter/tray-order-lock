@@ -535,6 +535,7 @@ NotificationAreaIcon2_Constructor_t
 NotificationAreaIcon_QueryInterface_t
     NotificationAreaIcon_QueryInterface =
         nullptr;
+bool g_queryInterfaceUsesDefaultAbi = false;
 
 NotificationAreaIconManager_AddVisible_t
     NotificationAreaIconManager_AddVisible_Original =
@@ -1972,6 +1973,10 @@ bool FindGuidContinuityPredecessorFromRegistry(
 
     bool found = false;
     bool ambiguous = false;
+    unsigned int registryEntries = 0;
+    unsigned int metadataMatches = 0;
+    unsigned int canonicalMatches = 0;
+    unsigned int eligibleMatches = 0;
 
     std::uint64_t selectedIdentity = 0;
     std::wstring selectedKey;
@@ -2044,6 +2049,7 @@ bool FindGuidContinuityPredecessorFromRegistry(
                 parsedIdentity
             );
 
+        registryEntries++;
         ContinuityIdentityMetadata candidateMetadata;
 
         if (
@@ -2061,6 +2067,7 @@ bool FindGuidContinuityPredecessorFromRegistry(
             continue;
         }
 
+        metadataMatches++;
         const std::wstring candidateKey =
             BuildLogicalKey(
                 candidateIdentity
@@ -2078,6 +2085,7 @@ bool FindGuidContinuityPredecessorFromRegistry(
             continue;
         }
 
+        canonicalMatches++;
         const int relativeToTarget =
             CompareVersionParts(
                 candidateMetadata.packageVersion,
@@ -2088,6 +2096,7 @@ bool FindGuidContinuityPredecessorFromRegistry(
             continue;
         }
 
+        eligibleMatches++;
         if (!found) {
             found = true;
             ambiguous = false;
@@ -2138,6 +2147,18 @@ bool FindGuidContinuityPredecessorFromRegistry(
         !found ||
         ambiguous
     ) {
+        TOR_LOG(
+            L"TRAY_ORDER_LOCK_GUID_PREDECESSOR_REJECTED "
+            L"reason=%s targetKey=\"%s\" "
+            L"registryEntries=%u metadataMatches=%u "
+            L"canonicalMatches=%u eligibleMatches=%u",
+            ambiguous ? L"ambiguous" : L"no-match",
+            targetKey.c_str(),
+            registryEntries,
+            metadataMatches,
+            canonicalMatches,
+            eligibleMatches
+        );
         return false;
     }
 
@@ -2150,6 +2171,85 @@ bool FindGuidContinuityPredecessorFromRegistry(
     return true;
 }
 
+bool FindWindowsAppsUidCanonicalPredecessor(
+    std::uint64_t targetIdentity,
+    const std::wstring& targetKey,
+    const std::vector<std::wstring>& canonical,
+    std::wstring* predecessorKey
+) {
+    if (!predecessorKey || targetKey.empty() ||
+        std::find(canonical.begin(), canonical.end(), targetKey) !=
+            canonical.end()) {
+        return false;
+    }
+
+    const std::wstring subkey = MakeTrayEntrySubkey(targetIdentity);
+    DWORD uid = 0;
+
+    if (!QueryDwordValue(subkey, L"UID", &uid)) {
+        return false;
+    }
+
+    std::vector<unsigned int> targetVersion;
+    const std::wstring family = BuildWindowsAppsGuidContinuityPath(
+        QueryStringValue(subkey, L"ExecutablePath"), &targetVersion
+    );
+
+    if (family.empty() || targetVersion.empty()) {
+        return false;
+    }
+
+    const std::wstring prefix =
+        L"uid:" + std::to_wstring(uid) + L"|path:";
+
+    std::wstring bestKey;
+    std::vector<unsigned int> bestVersion;
+    bool ambiguous = false;
+
+    for (const std::wstring& key : canonical) {
+        if (key.compare(0, prefix.size(), prefix) != 0) {
+            continue;
+        }
+
+        std::vector<unsigned int> version;
+        const std::wstring candidateFamily =
+            BuildWindowsAppsGuidContinuityPath(
+                key.substr(prefix.size()), &version
+            );
+
+        if (candidateFamily != family || version.empty() ||
+            CompareVersionParts(version, targetVersion) >= 0) {
+            continue;
+        }
+
+        const int comparison = bestKey.empty()
+            ? 1
+            : CompareVersionParts(version, bestVersion);
+
+        if (comparison > 0) {
+            bestKey = key;
+            bestVersion = std::move(version);
+            ambiguous = false;
+        } else if (comparison == 0) {
+            ambiguous = true;
+        }
+    }
+
+    if (bestKey.empty() || ambiguous) {
+        return false;
+    }
+
+    *predecessorKey = bestKey;
+
+    TOR_LOG(
+        L"TRAY_ORDER_LOCK_UID_CANONICAL_PREDECESSOR "
+        L"windowsIdentity=%llu predecessorKey=\"%s\" targetKey=\"%s\"",
+        static_cast<unsigned long long>(targetIdentity),
+        predecessorKey->c_str(), targetKey.c_str()
+    );
+
+    return true;
+}
 bool AnalyzeContinuityGroup(
     std::uint64_t targetIdentity,
     const std::wstring& targetKey,
@@ -2192,6 +2292,13 @@ bool AnalyzeContinuityGroup(
                 &predecessorKey
             )
         ) {
+            TOR_LOG(
+                L"TRAY_ORDER_LOCK_CONTINUITY_NO_CANDIDATE "
+                L"reason=\"guid-predecessor-unavailable\" "
+                L"windowsIdentity=%llu targetKey=\"%s\"",
+                static_cast<unsigned long long>(targetIdentity),
+                targetKey.c_str()
+            );
             return false;
         }
 
@@ -2288,10 +2395,31 @@ bool AnalyzeContinuityGroup(
             }
         }
 
+        if (targetMatches == 1 && analysis->keys.size() == 1) {
+            std::wstring predecessorKey;
+
+            if (FindWindowsAppsUidCanonicalPredecessor(
+                    targetIdentity, targetKey, canonicalSnapshot,
+                    &predecessorKey)) {
+                analysis->identities.push_back(0);
+                analysis->keys.push_back(predecessorKey);
+            }
+        }
+
         if (
             targetMatches != 1 ||
             analysis->keys.size() < 2
         ) {
+            TOR_LOG(
+                L"TRAY_ORDER_LOCK_CONTINUITY_NO_CANDIDATE "
+                L"reason=\"uid-no-unique-peer\" "
+                L"windowsIdentity=%llu targetMatches=%u "
+                L"matchingEntries=%llu targetKey=\"%s\"",
+                static_cast<unsigned long long>(targetIdentity),
+                targetMatches,
+                static_cast<unsigned long long>(analysis->keys.size()),
+                targetKey.c_str()
+            );
             *analysis =
                 ContinuityGroupAnalysis{};
 
@@ -4492,6 +4620,13 @@ TryReconcileCanonicalContinuityGroup(
             &targetMetadata
         )
     ) {
+        TOR_LOG(
+            L"TRAY_ORDER_LOCK_CONTINUITY_NO_CANDIDATE "
+            L"reason=\"target-metadata-unavailable\" "
+            L"windowsIdentity=%llu targetKey=\"%s\"",
+            static_cast<unsigned long long>(targetMapping.windowsIdentity),
+            targetKey.c_str()
+        );
         return
             ContinuityReconcileResult::NoCandidate;
     }
@@ -4534,6 +4669,13 @@ TryReconcileCanonicalContinuityGroup(
             &group
         )
     ) {
+        TOR_LOG(
+            L"TRAY_ORDER_LOCK_CONTINUITY_NO_CANDIDATE "
+            L"reason=\"group-analysis-failed\" "
+            L"windowsIdentity=%llu targetKey=\"%s\"",
+            static_cast<unsigned long long>(targetMapping.windowsIdentity),
+            targetKey.c_str()
+        );
         return
             ContinuityReconcileResult::NoCandidate;
     }
@@ -6753,14 +6895,150 @@ NotificationAreaIcon2_Constructor_Hook(
         NotificationAreaIcon_QueryInterface &&
         g_notificationAreaIconInterfaceId
     ) {
-        queryResult =
-            static_cast<HRESULT>(
-                NotificationAreaIcon_QueryInterface(
-                    pThis,
-                    *g_notificationAreaIconInterfaceId,
-                    &queriedAbi
-                )
+        bool safeToCall = true;
+        void* queryObject = pThis;
+
+        if (g_queryInterfaceUsesDefaultAbi) {
+            safeToCall = false;
+
+            const auto isReadablePointer = [](const void* address) -> bool {
+                if (!address) {
+                    return false;
+                }
+
+                MEMORY_BASIC_INFORMATION info{};
+
+                if (
+                    VirtualQuery(address, &info, sizeof(info)) != sizeof(info) ||
+                    info.State != MEM_COMMIT ||
+                    (info.Protect & (PAGE_GUARD | PAGE_NOACCESS))
+                ) {
+                    return false;
+                }
+
+                const DWORD protection = info.Protect & 0xFF;
+
+                if (
+                    protection != PAGE_READONLY &&
+                    protection != PAGE_READWRITE &&
+                    protection != PAGE_WRITECOPY &&
+                    protection != PAGE_EXECUTE_READ &&
+                    protection != PAGE_EXECUTE_READWRITE &&
+                    protection != PAGE_EXECUTE_WRITECOPY
+                ) {
+                    return false;
+                }
+
+                const auto position =
+                    reinterpret_cast<std::uintptr_t>(address);
+
+                const auto regionStart =
+                    reinterpret_cast<std::uintptr_t>(info.BaseAddress);
+
+                const auto regionEnd =
+                    regionStart + info.RegionSize;
+
+                return
+                    position >= regionStart &&
+                    position <= regionEnd &&
+                    regionEnd - position >= sizeof(void*);
+            };
+
+            unsigned int matches = 0;
+            std::size_t matchedOffset = 0;
+
+            const auto objectAddress =
+                reinterpret_cast<std::uintptr_t>(pThis);
+
+            for (std::size_t slot = 0; slot < 16; ++slot) {
+                const std::size_t offset = slot * sizeof(void*);
+                const auto address = objectAddress + offset;
+
+                if (
+                    !isReadablePointer(
+                        reinterpret_cast<const void*>(address)
+                    )
+                ) {
+                    continue;
+                }
+
+                void* const* candidateVtable = nullptr;
+
+                std::memcpy(
+                    &candidateVtable,
+                    reinterpret_cast<const void*>(address),
+                    sizeof(candidateVtable)
+                );
+
+                if (
+                    !candidateVtable ||
+                    reinterpret_cast<std::uintptr_t>(candidateVtable) %
+                        alignof(void*) != 0 ||
+                    !isReadablePointer(candidateVtable)
+                ) {
+                    continue;
+                }
+
+                void* firstMethod = nullptr;
+
+                std::memcpy(
+                    &firstMethod,
+                    candidateVtable,
+                    sizeof(firstMethod)
+                );
+
+                TOR_LOG(
+                    L"TRAY_ORDER_LOCK_QI_ABI_SLOT "
+                    L"slot=%llu offset=%llu firstMethod=%p",
+                    static_cast<unsigned long long>(slot),
+                    static_cast<unsigned long long>(offset),
+                    firstMethod
+                );
+
+                if (
+                    firstMethod ==
+                    reinterpret_cast<void*>(
+                        NotificationAreaIcon_QueryInterface
+                    )
+                ) {
+                    matches++;
+                    matchedOffset = offset;
+                }
+            }
+
+            if (
+                matches == 1 &&
+                matchedOffset == 2 * sizeof(void*)
+            ) {
+                queryObject =
+                    reinterpret_cast<void*>(
+                        objectAddress + matchedOffset
+                    );
+
+                safeToCall = true;
+            }
+
+            TOR_LOG(
+                L"TRAY_ORDER_LOCK_QI_ABI_SCAN "
+                L"implementation=%p matches=%u matchedOffset=%llu "
+                L"resolvedQuery=%p callAllowed=%d",
+                pThis,
+                matches,
+                static_cast<unsigned long long>(matchedOffset),
+                NotificationAreaIcon_QueryInterface,
+                safeToCall ? 1 : 0
             );
+        }
+        if (safeToCall) {
+            queryResult =
+                static_cast<HRESULT>(
+                    NotificationAreaIcon_QueryInterface(
+                        queryObject,
+                        *g_notificationAreaIconInterfaceId,
+                        &queriedAbi
+                    )
+                );
+        }
     }
 
     const UIOrderSnapshot current =
@@ -7339,6 +7617,8 @@ bool ResolveLiveIdentitySymbols(
     NotificationAreaIcon_QueryInterface =
         nullptr;
 
+    g_queryInterfaceUsesDefaultAbi = false;
+
     NotificationAreaIconManager_MoveIcon =
         nullptr;
 
@@ -7388,6 +7668,9 @@ bool ResolveLiveIdentitySymbols(
     unsigned int queryInterfaceMatches =
         0;
 
+    unsigned int defaultAbiQueryMatches = 0;
+    NotificationAreaIcon_QueryInterface_t defaultAbiQuery = nullptr;
+
     unsigned int iidMatches =
         0;
 
@@ -7397,7 +7680,40 @@ bool ResolveLiveIdentitySymbols(
     unsigned int managerMoveMatches =
         0;
 
+    unsigned int icon2SymbolNames = 0;
+    unsigned int queryInterfaceSymbolNames = 0;
+    unsigned int qiCandidateCount = 0;
+
     do {
+        const bool mentionsIcon2 =
+            ContainsText(symbol.symbol, L"NotificationAreaIcon2");
+
+        const bool mentionsQueryInterface =
+            ContainsText(symbol.symbol, L"query_interface") ||
+            ContainsText(symbol.symbol, L"QueryInterface");
+
+        if (mentionsIcon2) {
+            icon2SymbolNames++;
+        }
+
+        if (mentionsQueryInterface) {
+            queryInterfaceSymbolNames++;
+        }
+
+        if (mentionsIcon2 && mentionsQueryInterface) {
+            qiCandidateCount++;
+
+            if (qiCandidateCount <= 24) {
+                TOR_LOG(
+                    L"TRAY_ORDER_LOCK_QI_SYMBOL_CANDIDATE "
+                    L"index=%u address=%p name=\"%s\"",
+                    qiCandidateCount,
+                    symbol.address,
+                    symbol.symbol
+                );
+            }
+        }
+
         if (
             IsNotificationAreaIconConstructorSymbol(
                 symbol.symbol
@@ -7431,6 +7747,23 @@ bool ResolveLiveIdentitySymbols(
                     reinterpret_cast<
                         NotificationAreaIcon_QueryInterface_t
                     >(
+                        symbol.address
+                    );
+            }
+        }
+
+        if (
+            symbol.symbol &&
+            std::wcscmp(
+                symbol.symbol,
+                LR"(public: virtual int __cdecl winrt::impl::produce_base<struct winrt::WindowsUdk::UI::Shell::implementation::NotificationAreaIcon2,struct winrt::WindowsUdk::UI::Shell::INotificationAreaIcon,void>::QueryInterface(struct winrt::guid const &,void * *))"
+            ) == 0
+        ) {
+            defaultAbiQueryMatches++;
+
+            if (!defaultAbiQuery) {
+                defaultAbiQuery =
+                    reinterpret_cast<NotificationAreaIcon_QueryInterface_t>(
                         symbol.address
                     );
             }
@@ -7501,6 +7834,35 @@ bool ResolveLiveIdentitySymbols(
 
     Wh_FindCloseSymbol(
         search
+    );
+
+    TOR_LOG(
+        L"TRAY_ORDER_LOCK_SYMBOL_SCAN "
+        L"icon2Names=%u queryInterfaceNames=%u "
+        L"qiCandidates=%u",
+        icon2SymbolNames,
+        queryInterfaceSymbolNames,
+        qiCandidateCount
+    );
+
+    if (
+        !NotificationAreaIcon_QueryInterface &&
+        defaultAbiQueryMatches == 1
+    ) {
+        NotificationAreaIcon_QueryInterface = defaultAbiQuery;
+        g_queryInterfaceUsesDefaultAbi = true;
+    }
+
+    TOR_LOG(
+        L"TRAY_ORDER_LOCK_QI_SOURCE "
+        L"rootMatches=%u defaultAbiMatches=%u selected=%s",
+        queryInterfaceMatches,
+        defaultAbiQueryMatches,
+        g_queryInterfaceUsesDefaultAbi
+            ? L"default-interface-abi"
+            : (NotificationAreaIcon_QueryInterface
+                ? L"root-implements"
+                : L"unavailable")
     );
 
     TOR_LOG(
