@@ -649,8 +649,7 @@ bool g_canonicalLoadedFromStorage =
 std::atomic<bool> g_liveBaselineTrusted = false;
 std::atomic<unsigned int> g_liveBaselineSize = 0;
 
-// A manual move may update the persisted baseline, but automatic
-// ordering must not activate until the next Explorer/mod session.
+// An initially untrusted baseline becomes active in the next session.
 std::atomic<bool> g_liveBaselineActiveInSession = false;
 
 std::mutex g_liveMappingMutex;
@@ -3800,6 +3799,11 @@ void LearnManualMove(
 
     // A changed canonical order must not retain its old trust marker.
 
+    const bool baselineWasActive =
+        g_liveBaselineActiveInSession.load(
+            std::memory_order_acquire
+        );
+
     const bool baselineInvalidated =
         Wh_SetIntValue(
             kLiveBaselineTrustedValueName, 0
@@ -3877,7 +3881,7 @@ void LearnManualMove(
             );
 
             g_liveBaselineActiveInSession.store(
-                true,
+                baselineWasActive,
                 std::memory_order_release
             );
         }
