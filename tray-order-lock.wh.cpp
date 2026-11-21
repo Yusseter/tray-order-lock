@@ -3875,6 +3875,11 @@ void LearnManualMove(
                 true,
                 std::memory_order_release
             );
+
+            g_liveBaselineActiveInSession.store(
+                true,
+                std::memory_order_release
+            );
         }
     }
 
