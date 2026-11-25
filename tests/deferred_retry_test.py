@@ -12,11 +12,14 @@ code = r'''
 #include <atomic>
 #include <cstdint>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <vector>
 enum class OrderingBehavior { LockAll, PreserveManual };
 std::atomic<int> g_orderingBehavior{1};
 unsigned g_internalMoveDepth=0, g_taskbarMoveDepth=0;
+std::mutex g_restoreRetryMutex;
+std::vector<std::uint64_t> g_restoreRetryIdentities{2};
 struct LiveOverflowEntry { std::uint64_t windowsIdentity; std::wstring logicalKey; bool mapped=true, uniqueLogical=true; };
 struct LiveOverflowSnapshot { bool valid=true; unsigned size=2, mappedEntries=2; std::vector<LiveOverflowEntry> entries; };
 struct LiveIdentityMapping { std::uint64_t windowsIdentity=0; };
@@ -40,16 +43,16 @@ bool LookupLiveMapping(void*, LiveIdentityMapping* mapping) {
 }
 void RestoreCanonicalRelationForMapping(void*, const LiveIdentityMapping&) {
     ++restores;
-    if (migrate) { canonical.push_back(L"updated"); }
+    if (migrate) { canonical.push_back(L"updated"); g_restoreRetryIdentities.clear(); }
 }
 ''' + retry + r'''
 bool check(bool ok, const char* name) { if (!ok) std::cerr << "FAIL: " << name << '\n'; return ok; }
 int main() {
     void* manager=&icon;
-    sufficient=false;
+    snapshot.mappedEntries=1;
     RetryDeferredLiveContinuity(manager);
     if (!check(restores==0 && held==0, "incomplete baseline waits without acquiring COM references")) return 1;
-    sufficient=true;
+    snapshot.mappedEntries=2;
     g_internalMoveDepth=1;
     RetryDeferredLiveContinuity(manager);
     if (!check(restores==0, "internal moves cannot recurse into retry")) return 1;
@@ -66,6 +69,9 @@ int main() {
     if (!check(restores==3 && held==0, "successful migration is not retried again in the same event")) return 1;
     RetryDeferredLiveContinuity(manager);
     if (!check(restores==3 && held==0, "known manual or migrated key is left alone")) return 1;
+    g_restoreRetryIdentities={2}; sufficient=false; migrate=false;
+    RetryDeferredLiveContinuity(manager);
+    if (!check(restores==4 && held==0, "a known deferred icon is retried even when fewer apps are open")) return 1;
     std::cout << "PASS: deferred continuity retries and reference ownership\n";
 }
 '''

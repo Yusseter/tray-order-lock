@@ -86,7 +86,7 @@ the end of the overflow area. Ambiguous icons are left untouched.
 namespace {
 
 constexpr wchar_t kPersistentDevelopmentLogBuild[] =
-    L"0.2.0-dev-order-drift-safe-uid-continuity";
+    L"0.2.0-dev-order-drift-live-recovery";
 
 std::mutex g_persistentDevelopmentLogMutex;
 HANDLE g_persistentDevelopmentLogFile = INVALID_HANDLE_VALUE;
@@ -655,6 +655,9 @@ std::atomic<bool> g_liveBaselineActiveInSession = false;
 std::mutex g_liveMappingMutex;
 
 std::vector<LiveIdentityMapping> g_liveMappings;
+
+std::mutex g_restoreRetryMutex;
+std::vector<std::uint64_t> g_restoreRetryIdentities;
 
 thread_local unsigned int g_internalMoveDepth =
     0;
@@ -2204,7 +2207,9 @@ bool FindWindowsAppsUidCanonicalPredecessor(
     const std::wstring subkey = MakeTrayEntrySubkey(targetIdentity);
     DWORD uid = 0;
 
-    if (!QueryDwordValue(subkey, L"UID", &uid)) {
+    std::wstring guid;
+    const bool guidTarget = QueryIconGuid(subkey, &guid);
+    if (!guidTarget && !QueryDwordValue(subkey, L"UID", &uid)) {
         return false;
     }
 
@@ -2225,16 +2230,19 @@ bool FindWindowsAppsUidCanonicalPredecessor(
     std::wstring bestKey;
     std::vector<unsigned int> bestVersion;
     bool ambiguous = false;
+    std::wstring selectedUidPrefix;
 
     for (const std::wstring& key : canonical) {
-        if (key.compare(0, prefix.size(), prefix) != 0) {
+        const auto pathMarker = key.find(L"|path:");
+        if (key.compare(0, 4, L"uid:") != 0 || pathMarker == std::wstring::npos ||
+            (!guidTarget && key.compare(0, prefix.size(), prefix) != 0)) {
             continue;
         }
 
         std::vector<unsigned int> version;
         std::wstring candidateFamily =
             BuildWindowsAppsGuidContinuityPath(
-                key.substr(prefix.size()), &version
+                key.substr(pathMarker + 6), &version
             );
 
         if (!candidateFamily.empty()) {
@@ -2245,6 +2253,16 @@ bool FindWindowsAppsUidCanonicalPredecessor(
             CompareVersionParts(version, targetVersion) > 0) {
             continue;
         }
+
+        // A GUID has no UID to disambiguate multiple tray icons in one package.
+        const std::wstring uidPrefix = key.substr(0, pathMarker);
+        if (guidTarget && !selectedUidPrefix.empty() && uidPrefix != selectedUidPrefix) {
+            if (ambiguousResult) {
+                *ambiguousResult = true;
+            }
+            return false;
+        }
+        selectedUidPrefix = uidPrefix;
 
         const int comparison = bestKey.empty()
             ? 1
@@ -2332,14 +2350,26 @@ bool AnalyzeContinuityGroup(
                 &predecessorKey
             )
         ) {
-            TOR_LOG(
-                L"TRAY_ORDER_LOCK_CONTINUITY_NO_CANDIDATE "
-                L"reason=\"guid-predecessor-unavailable\" "
-                L"windowsIdentity=%llu targetKey=\"%s\"",
-                static_cast<unsigned long long>(targetIdentity),
-                targetKey.c_str()
-            );
-            return false;
+            bool ambiguous = false;
+            if (!FindWindowsAppsUidCanonicalPredecessor(
+                    targetIdentity, targetKey, canonicalSnapshot,
+                    &predecessorKey, &ambiguous)) {
+                analysis->ambiguous = ambiguous;
+                return ambiguous;
+            }
+
+            for (const LogicalSnapshotEntry& entry : logicalSnapshot) {
+                if (entry.key == predecessorKey) {
+                    std::vector<BYTE> snapshot;
+                    if (!entry.unique || !QueryBinaryValue(
+                            MakeTrayEntrySubkey(entry.identity), L"IconSnapshot",
+                            &snapshot) || snapshot != targetMetadata.iconSnapshot) {
+                        analysis->ambiguous = true;
+                        return true;
+                    }
+                    predecessorIdentity = entry.identity;
+                }
+            }
         }
 
         const bool targetKnown =
@@ -2892,9 +2922,15 @@ unsigned int MergeLoadedLiveKeysLocked(
                 entry.identity, entry.key, canonicalBeforeMerge,
                 &possiblePredecessor, &ambiguous
             );
+        ContinuityIdentityMetadata metadata;
+        const bool packageMetadataPending = !hasGroup &&
+            !BuildWindowsAppsGuidContinuityPath(
+                QueryStringValue(MakeTrayEntrySubkey(entry.identity),
+                                 L"ExecutablePath"), nullptr).empty() &&
+            !BuildContinuityIdentityMetadata(entry.identity, &metadata);
 
         if ((hasGroup && (group.ambiguous || group.canonicalMembers != 0)) ||
-            hasPossiblePredecessor || ambiguous) {
+            hasPossiblePredecessor || ambiguous || packageMetadataPending) {
             deferred++;
 
             TOR_LOG(
@@ -4718,8 +4754,7 @@ bool IsSafeContinuityLiveState(
         return false;
     }
 
-    if (!targetMetadata.guidBacked &&
-        !BuildWindowsAppsGuidContinuityPath(
+    if (!BuildWindowsAppsGuidContinuityPath(
             QueryStringValue(MakeTrayEntrySubkey(targetMapping.windowsIdentity),
                              L"ExecutablePath"), nullptr).empty() &&
         !HasSufficientTrustedLiveBaseline(live.size)) {
@@ -4784,7 +4819,11 @@ TryReconcileCanonicalContinuityGroup(
     ) {
         std::wstring possiblePredecessor;
         bool ambiguous = false;
-        if (FindWindowsAppsUidCanonicalPredecessor(
+        const bool packageMetadataPending =
+            !BuildWindowsAppsGuidContinuityPath(
+                QueryStringValue(MakeTrayEntrySubkey(targetMapping.windowsIdentity),
+                                 L"ExecutablePath"), nullptr).empty();
+        if (packageMetadataPending || FindWindowsAppsUidCanonicalPredecessor(
                 targetMapping.windowsIdentity, targetKey, canonicalSnapshot,
                 &possiblePredecessor, &ambiguous) || ambiguous) {
             TOR_LOG(
@@ -4918,10 +4957,7 @@ TryReconcileCanonicalContinuityGroup(
         g_canonicalMutex
     );
 
-    if (!targetMetadata.guidBacked &&
-        std::find(canonicalSnapshot.begin(), canonicalSnapshot.end(), targetKey) ==
-            canonicalSnapshot.end() &&
-        g_canonicalOrder != canonicalSnapshot) {
+    if (g_canonicalOrder != canonicalSnapshot) {
         return ContinuityReconcileResult::Deferred;
     }
 
@@ -5902,6 +5938,17 @@ void RecordRestoreObservationSkip(
     const wchar_t* reason,
     std::uint64_t windowsIdentity
 ) {
+    if (windowsIdentity != 0) {
+        std::lock_guard<std::mutex> lock(g_restoreRetryMutex);
+        if (std::find(g_restoreRetryIdentities.begin(),
+                      g_restoreRetryIdentities.end(), windowsIdentity) ==
+            g_restoreRetryIdentities.end()) {
+            if (g_restoreRetryIdentities.size() == 64) {
+                g_restoreRetryIdentities.erase(g_restoreRetryIdentities.begin());
+            }
+            g_restoreRetryIdentities.push_back(windowsIdentity);
+        }
+    }
     const unsigned long long skip =
         g_restoreSkipCount.fetch_add(
             1,
@@ -5957,6 +6004,13 @@ void RestoreCanonicalRelationForMapping(
     void* manager,
     const LiveIdentityMapping& targetMapping
 ) {
+    {
+        std::lock_guard<std::mutex> lock(g_restoreRetryMutex);
+        g_restoreRetryIdentities.erase(
+            std::remove(g_restoreRetryIdentities.begin(),
+                        g_restoreRetryIdentities.end(), targetMapping.windowsIdentity),
+            g_restoreRetryIdentities.end());
+    }
     if (
         g_internalMoveDepth !=
             0 ||
@@ -5998,14 +6052,6 @@ void RestoreCanonicalRelationForMapping(
     std::vector<std::wstring> canonical =
         GetCanonicalOrderSnapshot();
 
-    const bool targetKnownBeforeContinuity =
-        std::find(
-            canonical.begin(),
-            canonical.end(),
-            targetKey
-        ) !=
-        canonical.end();
-
     const ContinuityReconcileResult continuityResult =
         TryReconcileCanonicalContinuityGroup(
             targetMapping,
@@ -6014,8 +6060,7 @@ void RestoreCanonicalRelationForMapping(
 
     if (
         continuityResult ==
-            ContinuityReconcileResult::Deferred &&
-        !targetKnownBeforeContinuity
+            ContinuityReconcileResult::Deferred
     ) {
         RecordRestoreObservationSkip(
             L"continuity-group-deferred",
@@ -6132,13 +6177,15 @@ void RestoreCanonicalRelationForMapping(
         return;
     }
 
-    if (
-        !HasSufficientTrustedLiveBaseline(
-            before.size
-        )
-    ) {
+    // A local repair uses verified live anchors, not the number of apps left open.
+    if (before.size > 64 || before.entries.size() != before.size ||
+        before.mappedEntries != before.size ||
+        std::any_of(before.entries.begin(), before.entries.end(),
+            [](const LiveOverflowEntry& entry) {
+                return !entry.mapped || !entry.uniqueLogical || entry.logicalKey.empty();
+            })) {
         RecordRestoreObservationSkip(
-            L"waiting-for-trusted-live-baseline-quorum",
+            L"incomplete-live-snapshot",
             targetMapping.windowsIdentity
         );
 
@@ -6706,37 +6753,32 @@ void RetryDeferredLiveContinuity(void* manager) {
         return;
     }
 
-    std::vector<std::wstring> attempted;
+    std::vector<std::uint64_t> attempted;
     for (unsigned int attempt = 0; attempt < 64; ++attempt) {
         const LiveOverflowSnapshot live = CaptureLiveOverflowSnapshot(nullptr);
         if (!live.valid || live.size > 64 ||
             live.entries.size() != live.size ||
-            live.mappedEntries != live.size ||
-            !HasSufficientTrustedLiveBaseline(live.size)) {
+            live.mappedEntries != live.size) {
             return;
         }
 
-        const auto canonical = GetCanonicalOrderSnapshot();
+        std::vector<std::uint64_t> pending;
+        {
+            std::lock_guard<std::mutex> lock(g_restoreRetryMutex);
+            pending = g_restoreRetryIdentities;
+        }
         bool retried = false;
         for (unsigned int index = 0; index < live.size; ++index) {
             const LiveOverflowEntry& entry = live.entries[index];
             if (!entry.mapped || !entry.uniqueLogical || entry.logicalKey.empty() ||
-                std::find(canonical.begin(), canonical.end(), entry.logicalKey) !=
-                    canonical.end() ||
-                std::find(attempted.begin(), attempted.end(), entry.logicalKey) !=
+                std::find(pending.begin(), pending.end(), entry.windowsIdentity) ==
+                    pending.end() ||
+                std::find(attempted.begin(), attempted.end(), entry.windowsIdentity) !=
                     attempted.end()) {
                 continue;
             }
 
-            std::wstring predecessor;
-            bool ambiguous = false;
-            if (!FindWindowsAppsUidCanonicalPredecessor(
-                    entry.windowsIdentity, entry.logicalKey, canonical,
-                    &predecessor, &ambiguous) && !ambiguous) {
-                continue;
-            }
-
-            attempted.push_back(entry.logicalKey);
+            attempted.push_back(entry.windowsIdentity);
             void* abi = AcquireCurrentOverflowIconAtIndex(index, entry);
             if (abi) {
                 LiveIdentityMapping mapping;
@@ -8786,6 +8828,11 @@ BOOL Wh_ModInit() {
         );
 
         g_liveMappings.clear();
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_restoreRetryMutex);
+        g_restoreRetryIdentities.clear();
     }
 
     LoadSettings();

@@ -25,7 +25,7 @@ code = r'''
 using BYTE = unsigned char;
 using DWORD = unsigned long;
 #define TOR_LOG(...) ((void)0)
-struct Entry { DWORD uid; std::wstring path, tooltip; std::vector<BYTE> icon; };
+struct Entry { DWORD uid; std::wstring path, tooltip; std::vector<BYTE> icon; std::wstring guid; };
 std::map<std::wstring, Entry> entries;
 ''' + section("struct LogicalSnapshotEntry {", "struct LiveIdentityMapping {") + section(
     "std::wstring ToLower(", "bool StartsWithOrdinalIgnoreCase("
@@ -33,10 +33,13 @@ std::map<std::wstring, Entry> entries;
     "int CompareVersionParts(", "bool ContainsText("
 ) + r'''
 std::wstring MakeTrayEntrySubkey(std::uint64_t identity) { return std::to_wstring(identity); }
-bool QueryIconGuid(const std::wstring&, std::wstring*) { return false; }
+bool QueryIconGuid(const std::wstring& key, std::wstring* guid) {
+    auto it=entries.find(key); if(it==entries.end() || it->second.guid.empty()) return false;
+    *guid=it->second.guid; return true;
+}
 bool QueryDwordValue(const std::wstring& key, const wchar_t*, DWORD* uid) {
     auto it=entries.find(key); if (it == entries.end()) return false;
-    *uid=it->second.uid; return true;
+    *uid=it->second.uid; return it->second.guid.empty();
 }
 std::wstring QueryStringValue(const std::wstring& key, const wchar_t* name) {
     auto it=entries.find(key); if (it == entries.end()) return L"";
@@ -80,8 +83,11 @@ std::vector<LogicalSnapshotEntry> logicalFixture;
 std::vector<std::wstring> GetCanonicalOrderSnapshot() { return canonicalFixture; }
 UIOrderSnapshot CaptureUIOrderSnapshot() { return {}; }
 std::vector<LogicalSnapshotEntry> BuildLogicalSnapshot(const UIOrderSnapshot&) { return logicalFixture; }
+bool ContainsCanonicalKeyLocked(const std::wstring& key) {
+    return std::find(g_canonicalOrder.begin(),g_canonicalOrder.end(),key)!=g_canonicalOrder.end();
+}
 enum class ContinuityReconcileResult { NoCandidate, Reconciled, Deferred };
-''' + section("bool HasSimultaneousContinuityAlias(", "bool TryRebaseCanonicalLiveOrderLocked(") + section("bool IsSafeContinuityLiveState(", "bool IsCanonicalRelationSatisfied(") + r'''
+''' + section("unsigned int MergeLoadedLiveKeysLocked(", "void InitializeCanonicalState(") + section("bool HasSimultaneousContinuityAlias(", "bool TryRebaseCanonicalLiveOrderLocked(") + section("bool IsSafeContinuityLiveState(", "bool IsCanonicalRelationSatisfied(") + r'''
 bool check(bool condition, const char* name) {
     if (!condition) std::cerr << "FAIL: " << name << '\n';
     return condition;
@@ -188,8 +194,8 @@ int main() {
     if (!check(TryReconcileCanonicalContinuityGroup(target,targetKey)==ContinuityReconcileResult::Deferred,
                "missing target icon metadata with a possible predecessor must be deferred")) return 1;
     canonicalFixture={};
-    if (!check(TryReconcileCanonicalContinuityGroup(target,targetKey)==ContinuityReconcileResult::NoCandidate,
-               "missing metadata without a predecessor has no candidate")) return 1;
+    if (!check(TryReconcileCanonicalContinuityGroup(target,targetKey)==ContinuityReconcileResult::Deferred,
+               "a package with incomplete metadata is not adopted as a new icon")) return 1;
     entries.erase(L"1");
     entries[L"2"].icon={1,2,3};
     logicalFixture={{2,targetKey,true}};
@@ -202,6 +208,26 @@ int main() {
     if (!check(TryReconcileCanonicalContinuityGroup(target,targetKey)==ContinuityReconcileResult::Reconciled &&
                canonicalFixture==std::vector<std::wstring>{L"first",targetKey,L"last"},
                "known tooltip permits unique canonical predecessor without old registry record")) return 1;
+    const std::wstring guidKey=L"guid:{updated-package-guid}";
+    entries[L"2"].guid=L"{updated-package-guid}";
+    entries[L"2"].icon.clear();
+    canonicalFixture={L"first",oldKey,L"last"};
+    logicalFixture={{2,guidKey,true}};
+    liveFixture={true,true,1,1,{{2,guidKey,true}}};
+    unsigned int deferred=0;
+    const auto beforeStartup=canonicalFixture;
+    if (!check(MergeLoadedLiveKeysLocked(logicalFixture,beforeStartup,&deferred)==0 &&
+               deferred==1 && canonicalFixture==beforeStartup,
+               "startup does not permanently append incomplete GUID metadata")) return 1;
+    if (!check(TryReconcileCanonicalContinuityGroup(target,guidKey)==ContinuityReconcileResult::Deferred &&
+               canonicalFixture==std::vector<std::wstring>{L"first",oldKey,L"last"},
+               "partial GUID metadata waits instead of placing the updated app at the end")) return 1;
+    entries[L"2"].icon={1,2,3};
+    if (!check(TryReconcileCanonicalContinuityGroup(target,guidKey)==ContinuityReconcileResult::Reconciled &&
+               canonicalFixture==std::vector<std::wstring>{L"first",guidKey,L"last"},
+               "UID to GUID migration preserves the old neighbours even without old registry data")) return 1;
+    if (!check(TryReconcileCanonicalContinuityGroup(target,guidKey)==ContinuityReconcileResult::NoCandidate,
+               "a known GUID is not overwritten by UID history")) return 1;
     std::cout << "PASS: continuity group selection\n";
 }
 '''

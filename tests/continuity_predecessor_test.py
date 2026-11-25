@@ -29,8 +29,10 @@ using DWORD = unsigned long;
     "bool IsNumericDottedVersionCore(", "bool LooksLikeVersionDirectory("
 ) + section("int CompareVersionParts(", "bool ContainsText(") + r'''
 std::wstring targetPath;
+bool guidMode=false;
 std::wstring MakeTrayEntrySubkey(std::uint64_t) { return L"fixture"; }
-bool QueryDwordValue(const std::wstring&, const wchar_t*, DWORD* uid) { *uid=3; return true; }
+bool QueryDwordValue(const std::wstring&, const wchar_t*, DWORD* uid) { *uid=3; return !guidMode; }
+bool QueryIconGuid(const std::wstring&, std::wstring*) { return guidMode; }
 std::wstring QueryStringValue(const std::wstring&, const wchar_t*) { return targetPath; }
 ''' + section("bool FindWindowsAppsUidCanonicalPredecessor(", "bool AnalyzeContinuityGroup(") + r'''
 bool check(bool condition, const char* name) {
@@ -56,6 +58,15 @@ int main() {
     ambiguous = true;
     if (!check(!FindWindowsAppsUidCanonicalPredecessor(1, targetKey, {oldKey, targetKey}, &selected, &ambiguous) && !ambiguous,
                "a known target retains its established position")) return 1;
+    guidMode=true;
+    const std::wstring guidKey=L"guid:{new-package-guid}";
+    if (!check(FindWindowsAppsUidCanonicalPredecessor(1, guidKey, {oldKey}, &selected, &ambiguous) && selected==oldKey,
+               "a unique package identity survives a UID to GUID transition")) return 1;
+    const std::wstring otherIcon=LR"(uid:4|path:d:\windowsapps\claude_6.6395.0.0_x64__publisher\app\claude.exe)";
+    if (!check(!FindWindowsAppsUidCanonicalPredecessor(1, guidKey, {oldKey,otherIcon}, &selected, &ambiguous) && ambiguous,
+               "multiple old UID icons cannot be guessed when changing to a GUID")) return 1;
+    if (!check(!FindWindowsAppsUidCanonicalPredecessor(1, guidKey, {oldKey,guidKey}, &selected, &ambiguous),
+               "an existing GUID position is preserved")) return 1;
     std::cout << "PASS: canonical WindowsApps predecessor selection\n";
 }
 '''
