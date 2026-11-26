@@ -14,6 +14,7 @@ def section(start, end):
 
 code = r'''
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cwctype>
 #include <iostream>
@@ -77,6 +78,7 @@ std::mutex g_canonicalMutex;
 bool persistSuccess=true;
 bool PersistCanonicalOrderLocked() { return persistSuccess; }
 bool baselineSufficient=true;
+std::atomic<bool> g_liveBaselineActiveInSession{true};
 bool HasSufficientTrustedLiveBaseline(unsigned) { return baselineSufficient; }
 std::uint64_t DiagnosticCanonicalFingerprint(const std::vector<std::wstring>&) { return 0; }
 std::vector<LogicalSnapshotEntry> logicalFixture;
@@ -228,6 +230,46 @@ int main() {
                "UID to GUID migration preserves the old neighbours even without old registry data")) return 1;
     if (!check(TryReconcileCanonicalContinuityGroup(target,guidKey)==ContinuityReconcileResult::NoCandidate,
                "a known GUID is not overwritten by UID history")) return 1;
+    const std::wstring returnedUidKey=L"uid:3|path:"+targetPath;
+    entries[L"3"]={3,targetPath,L"",{1,2,3}};
+    LiveIdentityMapping returned; returned.windowsIdentity=3;
+    logicalFixture={{2,guidKey,true},{3,returnedUidKey,true}};
+    liveFixture={true,true,1,1,{{3,returnedUidKey,true}}};
+    canonicalFixture={L"first",guidKey,L"last"};
+    baselineSufficient=false;
+    if (!check(TryReconcileCanonicalContinuityGroup(returned,returnedUidKey)==ContinuityReconcileResult::Reconciled &&
+               canonicalFixture==std::vector<std::wstring>{L"first",returnedUidKey,L"last"},
+               "GUID to UID re-registration preserves position with fewer applications open")) return 1;
+    canonicalFixture={L"first",guidKey,L"last"};
+    g_liveBaselineActiveInSession=false;
+    if (!check(TryReconcileCanonicalContinuityGroup(returned,returnedUidKey)==ContinuityReconcileResult::Deferred,
+               "metadata evidence does not activate initially untrusted ordering")) return 1;
+    g_liveBaselineActiveInSession=true;
+    liveFixture={true,true,2,2,{{2,guidKey,true},{3,returnedUidKey,true}}};
+    if (!check(TryReconcileCanonicalContinuityGroup(returned,returnedUidKey)==ContinuityReconcileResult::Deferred &&
+               canonicalFixture==std::vector<std::wstring>{L"first",guidKey,L"last"},
+               "simultaneously live GUID and UID icons are kept separate")) return 1;
+    liveFixture={true,true,1,1,{{3,returnedUidKey,true}}};
+    entries[L"2"].icon={9,9,9};
+    if (!check(TryReconcileCanonicalContinuityGroup(returned,returnedUidKey)==ContinuityReconcileResult::Deferred,
+               "a package GUID with a different icon is not adopted or overwritten")) return 1;
+    entries[L"2"].icon={1,2,3};
+    const std::wstring secondGuid=L"guid:{second-package-icon}";
+    entries[L"4"]=entries[L"2"];entries[L"4"].guid=L"{second-package-icon}";
+    logicalFixture.push_back({4,secondGuid,true});
+    canonicalFixture={guidKey,secondGuid};
+    if (!check(TryReconcileCanonicalContinuityGroup(returned,returnedUidKey)==ContinuityReconcileResult::Deferred,
+               "two matching GUID icons cannot be guessed")) return 1;
+    logicalFixture.pop_back();
+    canonicalFixture={guidKey,L"uid:4|path:"+targetPath};
+    if (!check(TryReconcileCanonicalContinuityGroup(returned,returnedUidKey)==ContinuityReconcileResult::Deferred,
+               "multiple historical UID roles cannot share one GUID anchor")) return 1;
+    canonicalFixture={oldKey,guidKey};
+    entries[L"1"]={3,oldPath,L"",{1,2,3}};
+    logicalFixture.push_back({1,oldKey,true});
+    if (!check(TryReconcileCanonicalContinuityGroup(returned,returnedUidKey)==ContinuityReconcileResult::Reconciled &&
+               canonicalFixture==std::vector<std::wstring>{oldKey,returnedUidKey},
+               "newer GUID position is preferred over obsolete UID history")) return 1;
     std::cout << "PASS: continuity group selection\n";
 }
 '''

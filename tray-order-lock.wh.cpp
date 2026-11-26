@@ -86,7 +86,7 @@ the end of the overflow area. Ambiguous icons are left untouched.
 namespace {
 
 constexpr wchar_t kPersistentDevelopmentLogBuild[] =
-    L"0.2.0-dev-order-drift-live-recovery";
+    L"0.2.0-dev-order-drift-identity-roundtrip";
 
 std::mutex g_persistentDevelopmentLogMutex;
 HANDLE g_persistentDevelopmentLogFile = INVALID_HANDLE_VALUE;
@@ -1620,6 +1620,14 @@ bool ContinuityIdentityMatches(
     const ContinuityIdentityMetadata& left,
     const ContinuityIdentityMetadata& right
 ) {
+    if (left.guidBacked != right.guidBacked) {
+        const auto leftMarker = left.normalizedExecutablePath.find(L"\\windowsapps\\");
+        const auto rightMarker = right.normalizedExecutablePath.find(L"\\windowsapps\\");
+        return leftMarker != std::wstring::npos && rightMarker != std::wstring::npos &&
+            left.normalizedExecutablePath.substr(leftMarker) ==
+                right.normalizedExecutablePath.substr(rightMarker) &&
+            !left.iconSnapshot.empty() && left.iconSnapshot == right.iconSnapshot;
+    }
     if (
         left.guidBacked ||
         right.guidBacked
@@ -1932,6 +1940,7 @@ struct ContinuityGroupAnalysis {
     std::vector<std::uint64_t> identities;
     std::vector<std::wstring> keys;
     bool ambiguous = false;
+    bool metadataConfirmed = false;
 
     unsigned int canonicalMembers = 0;
 
@@ -2295,6 +2304,110 @@ bool FindWindowsAppsUidCanonicalPredecessor(
 
     return true;
 }
+bool FindWindowsAppsGuidAnchorForUid(
+    const ContinuityIdentityMetadata& target,
+    const std::wstring& targetKey,
+    const std::vector<LogicalSnapshotEntry>& logical,
+    const std::vector<std::wstring>& canonical,
+    ContinuityGroupAnalysis* analysis
+) {
+    if (target.guidBacked || target.normalizedExecutablePath.empty() ||
+        target.packageVersion.empty() ||
+        std::find(canonical.begin(), canonical.end(), targetKey) != canonical.end()) {
+        return false;
+    }
+
+    const std::wstring uidPrefix = L"uid:" + std::to_wstring(target.uid) + L"|path:";
+    std::vector<unsigned int> bestVersion;
+    std::size_t bestIndex = canonical.size();
+    std::uint64_t bestIdentity = 0;
+    bool bestGuid = false;
+    bool ambiguous = false;
+    bool otherUid = false;
+    for (std::size_t index = 0; index < canonical.size(); ++index) {
+        const auto& key = canonical[index];
+        std::vector<unsigned int> version;
+        std::uint64_t identity = 0;
+        bool guid = key.compare(0, 5, L"guid:") == 0;
+        bool unique = true;
+        if (guid) {
+            for (const auto& entry : logical) {
+                if (entry.key != key) {
+                    continue;
+                }
+                ContinuityIdentityMetadata candidate;
+                const bool complete =
+                    BuildContinuityIdentityMetadata(entry.identity, &candidate);
+                const auto marker = candidate.normalizedExecutablePath.find(L"\\windowsapps\\");
+                if (marker != std::wstring::npos &&
+                    candidate.normalizedExecutablePath.substr(marker) ==
+                        target.normalizedExecutablePath) {
+                    unique = unique && entry.unique && identity == 0 && complete &&
+                        candidate.guidBacked && ContinuityIdentityMatches(target, candidate);
+                    version = candidate.packageVersion;
+                    identity = entry.identity;
+                }
+            }
+        } else if (key.compare(0, 4, L"uid:") == 0) {
+            const auto pathMarker = key.find(L"|path:");
+            if (pathMarker == std::wstring::npos) {
+                continue;
+            }
+            auto family = BuildWindowsAppsGuidContinuityPath(
+                key.substr(pathMarker + 6), &version);
+            const auto marker = family.find(L"\\windowsapps\\");
+            if (marker == std::wstring::npos ||
+                family.substr(marker) != target.normalizedExecutablePath) {
+                continue;
+            }
+            if (key.compare(0, uidPrefix.size(), uidPrefix) != 0) {
+                if (!version.empty() && CompareVersionParts(version, target.packageVersion) <= 0) {
+                    otherUid = true;
+                }
+                continue;
+            }
+        }
+        if (version.empty() || CompareVersionParts(version, target.packageVersion) > 0) {
+            continue;
+        }
+        const int comparison = bestIndex == canonical.size()
+            ? 1 : CompareVersionParts(version, bestVersion);
+        if (comparison > 0) {
+            bestIndex = index;
+            bestVersion = version;
+            bestIdentity = identity;
+            bestGuid = guid;
+            ambiguous = !unique;
+        } else if (comparison == 0) {
+            ambiguous = true;
+            if (guid) {
+                bestGuid = true;
+                bestIndex = index;
+            }
+        }
+    }
+    if (!bestGuid) {
+        return false;
+    }
+    ambiguous = ambiguous || otherUid;
+    analysis->ambiguous = ambiguous;
+    if (!ambiguous) {
+        analysis->identities = {bestIdentity};
+        analysis->keys = {canonical[bestIndex]};
+        analysis->canonicalMembers = 1;
+        analysis->earliestCanonicalIndex = bestIndex;
+        analysis->earliestCanonicalIdentity = bestIdentity;
+        analysis->earliestCanonicalKey = canonical[bestIndex];
+        analysis->metadataConfirmed = true;
+    }
+    TOR_LOG(
+        L"TRAY_ORDER_LOCK_GUID_TO_UID_CANDIDATE "
+        L"ambiguous=%d predecessorKey=\"%s\" targetKey=\"%s\"",
+        ambiguous ? 1 : 0, canonical[bestIndex].c_str(), targetKey.c_str()
+    );
+    return true;
+}
+
 bool AnalyzeContinuityGroup(
     std::uint64_t targetIdentity,
     const std::wstring& targetKey,
@@ -2325,6 +2438,15 @@ bool AnalyzeContinuityGroup(
     }
 
     if (!targetMetadata.guidBacked) {
+        if (FindWindowsAppsGuidAnchorForUid(
+                targetMetadata, targetKey, logicalSnapshot, canonicalSnapshot,
+                analysis)) {
+            if (!analysis->ambiguous) {
+                analysis->identities.push_back(targetIdentity);
+                analysis->keys.push_back(targetKey);
+            }
+            return true;
+        }
         std::wstring predecessor;
         bool ambiguous = false;
         FindWindowsAppsUidCanonicalPredecessor(
@@ -2484,6 +2606,7 @@ bool AnalyzeContinuityGroup(
                     entry.identity,
                     &candidateMetadata
                 ) ||
+                candidateMetadata.guidBacked != targetMetadata.guidBacked ||
                 !ContinuityIdentityMatches(
                     targetMetadata,
                     candidateMetadata
@@ -4757,7 +4880,8 @@ bool IsSafeContinuityLiveState(
     if (!BuildWindowsAppsGuidContinuityPath(
             QueryStringValue(MakeTrayEntrySubkey(targetMapping.windowsIdentity),
                              L"ExecutablePath"), nullptr).empty() &&
-        !HasSufficientTrustedLiveBaseline(live.size)) {
+        (!g_liveBaselineActiveInSession.load(std::memory_order_acquire) ||
+         (!group.metadataConfirmed && !HasSufficientTrustedLiveBaseline(live.size)))) {
         return false;
     }
 
