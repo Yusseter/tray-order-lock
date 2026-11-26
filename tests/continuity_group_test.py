@@ -18,6 +18,7 @@ code = r'''
 #include <cstdint>
 #include <cwctype>
 #include <iostream>
+#include <cwchar>
 #include <map>
 #include <mutex>
 #include <string>
@@ -28,10 +29,20 @@ using DWORD = unsigned long;
 #define TOR_LOG(...) ((void)0)
 struct Entry { DWORD uid; std::wstring path, tooltip; std::vector<BYTE> icon; std::wstring guid; };
 std::map<std::wstring, Entry> entries;
+std::map<std::wstring,std::wstring> packageStorage;
+bool packageWriteSuccess=true;
+int Wh_SetStringValue(const wchar_t* key,const wchar_t* value) {
+    if(!packageWriteSuccess) return 0;
+    packageStorage[key]=value; return 1;
+}
+std::size_t Wh_GetStringValue(const wchar_t* key,wchar_t* buffer,std::size_t chars) {
+    const auto it=packageStorage.find(key);
+    if(it==packageStorage.end() || it->second.size()>=chars) return 0;
+    std::copy(it->second.begin(),it->second.end(),buffer);
+    buffer[it->second.size()]=0; return it->second.size();
+}
 ''' + section("struct LogicalSnapshotEntry {", "struct LiveIdentityMapping {") + section(
-    "std::wstring ToLower(", "bool StartsWithOrdinalIgnoreCase("
-) + section("bool IsNumericDottedVersionCore(", "bool LooksLikeVersionDirectory(") + section(
-    "int CompareVersionParts(", "bool ContainsText("
+    "std::wstring ToLower(", "bool ContainsText("
 ) + r'''
 std::wstring MakeTrayEntrySubkey(std::uint64_t identity) { return std::to_wstring(identity); }
 bool QueryIconGuid(const std::wstring& key, std::wstring* guid) {
@@ -206,6 +217,8 @@ int main() {
     if (!check(TryReconcileCanonicalContinuityGroup(target,targetKey)==ContinuityReconcileResult::Deferred &&
                canonicalFixture==std::vector<std::wstring>{L"first",oldKey,L"last"},
                "missing predecessor registry metadata with empty tooltip defers")) return 1;
+    packageStorage.erase(L"PackageIdentityV1."+oldKey);
+    g_packageHistory.clear();
     entries[L"2"].tooltip=L"Example";
     if (!check(TryReconcileCanonicalContinuityGroup(target,targetKey)==ContinuityReconcileResult::Reconciled &&
                canonicalFixture==std::vector<std::wstring>{L"first",targetKey,L"last"},
@@ -270,6 +283,146 @@ int main() {
     if (!check(TryReconcileCanonicalContinuityGroup(returned,returnedUidKey)==ContinuityReconcileResult::Reconciled &&
                canonicalFixture==std::vector<std::wstring>{oldKey,returnedUidKey},
                "newer GUID position is preferred over obsolete UID history")) return 1;
+    canonicalFixture={L"first",guidKey,L"last"};
+    entries.erase(L"2");
+    g_packageHistory.clear();
+    logicalFixture={{3,returnedUidKey,true}};
+    if (!check(TryReconcileCanonicalContinuityGroup(returned,returnedUidKey)==ContinuityReconcileResult::Reconciled &&
+               canonicalFixture==std::vector<std::wstring>{L"first",returnedUidKey,L"last"},
+               "removing old Windows registry data does not erase the GUID position evidence")) return 1;
+    canonicalFixture={L"first",guidKey,L"last"};
+    entries[L"5"]={3,targetPath,L"",{1,2,3},L"{replacement-guid}"};
+    const std::wstring replacementGuid=L"guid:{replacement-guid}";
+    LiveIdentityMapping replacement;replacement.windowsIdentity=5;
+    logicalFixture={{5,replacementGuid,true}};
+    liveFixture={true,true,1,1,{{5,replacementGuid,true}}};
+    if (!check(TryReconcileCanonicalContinuityGroup(replacement,replacementGuid)==ContinuityReconcileResult::Reconciled &&
+               canonicalFixture==std::vector<std::wstring>{L"first",replacementGuid,L"last"},
+               "GUID replacement survives removal of old registry data and a session restart")) return 1;
+    const std::wstring cachedOlder=L"guid:{cached-older}";
+    const std::wstring cachedNewer=L"guid:{cached-newer}";
+    const std::wstring cachedTarget=L"guid:{cached-target}";
+    const std::wstring cachedPath=LR"(d:\windowsapps\example_5.0.0.0_x64__publisher\app\example.exe)";
+    const std::wstring newerCachedPath=LR"(d:\windowsapps\example_6.0.0.0_x64__publisher\app\example.exe)";
+    const std::wstring cachedTargetPath=LR"(d:\windowsapps\example_7.0.0.0_x64__publisher\app\example.exe)";
+    RememberPackageIdentity(cachedOlder,cachedPath,{1,2,3});
+    RememberPackageIdentity(cachedNewer,newerCachedPath,{9,9,9});
+    entries.clear();
+    entries[L"70"]={3,cachedTargetPath,L"",{1,2,3},L"{cached-target}"};
+    logicalFixture={{70,cachedTarget,true}};
+    liveFixture={true,true,1,1,{{70,cachedTarget,true}}};
+    LiveIdentityMapping cachedMapping;cachedMapping.windowsIdentity=70;
+    canonicalFixture={cachedOlder,cachedNewer};
+    auto cachedBefore=canonicalFixture;
+    if (!check(TryReconcileCanonicalContinuityGroup(cachedMapping,cachedTarget)==ContinuityReconcileResult::Deferred &&
+               canonicalFixture==cachedBefore,
+               "conflicting newest cached GUID must not fall back to an older matching GUID")) return 1;
+    canonicalFixture={cachedOlder};cachedBefore=canonicalFixture;
+    entries[L"71"]={3,LR"(d:\windowsapps\other_5.0.0.0_x64__publisher\app\example.exe)",L"",{1,2,3},L"{cached-older}"};
+    logicalFixture.push_back({71,cachedOlder,true});
+    if (!check(TryReconcileCanonicalContinuityGroup(cachedMapping,cachedTarget)!=ContinuityReconcileResult::Reconciled &&
+               canonicalFixture==cachedBefore,
+               "a current GUID record from another package invalidates cached identity evidence")) return 1;
+    // A full lifecycle, rather than independent one-transition examples.
+    packageStorage.clear();g_packageHistory.clear();entries.clear();
+    std::wstring currentKey=L"guid:{cycle-0}";
+    const std::wstring initialPath=LR"(d:\windowsapps\example_1.0.0.0_x64__publisher\app\example.exe)";
+    entries[L"100"]={3,initialPath,L"",{1,2,3},L"{cycle-0}"};
+    ContinuityIdentityMetadata initial;
+    if (!check(BuildContinuityIdentityMetadata(100,&initial), "initial lifecycle metadata is captured")) return 1;
+    canonicalFixture={L"before",currentKey,L"after"};
+    baselineSufficient=false;
+    for (unsigned step=1;step<=8;++step) {
+        entries.clear();g_packageHistory.clear();
+        const auto path=(step%2 ? L"c:\\program files\\windowsapps\\" : L"d:\\windowsapps\\")+
+            std::wstring(L"example_")+std::to_wstring(step+1)+L".0.0.0_x64__publisher\\app\\example.exe";
+        const auto identity=100+step;
+        const auto textId=std::to_wstring(identity);
+        const auto guid=L"{cycle-"+std::to_wstring(step)+L"}";
+        const auto nextKey=step%2 ? L"uid:3|path:"+path : L"guid:"+guid;
+        entries[textId]={3,path,step%3 ? L"" : L"Example",{1,2,3},step%2 ? L"" : guid};
+        logicalFixture={{identity,nextKey,true}};
+        liveFixture={true,true,1,1,{{identity,nextKey,true}}};
+        LiveIdentityMapping next;next.windowsIdentity=identity;
+        const auto before=canonicalFixture;
+        if (step==3) {
+            entries[textId].icon.clear();
+            if (!check(TryReconcileCanonicalContinuityGroup(next,nextKey)==ContinuityReconcileResult::Deferred && canonicalFixture==before,
+                       "delayed metadata cannot corrupt the lifecycle position")) return 1;
+            entries[textId].icon={1,2,3};
+        }
+        if (step==5) {
+            persistSuccess=false;
+            if (!check(TryReconcileCanonicalContinuityGroup(next,nextKey)==ContinuityReconcileResult::Deferred && canonicalFixture==before,
+                       "a lifecycle write failure rolls back to its previous identity")) return 1;
+            persistSuccess=true;
+        }
+        auto expected=before;
+        std::replace(expected.begin(),expected.end(),currentKey,nextKey);
+        if (!check(TryReconcileCanonicalContinuityGroup(next,nextKey)==ContinuityReconcileResult::Reconciled && canonicalFixture==expected,
+                   "repeated updates, root changes, session resets and registry pruning preserve position")) return 1;
+        currentKey=nextKey;
+        if (step==4) {
+            canonicalFixture={currentKey,L"before",L"after"};
+            if (!check(TryReconcileCanonicalContinuityGroup(next,currentKey)==ContinuityReconcileResult::NoCandidate &&
+                       canonicalFixture==std::vector<std::wstring>{currentKey,L"before",L"after"},
+                       "an established manual preference survives the next identity change")) return 1;
+        }
+    }
+    for (unsigned version=8;version>=6;--version) {
+        entries.clear();g_packageHistory.clear();
+        const auto path=L"c:\\program files\\windowsapps\\example_"+std::to_wstring(version)+
+            L".0.0.0_x64__publisher\\app\\example.exe";
+        const bool guid=version%2;
+        const auto nextKey=guid ? L"guid:{rollback-"+std::to_wstring(version)+L"}" : L"uid:3|path:"+path;
+        entries[L"200"]={3,path,L"",{1,2,3},guid ? L"{rollback-"+std::to_wstring(version)+L"}" : L""};
+        logicalFixture={{200,nextKey,true}};
+        liveFixture={true,true,1,1,{{200,nextKey,true}}};
+        LiveIdentityMapping rollback;rollback.windowsIdentity=200;
+        auto expected=canonicalFixture;
+        std::replace(expected.begin(),expected.end(),currentKey,nextKey);
+        if (!check(TryReconcileCanonicalContinuityGroup(rollback,nextKey)==ContinuityReconcileResult::Reconciled &&
+                   canonicalFixture==expected,
+                   "verified version rollbacks retain the latest selected position")) return 1;
+        currentKey=nextKey;
+    }
+    const auto rollbackPath=LR"(c:\program files\windowsapps\example_2.0.0.0_x64__publisher\app\example.exe)";
+    const auto futurePath=LR"(d:\windowsapps\example_3.0.0.0_x64__publisher\app\example.exe)";
+    const auto futureKey=L"uid:3|path:"+std::wstring(futurePath);
+    const std::wstring rollbackKey=L"guid:{rollback-safety}";
+    entries.clear();g_packageHistory.clear();packageStorage.clear();
+    RememberPackageIdentity(futureKey,futurePath,{1,2,3});
+    entries[L"300"]={3,rollbackPath,L"",{1,2,3},L"{rollback-safety}"};
+    logicalFixture={{300,rollbackKey,true}};
+    liveFixture={true,true,1,1,{{300,rollbackKey,true}}};
+    LiveIdentityMapping rollback;rollback.windowsIdentity=300;
+    canonicalFixture={futureKey,L"uid:4|path:"+std::wstring(futurePath)};
+    auto beforeRollback=canonicalFixture;
+    if (!check(TryReconcileCanonicalContinuityGroup(rollback,rollbackKey)==ContinuityReconcileResult::Deferred &&
+               canonicalFixture==beforeRollback,
+               "rollback cannot guess between multiple historical package icon roles")) return 1;
+    canonicalFixture={L"before",futureKey,L"after"};
+    beforeRollback=canonicalFixture;
+    entries[L"301"]={3,futurePath,L"",{9,9,9}};
+    logicalFixture.push_back({301,futureKey,true});
+    if (!check(TryReconcileCanonicalContinuityGroup(rollback,rollbackKey)!=ContinuityReconcileResult::Reconciled &&
+               canonicalFixture==beforeRollback,
+               "current registry metadata overrides conflicting cached rollback evidence")) return 1;
+    entries[L"301"].icon={1,2,3};
+    liveFixture={true,true,2,2,{{300,rollbackKey,true},{301,futureKey,true}}};
+    if (!check(TryReconcileCanonicalContinuityGroup(rollback,rollbackKey)==ContinuityReconcileResult::Deferred &&
+               canonicalFixture==beforeRollback,
+               "a simultaneously live future identity prevents rollback migration")) return 1;
+    entries.erase(L"301");logicalFixture.pop_back();
+    liveFixture={true,true,1,1,{{300,rollbackKey,true}}};
+    g_liveBaselineActiveInSession=false;
+    if (!check(TryReconcileCanonicalContinuityGroup(rollback,rollbackKey)==ContinuityReconcileResult::Deferred &&
+               canonicalFixture==beforeRollback,
+               "cached rollback evidence cannot activate an untrusted session")) return 1;
+    g_liveBaselineActiveInSession=true;
+    if (!check(TryReconcileCanonicalContinuityGroup(rollback,rollbackKey)==ContinuityReconcileResult::Reconciled &&
+               canonicalFixture==std::vector<std::wstring>{L"before",rollbackKey,L"after"},
+               "a verified rollback succeeds after temporary blockers are removed")) return 1;
     std::cout << "PASS: continuity group selection\n";
 }
 '''

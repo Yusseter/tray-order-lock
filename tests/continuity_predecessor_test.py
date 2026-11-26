@@ -34,7 +34,7 @@ std::wstring MakeTrayEntrySubkey(std::uint64_t) { return L"fixture"; }
 bool QueryDwordValue(const std::wstring&, const wchar_t*, DWORD* uid) { *uid=3; return !guidMode; }
 bool QueryIconGuid(const std::wstring&, std::wstring*) { return guidMode; }
 std::wstring QueryStringValue(const std::wstring&, const wchar_t*) { return targetPath; }
-''' + section("bool FindWindowsAppsUidCanonicalPredecessor(", "bool FindWindowsAppsGuidAnchorForUid(") + r'''
+''' + section("bool FindWindowsAppsUidCanonicalPredecessor(", "bool AnalyzePackageRollback(") + r'''
 bool check(bool condition, const char* name) {
     if (!condition) std::cerr << "FAIL: " << name << '\n';
     return condition;

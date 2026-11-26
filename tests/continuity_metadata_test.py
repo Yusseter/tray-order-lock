@@ -21,6 +21,8 @@ code = r'''
 #include <cstdint>
 #include <cwctype>
 #include <iostream>
+#include <cwchar>
+#include <mutex>
 #include <map>
 #include <string>
 #include <vector>
@@ -28,9 +30,20 @@ using BYTE = unsigned char;
 using DWORD = unsigned long;
 struct Entry { DWORD uid; std::wstring path, tooltip; std::vector<BYTE> icon; };
 std::map<std::wstring, Entry> entries;
+std::map<std::wstring,std::wstring> packageStorage;
+bool packageWriteSuccess=true;
+int Wh_SetStringValue(const wchar_t* key,const wchar_t* value) {
+    if(!packageWriteSuccess) return 0;
+    packageStorage[key]=value; return 1;
+}
+std::size_t Wh_GetStringValue(const wchar_t* key,wchar_t* buffer,std::size_t chars) {
+    const auto it=packageStorage.find(key);
+    if(it==packageStorage.end() || it->second.size()>=chars) return 0;
+    std::copy(it->second.begin(),it->second.end(),buffer);
+    buffer[it->second.size()]=0; return it->second.size();
+}
 ''' + section("struct ContinuityIdentityMetadata {", "struct LiveIdentityMapping {") + section(
-    "std::wstring ToLower(", "bool StartsWithOrdinalIgnoreCase("
-) + section("bool IsNumericDottedVersionCore(", "bool LooksLikeVersionDirectory(") + section("bool ParseNumericDottedVersion(", "bool ContainsText(") + r'''
+    "std::wstring ToLower(", "bool ContainsText(") + r'''
 std::wstring MakeTrayEntrySubkey(std::uint64_t identity) { return std::to_wstring(identity); }
 bool QueryIconGuid(const std::wstring&, std::wstring*) { return false; }
 bool QueryDwordValue(const std::wstring& key, const wchar_t*, DWORD* uid) {
@@ -72,6 +85,28 @@ int main() {
     if (!check(!ContinuityIdentityMatches(a,otherFamily) && !ContinuityIdentityMatches(otherFamily,a) && !ContinuityIdentityMatches(a,otherIcon) && !ContinuityIdentityMatches(otherIcon,a), "mixed tooltip states do not match different families or icons")) return 1;
     if (!check(BuildContinuityIdentityMetadata(6, &legacy1) && BuildContinuityIdentityMetadata(7, &legacy2) && ContinuityIdentityMatches(legacy1,legacy2), "legacy tooltip matching remains supported")) return 1;
     if (!check(!BuildContinuityIdentityMetadata(8, &nonpackage), "missing tooltip on non-WindowsApps identity remains unsupported")) return 1;
+    const std::wstring storedGuid=L"guid:{persisted-package}";
+    RememberPackageIdentity(storedGuid,entries[L"2"].path,entries[L"2"].icon);
+    g_packageHistory.clear();
+    ContinuityIdentityMetadata stored;
+    if (!check(LoadPackageIdentity(storedGuid,&stored) && stored.guidBacked &&
+               ContinuityIdentityMatches(a,stored), "GUID evidence survives an in-memory cache reset")) return 1;
+    const auto uidKey=L"uid:3|path:"+BuildVersionNormalizedPath(entries[L"2"].path);
+    RememberPackageIdentity(uidKey,entries[L"2"].path,entries[L"2"].icon);
+    g_packageHistory.clear();
+    if (!check(LoadPackageIdentity(uidKey,&stored) && !stored.guidBacked && stored.uid==3 &&
+               ContinuityIdentityMatches(b,stored), "UID evidence also survives session changes")) return 1;
+    packageStorage[L"PackageIdentityV1."+storedGuid]=L"TOR_PACKAGE_V1\n"+entries[L"2"].path+L"\n0g";
+    if (!check(!LoadPackageIdentity(storedGuid,&stored), "invalid hex metadata is rejected")) return 1;
+    packageStorage[L"PackageIdentityV1."+storedGuid]=L"TOR_PACKAGE_V1\n"+entries[L"2"].path+L"\n0";
+    if (!check(!LoadPackageIdentity(storedGuid,&stored), "truncated metadata is rejected")) return 1;
+    packageStorage[L"PackageIdentityV1."+storedGuid]=L"unknown-version\n"+entries[L"2"].path+L"\n01";
+    if (!check(!LoadPackageIdentity(storedGuid,&stored), "unsupported metadata format is rejected")) return 1;
+    packageStorage[L"PackageIdentityV1."+uidKey]=L"TOR_PACKAGE_V1\n"+entries[L"3"].path+L"\n010203";
+    if (!check(!LoadPackageIdentity(uidKey,&stored), "a UID record with the wrong executable is rejected")) return 1;
+    packageWriteSuccess=false;
+    RememberPackageIdentity(L"guid:{failed-write}",entries[L"2"].path,entries[L"2"].icon);
+    if (!check(!LoadPackageIdentity(L"guid:{failed-write}",&stored), "a failed write does not create false persisted evidence")) return 1;
     std::cout << "PASS: continuity metadata matching\n";
 }
 '''
